@@ -2,7 +2,7 @@
 
 package main
 
-// #cgo CFLAGS: -std=gnu11 -Wvla -Werror -fvisibility=hidden -Winit-self
+// #cgo CFLAGS: -std=gnu11 -Wvla  -fvisibility=hidden -Winit-self
 // #cgo CFLAGS: -Wformat=2 -Wshadow -Wendif-labels -fasynchronous-unwind-tables
 // #cgo CFLAGS: -pipe --param=ssp-buffer-size=4 -g -Wunused
 // #cgo CFLAGS: -Werror=implicit-function-declaration

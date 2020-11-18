@@ -33,8 +33,8 @@ func getPlatformVersionStrings() []string {
 	}
 
 	// Add chromebook info
-	if len(versions) == 1 && shared.PathExists("/run/cros_milestone") {
-		content, err := ioutil.ReadFile("/run/cros_milestone")
+	if len(versions) == 1 && shared.PathExists("/data/local/usr/run/cros_milestone") {
+		content, err := ioutil.ReadFile("/data/local/usr/run/cros_milestone")
 		if err == nil {
 			versions = append(versions, "Chrome OS")
 			versions = append(versions, strings.TrimSpace(string(content)))

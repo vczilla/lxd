@@ -308,7 +308,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 	if value == nil {
 		value = getConfig(conf, "lxc.seccomp")
 	}
-	if value != nil && value[0] != "/usr/share/lxc/config/common.seccomp" {
+	if value != nil && value[0] != "/data/local/usr/share/lxc/config/common.seccomp" {
 		return fmt.Errorf("Custom seccomp profiles aren't supported")
 	}
 

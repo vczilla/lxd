@@ -138,7 +138,7 @@ func ConnectLXDUnix(path string, args *ConnectionArgs) (InstanceServer, error) {
 		if path == "" {
 			lxdDir := os.Getenv("LXD_DIR")
 			if lxdDir == "" {
-				lxdDir = "/var/lib/lxd"
+				lxdDir = "/data/local/usr/var/lib/lxd"
 			}
 
 			path = filepath.Join(lxdDir, "unix.socket")

@@ -1,4 +1,5 @@
 package quota
+// #cgo CFLAGS: -D__ANDROID_API__=29
 
 import (
 	"bufio"

@@ -105,7 +105,7 @@ func (o *OVN) SetDatabaseAddress(addr string) {
 // getNorthboundDB returns connection string to use for northbound database.
 func (o *OVN) getNorthboundDB() string {
 	if o.dbAddr == "" {
-		return "unix:/var/run/ovn/ovnnb_db.sock"
+		return "unix:/data/local/usr/var/run/ovn/ovnnb_db.sock"
 	}
 
 	return o.dbAddr

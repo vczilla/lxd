@@ -283,7 +283,7 @@ var ConfigSchema = config.Schema{
 
 	// OVN networking global keys.
 	"network.ovn.integration_bridge":    {Default: "br-int"},
-	"network.ovn.northbound_connection": {Default: "unix:/var/run/ovn/ovnnb_db.sock"},
+	"network.ovn.northbound_connection": {Default: "unix:/data/local/usr/var/run/ovn/ovnnb_db.sock"},
 }
 
 func offlineThresholdDefault() string {

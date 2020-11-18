@@ -17,7 +17,7 @@ import (
 
 var devDiskByPath = "/dev/disk/by-path"
 var devDiskByID = "/dev/disk/by-id"
-var runUdevData = "/run/udev/data"
+var runUdevData = "/data/local/usr/run/udev/data"
 var sysClassBlock = "/sys/class/block"
 
 func storageAddDriveInfo(devicePath string, disk *api.ResourcesStorageDisk) error {

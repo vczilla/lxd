@@ -158,7 +158,7 @@ func instanceProfile(state *state.State, inst instance) (string, error) {
 	} else {
 		rootPath := ""
 		if shared.InSnap() {
-			rootPath = "/var/lib/snapd/hostfs"
+			rootPath = "/data/local/usr/var/lib/snapd/hostfs"
 		}
 
 		// AppArmor requires deref of all paths.

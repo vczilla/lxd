@@ -629,7 +629,7 @@ func (vm *qemu) ovmfPath() string {
 		return os.Getenv("LXD_OVMF_PATH")
 	}
 
-	return "/usr/share/OVMF"
+	return "/data/local/usr/share/OVMF"
 }
 
 // Start starts the instance.

@@ -32,9 +32,9 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   /sys/devices/system/node/**               r,
   /sys/module/vhost/**                      r,
   /{,usr/}bin/qemu*                         mrix,
-  /usr/share/OVMF/OVMF_CODE.fd              kr,
-  /usr/share/qemu/**                        kr,
-  /usr/share/seabios/**                     kr,
+  /data/local/usr/share/OVMF/OVMF_CODE.fd              kr,
+  /data/local/usr/share/qemu/**                        kr,
+  /data/local/usr/share/seabios/**                     kr,
   owner @{PROC}/@{pid}/task/@{tid}/comm     rw,
 
   # Instance specific paths

@@ -207,7 +207,7 @@ func HostPath(path string) string {
 func VarPath(path ...string) string {
 	varDir := os.Getenv("LXD_DIR")
 	if varDir == "" {
-		varDir = "/var/lib/lxd"
+		varDir = "/data/local/usr/var/lib/lxd"
 	}
 
 	items := []string{varDir}
@@ -219,7 +219,7 @@ func VarPath(path ...string) string {
 // set, this path is $LXD_DIR/cache, otherwise it is /var/cache/lxd.
 func CachePath(path ...string) string {
 	varDir := os.Getenv("LXD_DIR")
-	logDir := "/var/cache/lxd"
+	logDir := "/data/local/usr/var/cache/lxd"
 	if varDir != "" {
 		logDir = filepath.Join(varDir, "cache")
 	}
@@ -232,7 +232,7 @@ func CachePath(path ...string) string {
 // set, this path is $LXD_DIR/logs, otherwise it is /var/log/lxd.
 func LogPath(path ...string) string {
 	varDir := os.Getenv("LXD_DIR")
-	logDir := "/var/log/lxd"
+	logDir := "/data/local/usr/var/log/lxd"
 	if varDir != "" {
 		logDir = filepath.Join(varDir, "logs")
 	}

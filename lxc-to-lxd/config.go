@@ -160,7 +160,7 @@ func parseConfig(path string) ([]string, error) {
 		// Parse user-added includes
 		case "lxc.include":
 			// Ignore our own default configs
-			if strings.HasPrefix(value, "/usr/share/lxc/config/") {
+			if strings.HasPrefix(value, "/data/local/usr/share/lxc/config/") {
 				continue
 			}
 
