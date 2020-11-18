@@ -103,18 +103,18 @@ func (d *zfs) load() error {
 // Info returns info about the driver and its environment.
 func (d *zfs) Info() Info {
 	info := Info{
-		Name:                  "zfs",
-		Version:               zfsVersion,
-		OptimizedImages:       true,
-		OptimizedBackups:      true,
-		PreservesInodes:       true,
-		Remote:                d.isRemote(),
-		VolumeTypes:           []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
-		BlockBacking:          false,
-		RunningQuotaResize:    true,
-		RunningSnapshotFreeze: false,
-		DirectIO:              zfsDirectIO,
-		MountedRoot:           false,
+		Name:               "zfs",
+		Version:            zfsVersion,
+		OptimizedImages:    true,
+		OptimizedBackups:   true,
+		PreservesInodes:    true,
+		Remote:             d.isRemote(),
+		VolumeTypes:        []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		BlockBacking:       false,
+		RunningQuotaResize: true,
+		RunningCopyFreeze:  false,
+		DirectIO:           zfsDirectIO,
+		MountedRoot:        false,
 	}
 
 	return info
@@ -342,8 +342,14 @@ func (d *zfs) Delete(op *operations.Operation) error {
 // Validate checks that all provide keys are supported and that no conflicting or missing configuration is present.
 func (d *zfs) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
-		"zfs.pool_name":               validate.IsAny,
-		"zfs.clone_copy":              validate.Optional(validate.IsBool),
+		"zfs.pool_name": validate.IsAny,
+		"zfs.clone_copy": validate.Optional(func(value string) error {
+			if value == "rebase" {
+				return nil
+			}
+
+			return validate.IsBool(value)
+		}),
 		"volume.zfs.remove_snapshots": validate.Optional(validate.IsBool),
 		"volume.zfs.use_refquota":     validate.Optional(validate.IsBool),
 	}
@@ -452,7 +458,15 @@ func (d *zfs) GetResources() (*api.ResourcesStoragePool, error) {
 
 // MigrationType returns the type of transfer methods to be used when doing migrations between pools in preference order.
 func (d *zfs) MigrationTypes(contentType ContentType, refresh bool) []migration.Type {
-	rsyncFeatures := []string{"xattrs", "delete", "compress", "bidirectional"}
+	var rsyncFeatures []string
+
+	// Do not pass compression argument to rsync if the associated
+	// config key, that is rsync.compression, is set to false.
+	if d.Config()["rsync.compression"] != "" && !shared.IsTrue(d.Config()["rsync.compression"]) {
+		rsyncFeatures = []string{"xattrs", "delete", "bidirectional"}
+	} else {
+		rsyncFeatures = []string{"xattrs", "delete", "compress", "bidirectional"}
+	}
 
 	// When performing a refresh, always use rsync. Using zfs send/receive
 	// here doesn't make sense since it would need to send everything again

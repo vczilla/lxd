@@ -1,8 +1,12 @@
 package drivers
 
 import (
+	"errors"
+	"time"
+
 	"github.com/lxc/lxd/lxd/db"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
+	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared/api"
@@ -11,6 +15,7 @@ import (
 // common provides structure common to all instance types.
 type common struct {
 	dbType          instancetype.Type
+	architecture    int
 	devPaths        []string
 	expandedConfig  map[string]string
 	expandedDevices deviceConfig.Devices
@@ -29,6 +34,11 @@ func (c *common) Project() string {
 // Type returns the instance's type.
 func (c *common) Type() instancetype.Type {
 	return c.dbType
+}
+
+// Architecture returns the instance's architecture.
+func (c *common) Architecture() int {
+	return c.architecture
 }
 
 // ExpandedConfig returns instance's expanded config.
@@ -85,4 +95,25 @@ func (c *common) expandDevices(profiles []api.Profile) error {
 // will likely return nil.
 func (c *common) DevPaths() []string {
 	return c.devPaths
+}
+
+// restart handles instance restarts.
+func (c *common) restart(inst instance.Instance, timeout time.Duration) error {
+	if timeout == 0 {
+		err := inst.Stop(false)
+		if err != nil {
+			return err
+		}
+	} else {
+		if inst.IsFrozen() {
+			return errors.New("Instance is not running")
+		}
+
+		err := inst.Shutdown(timeout * time.Second)
+		if err != nil {
+			return err
+		}
+	}
+
+	return inst.Start(false)
 }

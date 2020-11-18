@@ -279,9 +279,10 @@ mem-path = "{{$hugepages}}"
 prealloc = "on"
 discard-data = "on"
 {{- else}}
-qom-type = "memory-backend-ram"
+qom-type = "memory-backend-memfd"
 {{- end }}
 size = "{{$memory}}M"
+share = "on"
 
 [numa]
 type = "node"
@@ -334,24 +335,43 @@ unit = "1"
 
 // Devices use "qemu_" prefix indicating that this is a internally named device.
 var qemuDriveConfig = template.Must(template.New("qemuDriveConfig").Parse(`
-# Config drive
+# Config drive ({{.protocol}})
+{{- if eq .protocol "9p" }}
 [fsdev "qemu_config"]
 fsdriver = "local"
 security_model = "none"
 readonly = "on"
 path = "{{.path}}"
+{{- else if eq .protocol "virtio-fs" }}
+[chardev "qemu_config"]
+backend = "socket"
+path = "{{.path}}"
+{{- end }}
 
-[device "dev-qemu_config"]
+[device "dev-qemu_config-drive-{{.protocol}}"]
 {{- if eq .bus "pci" "pcie"}}
+{{- if eq .protocol "9p" }}
 driver = "virtio-9p-pci"
+{{- else if eq .protocol "virtio-fs" }}
+driver = "vhost-user-fs-pci"
+{{- end }}
 bus = "{{.devBus}}"
 addr = "{{.devAddr}}"
 {{- end}}
-{{if eq .bus "ccw" -}}
+{{- if eq .bus "ccw" }}
+{{- if eq .protocol "9p" }}
 driver = "virtio-9p-ccw"
+{{- else if eq .protocol "virtio-fs" }}
+driver = "vhost-user-fs-ccw"
+{{- end }}
 {{- end}}
+{{- if eq .protocol "9p" }}
 mount_tag = "config"
 fsdev = "qemu_config"
+{{- else if eq .protocol "virtio-fs" }}
+chardev = "qemu_config"
+tag = "config"
+{{- end }}
 {{if .multifunction -}}
 multifunction = "on"
 {{- end }}
@@ -359,7 +379,8 @@ multifunction = "on"
 
 // Devices use "lxd_" prefix indicating that this is a user named device.
 var qemuDriveDir = template.Must(template.New("qemuDriveDir").Parse(`
-# {{.devName}} drive
+# {{.devName}} drive ({{.protocol}})
+{{- if eq .protocol "9p" }}
 [fsdev "lxd_{{.devName}}"]
 {{- if .readonly}}
 readonly = "on"
@@ -371,18 +392,36 @@ readonly = "off"
 fsdriver = "proxy"
 sock_fd = "{{.proxyFD}}"
 {{- end}}
+{{- else if eq .protocol "virtio-fs" }}
+[chardev "lxd_{{.devName}}"]
+backend = "socket"
+path = "{{.path}}"
+{{- end }}
 
-[device "dev-lxd_{{.devName}}"]
+[device "dev-lxd_{{.devName}}-{{.protocol}}"]
 {{- if eq .bus "pci" "pcie"}}
+{{- if eq .protocol "9p" }}
 driver = "virtio-9p-pci"
+{{- else if eq .protocol "virtio-fs" }}
+driver = "vhost-user-fs-pci"
+{{- end }}
 bus = "{{.devBus}}"
 addr = "{{.devAddr}}"
-{{- end}}
+{{- end -}}
 {{if eq .bus "ccw" -}}
+{{- if eq .protocol "9p" }}
 driver = "virtio-9p-ccw"
+{{- else if eq .protocol "virtio-fs" }}
+driver = "vhost-user-fs-ccw"
+{{- end }}
 {{- end}}
+{{- if eq .protocol "9p" }}
 fsdev = "lxd_{{.devName}}"
 mount_tag = "{{.mountTag}}"
+{{- else if eq .protocol "virtio-fs" }}
+chardev = "lxd_{{.devName}}"
+tag = "{{.mountTag}}"
+{{- end }}
 {{if .multifunction -}}
 multifunction = "on"
 {{- end }}
@@ -496,4 +535,61 @@ x-vga = "on"
 {{if .multifunction -}}
 multifunction = "on"
 {{- end }}
+`))
+
+var qemuUSB = template.Must(template.New("qemuUSB").Parse(`
+# USB controller
+[device "qemu_usb"]
+driver = "qemu-xhci"
+bus = "{{.devBus}}"
+addr = "{{.devAddr}}"
+{{if .multifunction -}}
+multifunction = "on"
+{{- end }}
+
+[chardev "qemu_spice-usb-chardev1"]
+  backend = "spicevmc"
+  name = "usbredir"
+
+[chardev "qemu_spice-usb-chardev2"]
+  backend = "spicevmc"
+  name = "usbredir"
+
+[chardev "qemu_spice-usb-chardev3"]
+  backend = "spicevmc"
+  name = "usbredir"
+
+[device "qemu_spice-usb1"]
+  driver = "usb-redir"
+  chardev = "qemu_spice-usb-chardev1"
+
+[device "qemu_spice-usb2"]
+  driver = "usb-redir"
+  chardev = "qemu_spice-usb-chardev2"
+
+[device "qemu_spice-usb3"]
+  driver = "usb-redir"
+  chardev = "qemu_spice-usb-chardev3"
+`))
+
+var qemuUSBDev = template.Must(template.New("qemuUSBDev").Parse(`
+# USB host device ("{{.devName}}" device)
+[device "dev-lxd_{{.devName}}"]
+driver = "usb-host"
+bus = "qemu_usb.0"
+hostdevice = "{{.hostDevice}}"
+`))
+
+var qemuTPM = template.Must(template.New("qemuTPM").Parse(`
+[chardev "qemu_tpm-chardev_{{.devName}}"]
+backend = "socket"
+path = "{{.path}}"
+
+[tpmdev "qemu_tpm-tpmdev_{{.devName}}"]
+type = "emulator"
+chardev = "qemu_tpm-chardev_{{.devName}}"
+
+[device "dev-lxd_{{.devName}}"]
+driver = "tpm-tis"
+tpmdev = "qemu_tpm-tpmdev_{{.devName}}"
 `))

@@ -71,17 +71,18 @@ func (d *cephfs) isRemote() bool {
 // Info returns the pool driver information.
 func (d *cephfs) Info() Info {
 	return Info{
-		Name:                  "cephfs",
-		Version:               cephfsVersion,
-		OptimizedImages:       false,
-		PreservesInodes:       false,
-		Remote:                d.isRemote(),
-		VolumeTypes:           []VolumeType{VolumeTypeCustom},
-		BlockBacking:          false,
-		RunningQuotaResize:    true,
-		RunningSnapshotFreeze: false,
-		DirectIO:              true,
-		MountedRoot:           true,
+		Name:               "cephfs",
+		Version:            cephfsVersion,
+		OptimizedImages:    false,
+		PreservesInodes:    false,
+		Remote:             d.isRemote(),
+		VolumeTypes:        []VolumeType{VolumeTypeCustom},
+		VolumeMultiNode:    true,
+		BlockBacking:       false,
+		RunningQuotaResize: true,
+		RunningCopyFreeze:  false,
+		DirectIO:           true,
+		MountedRoot:        true,
 	}
 }
 
@@ -312,6 +313,16 @@ func (d *cephfs) GetResources() (*api.ResourcesStoragePool, error) {
 
 // MigrationTypes returns the supported migration types and options supported by the driver.
 func (d *cephfs) MigrationTypes(contentType ContentType, refresh bool) []migration.Type {
+	var rsyncFeatures []string
+
+	// Do not pass compression argument to rsync if the associated
+	// config key, that is rsync.compression, is set to false.
+	if d.Config()["rsync.compression"] != "" && !shared.IsTrue(d.Config()["rsync.compression"]) {
+		rsyncFeatures = []string{"delete", "bidirectional"}
+	} else {
+		rsyncFeatures = []string{"delete", "compress", "bidirectional"}
+	}
+
 	if contentType != ContentTypeFS {
 		return nil
 	}
@@ -320,7 +331,7 @@ func (d *cephfs) MigrationTypes(contentType ContentType, refresh bool) []migrati
 	return []migration.Type{
 		{
 			FSType:   migration.MigrationFSType_RSYNC,
-			Features: []string{"delete", "compress", "bidirectional"},
+			Features: rsyncFeatures,
 		},
 	}
 }

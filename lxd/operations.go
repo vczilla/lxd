@@ -95,10 +95,9 @@ func waitForOperations(s *state.State, chCancel chan struct{}) {
 			// If there are still running operations, we shut down the instances
 			// which will terminate the operations.
 			if execConsoleOps > 0 {
-				logger.Info("Shutdown timeout reached, shutting down instances")
-				instancesShutdown(s)
+				logger.Info("Timeout reached, continuing with shutdown")
 			}
-
+			return
 		case <-logTick:
 			// Print log message every minute.
 			logger.Infof("Waiting for %d operation(s) to finish", runningOps)
@@ -373,7 +372,7 @@ func operationWaitGet(d *Daemon, r *http.Request) response.Response {
 	id := mux.Vars(r)["id"]
 	secret := r.FormValue("secret")
 
-	trusted, _, _, _ := d.Authenticate(r)
+	trusted, _, _, _ := d.Authenticate(nil, r)
 	if !trusted && secret == "" {
 		return response.Forbidden(nil)
 	}

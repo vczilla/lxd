@@ -22,6 +22,7 @@ import (
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/project"
+	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/rsync"
 	driver "github.com/lxc/lxd/lxd/storage"
 	storagePools "github.com/lxc/lxd/lxd/storage"
@@ -39,6 +40,16 @@ const (
 	patchNoStageSet patchStage = iota
 	patchPreDaemonStorage
 	patchPostDaemonStorage
+)
+
+// Leave the string type in here! This guarantees that go treats this is as a
+// typed string constant. Removing it causes go to treat these as untyped string
+// constants which is not what we want.
+const (
+	patchStoragePoolVolumeAPIEndpointContainers string = "containers"
+	patchStoragePoolVolumeAPIEndpointVMs        string = "virtual-machines"
+	patchStoragePoolVolumeAPIEndpointImages     string = "images"
+	patchStoragePoolVolumeAPIEndpointCustom     string = "custom"
 )
 
 /* Patches are one-time actions that are sometimes needed to update
@@ -101,6 +112,11 @@ var patches = []patch{
 	{name: "clustering_drop_database_role", stage: patchPostDaemonStorage, run: patchClusteringDropDatabaseRole},
 	{name: "network_clear_bridge_volatile_hwaddr", stage: patchPostDaemonStorage, run: patchNetworkCearBridgeVolatileHwaddr},
 	{name: "move_backups_instances", stage: patchPostDaemonStorage, run: patchMoveBackupsInstances},
+	{name: "network_ovn_enable_nat", stage: patchPostDaemonStorage, run: patchNetworkOVNEnableNAT},
+	{name: "network_ovn_remove_routes", stage: patchPostDaemonStorage, run: patchNetworkOVNRemoveRoutes},
+	{name: "network_fan_enable_nat", stage: patchPostDaemonStorage, run: patchNetworkFANEnableNAT},
+	{name: "thinpool_typo_fix", stage: patchPostDaemonStorage, run: patchThinpoolTypoFix},
+	{name: "vm_rename_uuid_key", stage: patchPostDaemonStorage, run: patchVMRenameUUIDKey},
 }
 
 type patch struct {
@@ -164,6 +180,270 @@ func patchesApply(d *Daemon, stage patchStage) error {
 }
 
 // Patches begin here
+
+// patchVMRenameUUIDKey renames the volatile.vm.uuid key to volatile.uuid in instance and snapshot configs.
+func patchVMRenameUUIDKey(name string, d *Daemon) error {
+	oldUUIDKey := "volatile.vm.uuid"
+	newUUIDKey := "volatile.uuid"
+
+	return d.State().Cluster.InstanceList(func(inst db.Instance, p api.Project, profiles []api.Profile) error {
+		if inst.Type != instancetype.VM {
+			return nil
+		}
+
+		return d.State().Cluster.Transaction(func(tx *db.ClusterTx) error {
+			uuid := inst.Config[oldUUIDKey]
+			if uuid != "" {
+				changes := map[string]string{
+					oldUUIDKey: "",
+					newUUIDKey: uuid,
+				}
+
+				logger.Debugf("Renaming config key %q to %q for VM %q (Project %q)", oldUUIDKey, newUUIDKey, inst.Name, inst.Project)
+				err := tx.UpdateInstanceConfig(inst.ID, changes)
+				if err != nil {
+					return errors.Wrapf(err, "Failed renaming config key %q to %q for VM %q (Project %q)", oldUUIDKey, newUUIDKey, inst.Name, inst.Project)
+				}
+			}
+
+			snaps, err := tx.GetInstanceSnapshotsWithName(inst.Project, inst.Name)
+			if err != nil {
+				return err
+			}
+
+			for _, snap := range snaps {
+				uuid := snap.Config[oldUUIDKey]
+				if uuid != "" {
+					changes := map[string]string{
+						oldUUIDKey: "",
+						newUUIDKey: uuid,
+					}
+
+					logger.Debugf("Renaming config key %q to %q for VM %q (Project %q)", oldUUIDKey, newUUIDKey, snap.Name, snap.Project)
+					err = tx.UpdateInstanceSnapshotConfig(snap.ID, changes)
+					if err != nil {
+						return errors.Wrapf(err, "Failed renaming config key %q to %q for VM %q (Project %q)", oldUUIDKey, newUUIDKey, snap.Name, snap.Project)
+					}
+				}
+			}
+
+			return nil
+		})
+	})
+}
+
+// patchThinpoolTypoFix renames any config incorrectly set config file entries due to the lvm.thinpool_name typo.
+func patchThinpoolTypoFix(name string, d *Daemon) error {
+	revert := revert.New()
+	defer revert.Fail()
+
+	// Setup a transaction.
+	tx, err := d.cluster.Begin()
+	if err != nil {
+		return errors.Wrap(err, "Failed to begin transaction")
+	}
+
+	revert.Add(func() { tx.Rollback() })
+
+	// Fetch the IDs of all existing nodes.
+	nodeIDs, err := query.SelectIntegers(tx, "SELECT id FROM nodes")
+	if err != nil {
+		return errors.Wrap(err, "Failed to get IDs of current nodes")
+	}
+
+	// Fetch the IDs of all existing lvm pools.
+	poolIDs, err := query.SelectIntegers(tx, "SELECT id FROM storage_pools WHERE driver='lvm'")
+	if err != nil {
+		return errors.Wrap(err, "Failed to get IDs of current lvm pools")
+	}
+
+	for _, poolID := range poolIDs {
+		// Fetch the config for this lvm pool and check if it has the lvm.thinpool_name.
+		config, err := query.SelectConfig(
+			tx, "storage_pools_config", "storage_pool_id=? AND node_id IS NULL", poolID)
+		if err != nil {
+			return errors.Wrap(err, "Failed to fetch of lvm pool config")
+		}
+
+		value, ok := config["lvm.thinpool_name"]
+		if !ok {
+			continue
+		}
+
+		// Delete the current key
+		_, err = tx.Exec(`
+DELETE FROM storage_pools_config WHERE key='lvm.thinpool_name' AND storage_pool_id=? AND node_id IS NULL
+`, poolID)
+		if err != nil {
+			return errors.Wrapf(err, "Failed to delete lvm.thinpool_name config")
+		}
+
+		// Add the config entry for each node
+		for _, nodeID := range nodeIDs {
+			_, err := tx.Exec(`
+INSERT INTO storage_pools_config(storage_pool_id, node_id, key, value)
+  VALUES(?, ?, 'lvm.thinpool_name', ?)
+`, poolID, nodeID, value)
+			if err != nil {
+				return errors.Wrapf(err, "Failed to create lvm.thinpool_name node config")
+			}
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return errors.Wrap(err, "Failed to commit transaction")
+	}
+
+	revert.Success()
+	return nil
+}
+
+// patchNetworkFANEnableNAT sets "ipv4.nat=true" on fan bridges that are missing the "ipv4.nat" setting.
+// This prevents outbound connectivity breaking on existing fan networks now that the default behaviour of not
+// having "ipv4.nat" set is to disable NAT (bringing in line with the non-fan bridge behavior and docs).
+func patchNetworkFANEnableNAT(name string, d *Daemon) error {
+	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		projectNetworks, err := tx.GetNonPendingNetworks()
+		if err != nil {
+			return err
+		}
+
+		for _, networks := range projectNetworks {
+			for networkID, network := range networks {
+				if network.Type != "bridge" {
+					continue
+				}
+
+				if network.Config["bridge.mode"] != "fan" {
+					continue
+				}
+
+				modified := false
+
+				// Enable ipv4.nat if setting not specified.
+				if _, found := network.Config["ipv4.nat"]; !found {
+					modified = true
+					network.Config["ipv4.nat"] = "true"
+				}
+
+				if modified {
+					err = tx.UpdateNetwork(networkID, network.Description, network.Config)
+					if err != nil {
+						return errors.Wrapf(err, "Failed setting ipv4.nat=true for fan network %q (%d)", network.Name, networkID)
+					}
+
+					logger.Debugf("Set ipv4.nat=true for fan network %q (%d)", network.Name, networkID)
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// patchNetworkOVNRemoveRoutes removes the "ipv4.routes.external" and "ipv6.routes.external" settings from OVN
+// networks. It was decided that the OVN NIC level equivalent settings were sufficient.
+func patchNetworkOVNRemoveRoutes(name string, d *Daemon) error {
+	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		projectNetworks, err := tx.GetNonPendingNetworks()
+		if err != nil {
+			return err
+		}
+
+		for _, networks := range projectNetworks {
+			for networkID, network := range networks {
+				if network.Type != "ovn" {
+					continue
+				}
+
+				modified := false
+
+				// Ensure existing behaviour of having NAT enabled if IP address was set.
+				if _, found := network.Config["ipv4.routes.external"]; found {
+					modified = true
+					delete(network.Config, "ipv4.routes.external")
+				}
+
+				if _, found := network.Config["ipv6.routes.external"]; found {
+					modified = true
+					delete(network.Config, "ipv6.routes.external")
+				}
+
+				if modified {
+					err = tx.UpdateNetwork(networkID, network.Description, network.Config)
+					if err != nil {
+						return errors.Wrapf(err, "Failed removing OVN external route settings for %q (%d)", network.Name, networkID)
+					}
+
+					logger.Debugf("Removing external route settings for OVN network %q (%d)", network.Name, networkID)
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// patchNetworkOVNEnableNAT adds "ipv4.nat" and "ipv6.nat" keys set to "true" to OVN networks if not present.
+// This is to ensure existing networks retain the old behaviour of always having NAT enabled as we introduce
+// the new NAT settings which default to disabled if not specified.
+// patchNetworkCearBridgeVolatileHwaddr removes the unsupported `volatile.bridge.hwaddr` config key from networks.
+func patchNetworkOVNEnableNAT(name string, d *Daemon) error {
+	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		projectNetworks, err := tx.GetNonPendingNetworks()
+		if err != nil {
+			return err
+		}
+
+		for _, networks := range projectNetworks {
+			for networkID, network := range networks {
+				if network.Type != "ovn" {
+					continue
+				}
+
+				modified := false
+
+				// Ensure existing behaviour of having NAT enabled if IP address was set.
+				if network.Config["ipv4.address"] != "" && network.Config["ipv4.nat"] == "" {
+					modified = true
+					network.Config["ipv4.nat"] = "true"
+				}
+
+				if network.Config["ipv6.address"] != "" && network.Config["ipv6.nat"] == "" {
+					modified = true
+					network.Config["ipv6.nat"] = "true"
+				}
+
+				if modified {
+					err = tx.UpdateNetwork(networkID, network.Description, network.Config)
+					if err != nil {
+						return errors.Wrapf(err, "Failed saving OVN NAT settings for %q (%d)", network.Name, networkID)
+					}
+
+					logger.Debugf("Enabling NAT for OVN network %q (%d)", network.Name, networkID)
+				}
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
 
 // Moves backups from shared.VarPath("backups") to shared.VarPath("backups", "instances").
 func patchMoveBackupsInstances(name string, d *Daemon) error {
@@ -1235,8 +1515,8 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 		// permissions and ownership.
 		newContainerMntPoint := driver.GetContainerMountPoint("default", defaultPoolName, ct)
 		ctLvName := lvmNameToLVName(ct)
-		newContainerLvName := fmt.Sprintf("%s_%s", storagePoolVolumeAPIEndpointContainers, ctLvName)
-		containerLvDevPath := lvmDevPath("default", defaultPoolName, storagePoolVolumeAPIEndpointContainers, ctLvName)
+		newContainerLvName := fmt.Sprintf("%s_%s", patchStoragePoolVolumeAPIEndpointContainers, ctLvName)
+		containerLvDevPath := lvmDevPath("default", defaultPoolName, patchStoragePoolVolumeAPIEndpointContainers, ctLvName)
 		if !shared.PathExists(containerLvDevPath) {
 			oldLvDevPath := fmt.Sprintf("/dev/%s/%s", defaultPoolName, ctLvName)
 			// If the old LVM device path for the logical volume
@@ -1295,15 +1575,12 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 				err = func() error {
 					// In case the new LVM logical volume for the container is not mounted mount it.
 					if !shared.IsMountPoint(newContainerMntPoint) {
-						ourMount, err := pool.MountInstance(ctStruct, nil)
+						_, err = pool.MountInstance(ctStruct, nil)
 						if err != nil {
 							logger.Errorf("Failed to mount new empty LVM logical volume for container %s: %s", ct, err)
 							return err
 						}
-
-						if ourMount {
-							defer pool.UnmountInstance(ctStruct, nil)
-						}
+						defer pool.UnmountInstance(ctStruct, nil)
 					}
 
 					// Use rsync to fill the empty volume.
@@ -1397,8 +1674,8 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 
 			// Make sure we use a valid lv name.
 			csLvName := lvmNameToLVName(cs)
-			newSnapshotLvName := fmt.Sprintf("%s_%s", storagePoolVolumeAPIEndpointContainers, csLvName)
-			snapshotLvDevPath := lvmDevPath("default", defaultPoolName, storagePoolVolumeAPIEndpointContainers, csLvName)
+			newSnapshotLvName := fmt.Sprintf("%s_%s", patchStoragePoolVolumeAPIEndpointContainers, csLvName)
+			snapshotLvDevPath := lvmDevPath("default", defaultPoolName, patchStoragePoolVolumeAPIEndpointContainers, csLvName)
 			if !shared.PathExists(snapshotLvDevPath) {
 				oldLvDevPath := fmt.Sprintf("/dev/%s/%s", defaultPoolName, csLvName)
 				if shared.PathExists(oldLvDevPath) {
@@ -1461,15 +1738,12 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 					err = func() error {
 						// In case the new LVM logical volume for the snapshot is not mounted mount it.
 						if !shared.IsMountPoint(newSnapshotMntPoint) {
-							ourMount, err := pool.MountInstanceSnapshot(csStruct, nil)
+							_, err = pool.MountInstanceSnapshot(csStruct, nil)
 							if err != nil {
 								logger.Errorf("Failed to mount new empty LVM logical volume for container %s: %s", cs, err)
 								return err
 							}
-
-							if ourMount {
-								defer pool.UnmountInstanceSnapshot(csStruct, nil)
-							}
+							defer pool.UnmountInstanceSnapshot(csStruct, nil)
 						}
 
 						// Use rsync to fill the snapshot volume.
@@ -1589,8 +1863,8 @@ func upgradeFromStorageTypeLvm(name string, d *Daemon, defaultPoolName string, d
 		}
 
 		// Rename the logical volume device.
-		newImageLvName := fmt.Sprintf("%s_%s", storagePoolVolumeAPIEndpointImages, img)
-		imageLvDevPath := lvmDevPath("default", defaultPoolName, storagePoolVolumeAPIEndpointImages, img)
+		newImageLvName := fmt.Sprintf("%s_%s", patchStoragePoolVolumeAPIEndpointImages, img)
+		imageLvDevPath := lvmDevPath("default", defaultPoolName, patchStoragePoolVolumeAPIEndpointImages, img)
 		oldLvDevPath := fmt.Sprintf("/dev/%s/%s", defaultPoolName, img)
 		// Only create logical volumes for images that have a logical
 		// volume on the pre-storage-api LXD instance. If not, we don't
@@ -2404,7 +2678,7 @@ func patchStorageApiUpdateStorageConfigs(name string, d *Daemon) error {
 
 			// It shouldn't be possible that false volume types
 			// exist in the db, so it's safe to ignore the error.
-			volumeType, _ := driver.VolumeTypeNameToType(volume.Type)
+			volumeType, _ := driver.VolumeTypeNameToDBType(volume.Type)
 			// Update the volume config.
 			err = d.cluster.UpdateStoragePoolVolume("default", volume.Name, volumeType, poolID, volume.Description, volume.Config)
 			if err != nil {
@@ -2521,6 +2795,21 @@ func patchStorageApiDetectLVSize(name string, d *Daemon) error {
 			return fmt.Errorf("The \"lvm.vg_name\" key should not be empty")
 		}
 
+		storagePoolVolumeTypeNameToAPIEndpoint := func(volumeTypeName string) (string, error) {
+			switch volumeTypeName {
+			case db.StoragePoolVolumeTypeNameContainer:
+				return patchStoragePoolVolumeAPIEndpointContainers, nil
+			case db.StoragePoolVolumeTypeNameVM:
+				return patchStoragePoolVolumeAPIEndpointVMs, nil
+			case db.StoragePoolVolumeTypeNameImage:
+				return patchStoragePoolVolumeAPIEndpointImages, nil
+			case db.StoragePoolVolumeTypeNameCustom:
+				return patchStoragePoolVolumeAPIEndpointCustom, nil
+			}
+
+			return "", fmt.Errorf("Invalid storage volume type name")
+		}
+
 		for _, volume := range volumes {
 			// Make sure that config is not empty.
 			if volume.Config == nil {
@@ -2552,7 +2841,7 @@ func patchStorageApiDetectLVSize(name string, d *Daemon) error {
 
 			// It shouldn't be possible that false volume types
 			// exist in the db, so it's safe to ignore the error.
-			volumeType, _ := driver.VolumeTypeNameToType(volume.Type)
+			volumeType, _ := driver.VolumeTypeNameToDBType(volume.Type)
 			// Update the volume config.
 			err = d.cluster.UpdateStoragePoolVolume("default", volume.Name, volumeType, poolID, volume.Description, volume.Config)
 			if err != nil {
@@ -2682,7 +2971,7 @@ func patchStorageZFSVolumeSize(name string, d *Daemon) error {
 
 			// It shouldn't be possible that false volume types
 			// exist in the db, so it's safe to ignore the error.
-			volumeType, _ := driver.VolumeTypeNameToType(volume.Type)
+			volumeType, _ := driver.VolumeTypeNameToDBType(volume.Type)
 			// Update the volume config.
 			err = d.cluster.UpdateStoragePoolVolume("default", volume.Name,
 				volumeType, poolID, volume.Description,
@@ -3082,14 +3371,11 @@ func patchStorageApiPermissions(name string, d *Daemon) error {
 
 			// Run task in anonymous function so as not to stack up defers.
 			err = func() error {
-				ourMount, err := pool.MountCustomVolume(project.Default, vol, nil)
+				err = pool.MountCustomVolume(project.Default, vol, nil)
 				if err != nil {
 					return err
 				}
-
-				if ourMount {
-					defer pool.UnmountCustomVolume(project.Default, vol, nil)
-				}
+				defer pool.UnmountCustomVolume(project.Default, vol, nil)
 
 				cuMntPoint := storageDrivers.GetVolumeMountPath(poolName, storageDrivers.VolumeTypeCustom, vol)
 				err = os.Chmod(cuMntPoint, 0711)
@@ -3112,25 +3398,29 @@ func patchStorageApiPermissions(name string, d *Daemon) error {
 
 	for _, ct := range cRegular {
 		// load the container from the database
-		ctStruct, err := instance.LoadByProjectAndName(d.State(), "default", ct)
+		inst, err := instance.LoadByProjectAndName(d.State(), project.Default, ct)
 		if err != nil {
 			return err
 		}
 
-		ourMount, err := ctStruct.StorageStart()
+		// Start the storage if needed
+		pool, err := storagePools.GetPoolByInstance(d.State(), inst)
 		if err != nil {
 			return err
 		}
 
-		if ctStruct.IsPrivileged() {
-			err = os.Chmod(ctStruct.Path(), 0700)
+		_, err = storagePools.InstanceMount(pool, inst, nil)
+		if err != nil {
+			return err
+		}
+
+		if inst.IsPrivileged() {
+			err = os.Chmod(inst.Path(), 0700)
 		} else {
-			err = os.Chmod(ctStruct.Path(), 0711)
+			err = os.Chmod(inst.Path(), 0711)
 		}
 
-		if ourMount {
-			ctStruct.StorageStop()
-		}
+		storagePools.InstanceUnmount(pool, inst, nil)
 
 		if err != nil && !os.IsNotExist(err) {
 			return err

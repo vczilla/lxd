@@ -25,6 +25,7 @@ test_container_import() {
     lxc start ctImport
     pid=$(lxc info ctImport | grep ^Pid | awk '{print $2}')
     ! lxd import ctImport || false
+    # Import without killing the running instance to test restoring control plane after DB corruption.
     lxd import ctImport --force
     kill_lxc "${pid}"
     lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM instances WHERE name='ctImport'"
@@ -39,9 +40,7 @@ test_container_import() {
     pid=$(lxc info ctImport | grep ^Pid | awk '{print $2}')
     ! lxd import ctImport || false
     lxd import ctImport --force
-    kill_lxc "${pid}"
     lxc info ctImport | grep snap0
-    lxc start ctImport
     lxc delete --force ctImport
 
     lxc init testimage ctImport
@@ -88,6 +87,9 @@ test_container_import() {
     lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM instances WHERE name='ctImport'"
     lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='ctImport'"
     lxd import ctImport
+    lxc start ctImport
+    pid=$(lxc info ctImport | grep ^Pid | awk '{print $2}')
+    kill_lxc "${pid}"
     lxd import ctImport --force
     lxc info ctImport | grep snap0
     lxc start ctImport
@@ -622,9 +624,11 @@ test_backup_volume_export_with_project() {
   rmdir "${LXD_DIR}/non-optimized"
 
   if [ "$#" -ne 0 ]; then
-    lxc image rm testimage
     lxc project switch default
+    lxc image rm testimage --project "$project"
+    lxc image rm testimage --project "$project-b"
     lxc project delete "$project"
+    lxc project delete "$project-b"
   fi
 }
 
