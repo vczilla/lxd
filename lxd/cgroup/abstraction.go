@@ -522,9 +522,9 @@ func (cg *CGroup) GetEffectiveCpuset() (string, error) {
 	case Unavailable:
 		return "", ErrControllerMissing
 	case V1:
-		return cg.rw.Get(version, "cpuset", "cpuset.effective_cpus")
+		return cg.rw.Get(version, "cpuset", "effective_cpus")
 	case V2:
-		return cg.rw.Get(version, "cpuset", "cpuset.cpus.effective")
+		return cg.rw.Get(version, "cpuset", "cpus.effective")
 	}
 
 	return "", ErrUnknownVersion
@@ -537,9 +537,9 @@ func (cg *CGroup) GetCpuset() (string, error) {
 	case Unavailable:
 		return "", ErrControllerMissing
 	case V1:
-		return cg.rw.Get(version, "cpuset", "cpuset.cpus")
+		return cg.rw.Get(version, "cpuset", "cpus")
 	case V2:
-		return cg.rw.Get(version, "cpuset", "cpuset.cpus")
+		return cg.rw.Get(version, "cpuset", "cpus")
 	}
 
 	return "", ErrUnknownVersion
@@ -552,9 +552,9 @@ func (cg *CGroup) SetCpuset(limit string) error {
 	case Unavailable:
 		return ErrControllerMissing
 	case V1:
-		return cg.rw.Set(version, "cpuset", "cpuset.cpus", limit)
+		return cg.rw.Set(version, "cpuset", "cpus", limit)
 	case V2:
-		return cg.rw.Set(version, "cpuset", "cpuset.cpus", limit)
+		return cg.rw.Set(version, "cpuset", "cpus", limit)
 	}
 
 	return ErrUnknownVersion

@@ -341,7 +341,7 @@ func deviceTaskBalance(s *state.State) {
 		// Older kernel - use cpuset.cpus
 		effectiveCpus, err = cg.GetCpuset()
 		if err != nil {
-			logger.Errorf("Error reading host's cpuset.cpus")
+			logger.Errorf("Error reading host's cpuset/cpus")
 			return
 		}
 	}
