@@ -26,6 +26,7 @@ import (
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/network/openvswitch"
 	"github.com/lxc/lxd/lxd/project"
+	"github.com/lxc/lxd/lxd/resources"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
@@ -215,10 +216,9 @@ func (d *nicBridged) validateEnvironment() error {
 	return nil
 }
 
-// CanHotPlug returns whether the device can be managed whilst the instance is running, it also
-// returns a list of fields that can be updated without triggering a device remove & add.
-func (d *nicBridged) CanHotPlug() (bool, []string) {
-	return true, []string{"limits.ingress", "limits.egress", "limits.max", "ipv4.routes", "ipv6.routes", "ipv4.address", "ipv6.address", "security.mac_filtering", "security.ipv4_filtering", "security.ipv6_filtering"}
+// UpdatableFields returns a list of fields that can be updated without triggering a device remove & add.
+func (d *nicBridged) UpdatableFields() []string {
+	return []string{"limits.ingress", "limits.egress", "limits.max", "ipv4.routes", "ipv6.routes", "ipv4.address", "ipv6.address", "security.mac_filtering", "security.ipv4_filtering", "security.ipv6_filtering"}
 }
 
 // Add is run when a device is added to a non-snapshot instance whether or not the instance is running.
@@ -493,7 +493,7 @@ func (d *nicBridged) rebuildDnsmasqEntry() error {
 	defer dnsmasq.ConfigMutex.Unlock()
 
 	// Use project.Default here as bridge networks don't support projects.
-	_, dbInfo, err := d.state.Cluster.GetNetworkInAnyState(project.Default, d.config["parent"])
+	_, dbInfo, _, err := d.state.Cluster.GetNetworkInAnyState(project.Default, d.config["parent"])
 	if err != nil {
 		return err
 	}
@@ -1193,7 +1193,11 @@ func (d *nicBridged) State() (*api.InstanceStateNetwork, error) {
 
 	// Retrieve the host counters, as we report the values from the instance's point of view,
 	// those counters need to be reversed below.
-	hostCounters := shared.NetworkGetCounters(d.config["host_name"])
+	hostCounters, err := resources.GetNetworkCounters(d.config["host_name"])
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed getting network interface counters")
+	}
+
 	network := api.InstanceStateNetwork{
 		Addresses: addresses,
 		Counters: api.InstanceStateNetworkCounters{

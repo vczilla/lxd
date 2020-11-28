@@ -239,6 +239,37 @@ func (d *lvm) HasVolume(vol Volume) bool {
 	return volExists
 }
 
+// FillVolumeConfig populate volume with default config.
+func (d *lvm) FillVolumeConfig(vol Volume) error {
+	// Only validate filesystem config keys for filesystem volumes or VM block volumes (which have an
+	// associated filesystem volume).
+	if vol.ContentType() == ContentTypeFS || vol.IsVMBlock() {
+		// Inherit filesystem from pool if not set.
+		if vol.config["block.filesystem"] == "" {
+			vol.config["block.filesystem"] = d.config["volume.block.filesystem"]
+		}
+
+		// Default filesystem if neither volume nor pool specify an override.
+		if vol.config["block.filesystem"] == "" {
+			// Unchangeable volume property: Set unconditionally.
+			vol.config["block.filesystem"] = DefaultFilesystem
+		}
+
+		// Inherit filesystem mount options from pool if not set.
+		if vol.config["block.mount_options"] == "" {
+			vol.config["block.mount_options"] = d.config["volume.block.mount_options"]
+		}
+
+		// Default filesystem mount options if neither volume nor pool specify an override.
+		if vol.config["block.mount_options"] == "" {
+			// Unchangeable volume property: Set unconditionally.
+			vol.config["block.mount_options"] = "discard"
+		}
+	}
+
+	return nil
+}
+
 // ValidateVolume validates the supplied volume config.
 func (d *lvm) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
 	rules := map[string]func(value string) error{
@@ -371,42 +402,63 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, op *operations.Operation) 
 		defer d.deactivateVolume(volDevPath)
 	}
 
+	inUse := vol.MountInUse()
+
 	// Resize filesystem if needed.
 	if vol.contentType == ContentTypeFS {
+		fsType := vol.ConfigBlockFilesystem()
+
 		if sizeBytes < oldSizeBytes {
-			// Shrink filesystem to new size first, then shrink logical volume.
-			err = shrinkFileSystem(vol.ConfigBlockFilesystem(), volDevPath, vol, sizeBytes)
+			if !filesystemTypeCanBeShrunk(fsType) {
+				return errors.Wrapf(ErrCannotBeShrunk, "Filesystem %q cannot be shrunk", fsType)
+			}
+
+			if inUse {
+				return ErrInUse // We don't allow online shrinking of filesytem volumes.
+			}
+
+			// Shrink filesystem first.
+			err = shrinkFileSystem(fsType, volDevPath, vol, sizeBytes)
 			if err != nil {
 				return err
 			}
 			d.logger.Debug("Logical volume filesystem shrunk", logCtx)
 
+			// Shrink the block device.
 			err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 			if err != nil {
 				return err
 			}
 		} else if sizeBytes > oldSizeBytes {
-			// Grow logical volume to new size first, then grow filesystem to fill it.
+			// Grow block device first.
 			err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 			if err != nil {
 				return err
 			}
 
-			err = growFileSystem(vol.ConfigBlockFilesystem(), volDevPath, vol)
+			// Grow the filesystem to fill block device.
+			err = growFileSystem(fsType, volDevPath, vol)
 			if err != nil {
 				return err
 			}
 			d.logger.Debug("Logical volume filesystem grown", logCtx)
 		}
 	} else {
-		if sizeBytes < oldSizeBytes && !vol.allowUnsafeResize {
-			return errors.Wrap(ErrCannotBeShrunk, "You cannot shrink block volumes")
+		// Only perform pre-resize sanity checks if we are not in "unsafe" mode.
+		// In unsafe mode we expect the caller to know what they are doing and understand the risks.
+		if !vol.allowUnsafeResize {
+			if sizeBytes < oldSizeBytes {
+				return errors.Wrap(ErrCannotBeShrunk, "Block volumes cannot be shrunk")
+			}
+
+			if inUse {
+				return ErrInUse // We don't allow online resizing of block volumes.
+			}
 		}
 
 		err = d.resizeLogicalVolume(volDevPath, sizeBytes)
 		if err != nil {
 			return err
-
 		}
 
 		// Move the VM GPT alt header to end of disk if needed (not needed in unsafe resize mode as it is

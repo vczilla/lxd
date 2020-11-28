@@ -77,6 +77,11 @@ func (d *common) validatePool(config map[string]string, driverRules map[string]f
 	return nil
 }
 
+// FillVolumeConfig populate volume with default config.
+func (d *common) FillVolumeConfig(vol Volume) error {
+	return nil
+}
+
 // validateVolume validates a volume config against common rules and optional driver specific rules.
 // This functions has a removeUnknownKeys option that if set to true will remove any unknown fields
 // (excluding those starting with "user.") which can be used when translating a volume config to a
@@ -235,6 +240,15 @@ func (d *common) moveGPTAltHeader(devPath string) error {
 func (d *common) runFiller(vol Volume, devPath string, filler *VolumeFiller) error {
 	if filler == nil || filler.Fill == nil {
 		return nil
+	}
+
+	// Allow filler to resize initial image volume as needed. Some storage drivers don't normally allow
+	// image volumes to be resized due to them having read-only snapshots that cannot be resized. However
+	// when creating the initial image volume and filling it before the snapshot is taken resizing can be
+	// allowed and is required in order to support unpacking images larger than the default volume size.
+	// The filler function is still expected to obey any volume size restrictions configured on the pool.
+	if vol.Type() == VolumeTypeImage {
+		vol.allowUnsafeResize = true
 	}
 
 	vol.driver.Logger().Debug("Running filler function", log.Ctx{"dev": devPath, "path": vol.MountPath()})

@@ -115,6 +115,19 @@ func (n *bridge) FillConfig(config map[string]string) error {
 		}
 	}
 
+	// Now replace any "auto" keys with generated values.
+	err := n.populateAutoConfig(config)
+	if err != nil {
+		return errors.Wrapf(err, "Failed generating auto config")
+	}
+
+	return nil
+}
+
+// populateAutoConfig replaces "auto" in config with generated values.
+func (n *bridge) populateAutoConfig(config map[string]string) error {
+	changedConfig := false
+
 	// Now populate "auto" values where needed.
 	if config["ipv4.address"] == "auto" {
 		subnet, err := randomSubnetV4()
@@ -123,6 +136,7 @@ func (n *bridge) FillConfig(config map[string]string) error {
 		}
 
 		config["ipv4.address"] = subnet
+		changedConfig = true
 	}
 
 	if config["ipv6.address"] == "auto" {
@@ -132,6 +146,7 @@ func (n *bridge) FillConfig(config map[string]string) error {
 		}
 
 		config["ipv6.address"] = subnet
+		changedConfig = true
 	}
 
 	if config["fan.underlay_subnet"] == "auto" {
@@ -141,6 +156,12 @@ func (n *bridge) FillConfig(config map[string]string) error {
 		}
 
 		config["fan.underlay_subnet"] = subnet.String()
+		changedConfig = true
+	}
+
+	// Re-validate config if changed.
+	if changedConfig && n.state != nil {
+		return n.Validate(config)
 	}
 
 	return nil
@@ -368,7 +389,7 @@ func (n *bridge) Validate(config map[string]string) error {
 
 		_, err := parseIPRanges(config["ipv4.ovn.ranges"], allowedNets...)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed parsing ipv4.ovn.ranges")
 		}
 	}
 
@@ -387,7 +408,7 @@ func (n *bridge) Validate(config map[string]string) error {
 
 		_, err := parseIPRanges(config["ipv6.ovn.ranges"], allowedNets...)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed parsing ipv6.ovn.ranges")
 		}
 	}
 
@@ -414,18 +435,20 @@ func (n *bridge) isRunning() bool {
 func (n *bridge) Delete(clientType cluster.ClientType) error {
 	n.logger.Debug("Delete", log.Ctx{"clientType": clientType})
 
-	// Bring the network down.
-	if n.isRunning() {
-		err := n.Stop()
+	// Bring the local network down if created on this node.
+	if n.LocalStatus() == api.NetworkStatusCreated {
+		if n.isRunning() {
+			err := n.Stop()
+			if err != nil {
+				return err
+			}
+		}
+
+		// Delete apparmor profiles.
+		err := apparmor.NetworkDelete(n.state, n)
 		if err != nil {
 			return err
 		}
-	}
-
-	// Delete apparmor profiles.
-	err := apparmor.NetworkDelete(n.state, n)
-	if err != nil {
-		return err
 	}
 
 	return n.common.delete(clientType)
@@ -487,9 +510,8 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 
 	n.logger.Debug("Setting up network")
 
-	if n.status == api.NetworkStatusPending {
-		return fmt.Errorf("Cannot start pending network")
-	}
+	revert := revert.New()
+	defer revert.Fail()
 
 	// Create directory.
 	if !shared.PathExists(shared.VarPath("networks", n.name)) {
@@ -511,11 +533,13 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			if err != nil {
 				return err
 			}
+			revert.Add(func() { ovs.BridgeDelete(n.name) })
 		} else {
 			_, err := shared.RunCommand("ip", "link", "add", "dev", n.name, "type", "bridge")
 			if err != nil {
 				return err
 			}
+			revert.Add(func() { shared.RunCommand("ip", "link", "delete", "dev", n.name) })
 		}
 	}
 
@@ -573,6 +597,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	if mtu != "" && n.config["bridge.driver"] != "openvswitch" {
 		_, err = shared.RunCommand("ip", "link", "add", "dev", fmt.Sprintf("%s-mtu", n.name), "mtu", mtu, "type", "dummy")
 		if err == nil {
+			revert.Add(func() { shared.RunCommand("ip", "link", "delete", "dev", fmt.Sprintf("%s-mtu", n.name)) })
 			_, err = shared.RunCommand("ip", "link", "set", "dev", fmt.Sprintf("%s-mtu", n.name), "up")
 			if err == nil {
 				AttachInterface(n.name, fmt.Sprintf("%s-mtu", n.name))
@@ -794,7 +819,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		// Parse the subnet.
 		ip, subnet, err := net.ParseCIDR(n.config["ipv4.address"])
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed parsing ipv4.address")
 		}
 
 		// Update the dnsmasq config.
@@ -911,7 +936,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		// Parse the subnet.
 		ip, subnet, err := net.ParseCIDR(n.config["ipv6.address"])
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed parsing ipv6.address")
 		}
 		subnetSize, _ := subnet.Mask.Size()
 
@@ -1052,7 +1077,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		underlay := n.config["fan.underlay_subnet"]
 		_, underlaySubnet, err := net.ParseCIDR(underlay)
 		if err != nil {
-			return nil
+			return errors.Wrapf(err, "Failed parsing fan.underlay_subnet")
 		}
 
 		// Parse the overlay.
@@ -1063,7 +1088,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 
 		_, overlaySubnet, err = net.ParseCIDR(overlay)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed parsing fan.overlay_subnet")
 		}
 
 		// Get the address.
@@ -1108,7 +1133,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		// Parse the host subnet.
 		_, hostSubnet, err := net.ParseCIDR(fmt.Sprintf("%s/24", addr[0]))
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed parsing fan address")
 		}
 
 		// Add the address.
@@ -1438,6 +1463,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 	}
 
+	revert.Success()
 	return nil
 }
 
@@ -1519,10 +1545,9 @@ func (n *bridge) Stop() error {
 func (n *bridge) Update(newNetwork api.NetworkPut, targetNode string, clientType cluster.ClientType) error {
 	n.logger.Debug("Update", log.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
-	// Populate default values if they are missing.
-	err := n.FillConfig(newNetwork.Config)
+	err := n.populateAutoConfig(newNetwork.Config)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "Failed generating auto config")
 	}
 
 	dbUpdateNeeeded, changedKeys, oldNetwork, err := n.common.configChanged(newNetwork)
@@ -1534,50 +1559,58 @@ func (n *bridge) Update(newNetwork api.NetworkPut, targetNode string, clientType
 		return nil // Nothing changed.
 	}
 
+	if n.LocalStatus() == api.NetworkStatusPending {
+		// Apply DB change to local node only.
+		return n.common.update(newNetwork, targetNode, clientType)
+	}
+
 	revert := revert.New()
 	defer revert.Fail()
 
-	// Define a function which reverts everything.
-	revert.Add(func() {
-		// Reset changes to all nodes and database.
-		n.common.update(oldNetwork, targetNode, clientType)
+	// Perform any pre-update cleanup needed if local node network was already created.
+	if len(changedKeys) > 0 {
+		// Define a function which reverts everything.
+		revert.Add(func() {
+			// Reset changes to all nodes and database.
+			n.common.update(oldNetwork, targetNode, clientType)
 
-		// Reset any change that was made to local bridge.
-		n.setup(newNetwork.Config)
-	})
+			// Reset any change that was made to local bridge.
+			n.setup(newNetwork.Config)
+		})
 
-	// Bring the bridge down entirely if the driver has changed.
-	if shared.StringInSlice("bridge.driver", changedKeys) && n.isRunning() {
-		err = n.Stop()
-		if err != nil {
-			return err
-		}
-	}
-
-	// Detach any external interfaces should no longer be attached.
-	if shared.StringInSlice("bridge.external_interfaces", changedKeys) && n.isRunning() {
-		devices := []string{}
-		for _, dev := range strings.Split(newNetwork.Config["bridge.external_interfaces"], ",") {
-			dev = strings.TrimSpace(dev)
-			devices = append(devices, dev)
+		// Bring the bridge down entirely if the driver has changed.
+		if shared.StringInSlice("bridge.driver", changedKeys) && n.isRunning() {
+			err = n.Stop()
+			if err != nil {
+				return err
+			}
 		}
 
-		for _, dev := range strings.Split(oldNetwork.Config["bridge.external_interfaces"], ",") {
-			dev = strings.TrimSpace(dev)
-			if dev == "" {
-				continue
+		// Detach any external interfaces should no longer be attached.
+		if shared.StringInSlice("bridge.external_interfaces", changedKeys) && n.isRunning() {
+			devices := []string{}
+			for _, dev := range strings.Split(newNetwork.Config["bridge.external_interfaces"], ",") {
+				dev = strings.TrimSpace(dev)
+				devices = append(devices, dev)
 			}
 
-			if !shared.StringInSlice(dev, devices) && InterfaceExists(dev) {
-				err = DetachInterface(n.name, dev)
-				if err != nil {
-					return err
+			for _, dev := range strings.Split(oldNetwork.Config["bridge.external_interfaces"], ",") {
+				dev = strings.TrimSpace(dev)
+				if dev == "" {
+					continue
+				}
+
+				if !shared.StringInSlice(dev, devices) && InterfaceExists(dev) {
+					err = DetachInterface(n.name, dev)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
 	}
 
-	// Apply changes to all nodes and databse.
+	// Apply changes to all nodes and database.
 	err = n.common.update(newNetwork, targetNode, clientType)
 	if err != nil {
 		return err

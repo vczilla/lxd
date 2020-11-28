@@ -57,6 +57,7 @@ type Instance interface {
 	RegisterDevices()
 	SaveConfigFile() error
 
+	Info() Info
 	IsPrivileged() bool
 
 	// Snapshots & migration & backups.
@@ -69,7 +70,7 @@ type Instance interface {
 	Rename(newName string) error
 	Update(newConfig db.InstanceArgs, userRequested bool) error
 
-	Delete() error
+	Delete(force bool) error
 	Export(w io.Writer, properties map[string]string) (api.ImageMetadata, error)
 
 	// Used for security.
@@ -163,4 +164,10 @@ type CriuMigrationArgs struct {
 	DumpDir      string
 	PreDumpDir   string
 	Features     liblxc.CriuFeatures
+}
+
+// Info represents information about an instance driver.
+type Info struct {
+	Name    string // Name of an instance driver, e.g. "lxc"
+	Version string // Version number of a loaded instance driver
 }

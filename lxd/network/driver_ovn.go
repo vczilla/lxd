@@ -82,7 +82,7 @@ func (n *ovn) Info() Info {
 
 // uplinkRoutes parses ipv4.routes and ipv6.routes settings for a named uplink network into a slice of *net.IPNet.
 func (n *ovn) uplinkRoutes(uplinkNetworkName string) ([]*net.IPNet, error) {
-	_, uplink, err := n.state.Cluster.GetNetworkInAnyState(project.Default, uplinkNetworkName)
+	_, uplink, _, err := n.state.Cluster.GetNetworkInAnyState(project.Default, uplinkNetworkName)
 	if err != nil {
 		return nil, err
 	}
@@ -233,10 +233,11 @@ func (n *ovn) Validate(config map[string]string) error {
 	// If NAT disabled, parse the external subnets that are being requested.
 	var externalSubnets []*net.IPNet
 	for _, keyPrefix := range []string{"ipv4", "ipv6"} {
-		if !shared.IsTrue(config[fmt.Sprintf("%s.nat", keyPrefix)]) && validate.IsOneOf(config[fmt.Sprintf("%s.address", keyPrefix)], []string{"", "none", "auto"}) != nil {
-			_, ipNet, err := net.ParseCIDR(config[fmt.Sprintf("%s.address", keyPrefix)])
+		addressKey := fmt.Sprintf("%s.address", keyPrefix)
+		if !shared.IsTrue(config[fmt.Sprintf("%s.nat", keyPrefix)]) && validate.IsOneOf(config[addressKey], []string{"", "none", "auto"}) != nil {
+			_, ipNet, err := net.ParseCIDR(config[addressKey])
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "Failed parsing %s", addressKey)
 			}
 
 			externalSubnets = append(externalSubnets, ipNet)
@@ -1196,22 +1197,30 @@ func (n *ovn) deleteUplinkPortPhysical(uplinkNet Network) error {
 
 // FillConfig fills requested config with any default values.
 func (n *ovn) FillConfig(config map[string]string) error {
-	changedConfig := false
-
 	if config["ipv4.address"] == "" {
 		config["ipv4.address"] = "auto"
-		changedConfig = true
 	}
 
 	if config["ipv6.address"] == "" {
 		content, err := ioutil.ReadFile("/proc/sys/net/ipv6/conf/default/disable_ipv6")
 		if err == nil && string(content) == "0\n" {
 			config["ipv6.address"] = "auto"
-			changedConfig = true
 		}
 	}
 
-	// Now populate "auto" values where needed.
+	// Now replace any "auto" keys with generated values.
+	err := n.populateAutoConfig(config)
+	if err != nil {
+		return errors.Wrapf(err, "Failed generating auto config")
+	}
+
+	return nil
+}
+
+// populateAutoConfig replaces "auto" in config with generated values.
+func (n *ovn) populateAutoConfig(config map[string]string) error {
+	changedConfig := false
+
 	if config["ipv4.address"] == "auto" {
 		subnet, err := randomSubnetV4()
 		if err != nil {
@@ -1242,6 +1251,7 @@ func (n *ovn) FillConfig(config map[string]string) error {
 		changedConfig = true
 	}
 
+	// Re-validate config if changed.
 	if changedConfig && n.state != nil {
 		return n.Validate(config)
 	}
@@ -1758,61 +1768,63 @@ func (n *ovn) deleteChassisGroupEntry() error {
 func (n *ovn) Delete(clientType cluster.ClientType) error {
 	n.logger.Debug("Delete", log.Ctx{"clientType": clientType})
 
-	err := n.Stop()
-	if err != nil {
-		return err
-	}
-
-	if clientType == cluster.ClientTypeNormal {
-		client, err := n.getClient()
+	if n.LocalStatus() == api.NetworkStatusCreated {
+		err := n.Stop()
 		if err != nil {
 			return err
 		}
 
-		err = client.LogicalRouterDelete(n.getRouterName())
-		if err != nil {
-			return err
-		}
+		if clientType == cluster.ClientTypeNormal {
+			client, err := n.getClient()
+			if err != nil {
+				return err
+			}
 
-		err = client.LogicalSwitchDelete(n.getExtSwitchName())
-		if err != nil {
-			return err
-		}
+			err = client.LogicalRouterDelete(n.getRouterName())
+			if err != nil {
+				return err
+			}
 
-		err = client.LogicalSwitchDelete(n.getIntSwitchName())
-		if err != nil {
-			return err
-		}
+			err = client.LogicalSwitchDelete(n.getExtSwitchName())
+			if err != nil {
+				return err
+			}
 
-		err = client.LogicalRouterPortDelete(n.getRouterExtPortName())
-		if err != nil {
-			return err
-		}
+			err = client.LogicalSwitchDelete(n.getIntSwitchName())
+			if err != nil {
+				return err
+			}
 
-		err = client.LogicalRouterPortDelete(n.getRouterIntPortName())
-		if err != nil {
-			return err
-		}
+			err = client.LogicalRouterPortDelete(n.getRouterExtPortName())
+			if err != nil {
+				return err
+			}
 
-		err = client.LogicalSwitchPortDelete(n.getExtSwitchRouterPortName())
-		if err != nil {
-			return err
-		}
+			err = client.LogicalRouterPortDelete(n.getRouterIntPortName())
+			if err != nil {
+				return err
+			}
 
-		err = client.LogicalSwitchPortDelete(n.getExtSwitchProviderPortName())
-		if err != nil {
-			return err
-		}
+			err = client.LogicalSwitchPortDelete(n.getExtSwitchRouterPortName())
+			if err != nil {
+				return err
+			}
 
-		err = client.LogicalSwitchPortDelete(n.getIntSwitchRouterPortName())
-		if err != nil {
-			return err
-		}
+			err = client.LogicalSwitchPortDelete(n.getExtSwitchProviderPortName())
+			if err != nil {
+				return err
+			}
 
-		// Must be done after logical router removal.
-		err = client.ChassisGroupDelete(n.getChassisGroupName())
-		if err != nil {
-			return err
+			err = client.LogicalSwitchPortDelete(n.getIntSwitchRouterPortName())
+			if err != nil {
+				return err
+			}
+
+			// Must be done after logical router removal.
+			err = client.ChassisGroupDelete(n.getChassisGroupName())
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1835,10 +1847,6 @@ func (n *ovn) Rename(newName string) error {
 // Start starts adds the local OVS chassis ID to the OVN chass group and starts the local OVS uplink port.
 func (n *ovn) Start() error {
 	n.logger.Debug("Start")
-
-	if n.status == api.NetworkStatusPending {
-		return fmt.Errorf("Cannot start pending network")
-	}
 
 	// Add local node's OVS chassis ID to logical chassis group.
 	err := n.addChassisGroupEntry()
@@ -1879,10 +1887,9 @@ func (n *ovn) Stop() error {
 func (n *ovn) Update(newNetwork api.NetworkPut, targetNode string, clientType cluster.ClientType) error {
 	n.logger.Debug("Update", log.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
-	// Populate default values if they are missing.
-	err := n.FillConfig(newNetwork.Config)
+	err := n.populateAutoConfig(newNetwork.Config)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "Failed generating auto config")
 	}
 
 	dbUpdateNeeeded, changedKeys, oldNetwork, err := n.common.configChanged(newNetwork)
@@ -1892,6 +1899,11 @@ func (n *ovn) Update(newNetwork api.NetworkPut, targetNode string, clientType cl
 
 	if !dbUpdateNeeeded {
 		return nil // Nothing changed.
+	}
+
+	if n.LocalStatus() == api.NetworkStatusPending {
+		// Apply DB change to local node only.
+		return n.common.update(newNetwork, targetNode, clientType)
 	}
 
 	revert := revert.New()
@@ -1949,8 +1961,8 @@ func (n *ovn) Update(newNetwork api.NetworkPut, targetNode string, clientType cl
 }
 
 // getInstanceDevicePortName returns the switch port name to use for an instance device.
-func (n *ovn) getInstanceDevicePortName(instanceID int, deviceName string) openvswitch.OVNSwitchPort {
-	return openvswitch.OVNSwitchPort(fmt.Sprintf("%s-%d-%s", n.getIntSwitchInstancePortPrefix(), instanceID, deviceName))
+func (n *ovn) getInstanceDevicePortName(instanceUUID string, deviceName string) openvswitch.OVNSwitchPort {
+	return openvswitch.OVNSwitchPort(fmt.Sprintf("%s-%s-%s", n.getIntSwitchInstancePortPrefix(), instanceUUID, deviceName))
 }
 
 // InstanceDevicePortValidateExternalRoutes validates the external routes for an OVN instance port.
@@ -2041,7 +2053,11 @@ func (n *ovn) InstanceDevicePortValidateExternalRoutes(deviceInstance instance.I
 }
 
 // InstanceDevicePortAdd adds an instance device port to the internal logical switch and returns the port name.
-func (n *ovn) InstanceDevicePortAdd(instanceID int, instanceName string, deviceName string, mac net.HardwareAddr, ips []net.IP, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) (openvswitch.OVNSwitchPort, error) {
+func (n *ovn) InstanceDevicePortAdd(instanceUUID string, instanceName string, deviceName string, mac net.HardwareAddr, ips []net.IP, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) (openvswitch.OVNSwitchPort, error) {
+	if instanceUUID == "" {
+		return "", fmt.Errorf("Instance UUID is required")
+	}
+
 	var dhcpV4ID, dhcpv6ID string
 
 	revert := revert.New()
@@ -2101,7 +2117,7 @@ func (n *ovn) InstanceDevicePortAdd(instanceID int, instanceName string, deviceN
 		}
 	}
 
-	instancePortName := n.getInstanceDevicePortName(instanceID, deviceName)
+	instancePortName := n.getInstanceDevicePortName(instanceUUID, deviceName)
 
 	// Add port with mayExist set to true, so that if instance port exists, we don't fail and continue below
 	// to configure the port as needed. This is required in case the OVN northbound database was unavailable
@@ -2232,8 +2248,12 @@ func (n *ovn) InstanceDevicePortAdd(instanceID int, instanceName string, deviceN
 }
 
 // InstanceDevicePortDynamicIPs returns the dynamically allocated IPs for a device port.
-func (n *ovn) InstanceDevicePortDynamicIPs(instanceID int, deviceName string) ([]net.IP, error) {
-	instancePortName := n.getInstanceDevicePortName(instanceID, deviceName)
+func (n *ovn) InstanceDevicePortDynamicIPs(instanceUUID string, deviceName string) ([]net.IP, error) {
+	if instanceUUID == "" {
+		return nil, fmt.Errorf("Instance UUID is required")
+	}
+
+	instancePortName := n.getInstanceDevicePortName(instanceUUID, deviceName)
 
 	client, err := n.getClient()
 	if err != nil {
@@ -2244,8 +2264,20 @@ func (n *ovn) InstanceDevicePortDynamicIPs(instanceID int, deviceName string) ([
 }
 
 // InstanceDevicePortDelete deletes an instance device port from the internal logical switch.
-func (n *ovn) InstanceDevicePortDelete(instanceID int, deviceName string, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) error {
-	instancePortName := n.getInstanceDevicePortName(instanceID, deviceName)
+func (n *ovn) InstanceDevicePortDelete(instanceUUID string, deviceName string, ovsExternalOVNPort openvswitch.OVNSwitchPort, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) error {
+	// Decide whether to use OVS provided OVN port name or internally derived OVN port name.
+	instancePortName := ovsExternalOVNPort
+	source := "OVS"
+	if ovsExternalOVNPort == "" {
+		if instanceUUID == "" {
+			return fmt.Errorf("Instance UUID is required")
+		}
+
+		instancePortName = n.getInstanceDevicePortName(instanceUUID, deviceName)
+		source = "internal"
+	}
+
+	n.logger.Debug("Deleting instance port", log.Ctx{"port": instancePortName, "source": source})
 
 	client, err := n.getClient()
 	if err != nil {

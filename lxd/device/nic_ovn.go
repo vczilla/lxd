@@ -17,6 +17,7 @@ import (
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/network/openvswitch"
 	"github.com/lxc/lxd/lxd/project"
+	"github.com/lxc/lxd/lxd/resources"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
@@ -29,9 +30,9 @@ type ovnNet interface {
 	network.Network
 
 	InstanceDevicePortValidateExternalRoutes(deviceInstance instance.Instance, deviceName string, externalRoutes []*net.IPNet) error
-	InstanceDevicePortAdd(instanceID int, instanceName string, deviceName string, mac net.HardwareAddr, ips []net.IP, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) (openvswitch.OVNSwitchPort, error)
-	InstanceDevicePortDelete(instanceID int, deviceName string, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) error
-	InstanceDevicePortDynamicIPs(instanceID int, deviceName string) ([]net.IP, error)
+	InstanceDevicePortAdd(instanceUUID string, instanceName string, deviceName string, mac net.HardwareAddr, ips []net.IP, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) (openvswitch.OVNSwitchPort, error)
+	InstanceDevicePortDelete(instanceUUID string, deviceName string, ovsExternalOVNPort openvswitch.OVNSwitchPort, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) error
+	InstanceDevicePortDynamicIPs(instanceUUID string, deviceName string) ([]net.IP, error)
 }
 
 type nicOVN struct {
@@ -206,12 +207,6 @@ func (d *nicOVN) validateEnvironment() error {
 	return nil
 }
 
-// CanHotPlug returns whether the device can be managed whilst the instance is running, it also
-// returns a list of fields that can be updated without triggering a device remove & add.
-func (d *nicOVN) CanHotPlug() (bool, []string) {
-	return true, []string{}
-}
-
 // Start is run when the device is added to a running instance or instance is starting up.
 func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 	err := d.validateEnvironment()
@@ -306,12 +301,13 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	// Add new OVN logical switch port for instance.
-	logicalPortName, err := d.network.InstanceDevicePortAdd(d.inst.ID(), d.inst.Name(), d.name, mac, ips, internalRoutes, externalRoutes)
+	instanceUUID := d.inst.LocalConfig()["volatile.uuid"]
+	logicalPortName, err := d.network.InstanceDevicePortAdd(instanceUUID, d.inst.Name(), d.name, mac, ips, internalRoutes, externalRoutes)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Failed adding OVN port")
 	}
 
-	revert.Add(func() { d.network.InstanceDevicePortDelete(d.inst.ID(), d.name, internalRoutes, externalRoutes) })
+	revert.Add(func() { d.network.InstanceDevicePortDelete(instanceUUID, d.name, "", internalRoutes, externalRoutes) })
 
 	// Attach host side veth interface to bridge.
 	integrationBridge, err := d.getIntegrationBridgeName()
@@ -374,10 +370,8 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 	oldConfig := oldDevices[d.name]
 
-	v := d.volatileGet()
-
 	// Populate device config with volatile fields if needed.
-	networkVethFillFromVolatile(d.config, v)
+	networkVethFillFromVolatile(d.config, d.volatileGet())
 
 	// If instance is running, apply host side limits and filters first before rebuilding
 	// dnsmasq config below so that existing config can be used as part of the filter removal.
@@ -442,7 +436,19 @@ func (d *nicOVN) Stop() (*deviceConfig.RunConfig, error) {
 		}
 	}
 
-	err = d.network.InstanceDevicePortDelete(d.inst.ID(), d.name, internalRoutes, externalRoutes)
+	// Try and retrieve the last associated OVN switch port for the instance interface in the local OVS DB.
+	// If we cannot get this, don't fail, as InstanceDevicePortDelete will then try and generate the likely
+	// port name using the same regime it does for new ports. This part is only here in order to allow
+	// instance ports generated under an older regime to be cleaned up properly.
+	networkVethFillFromVolatile(d.config, d.volatileGet())
+	ovs := openvswitch.NewOVS()
+	ovsExternalOVNPort, err := ovs.InterfaceAssociatedOVNSwitchPort(d.config["host_name"])
+	if err != nil {
+		d.logger.Warn("Could not find OVN Switch port associated to OVS interface", log.Ctx{"interface": d.config["host_name"]})
+	}
+
+	instanceUUID := d.inst.LocalConfig()["volatile.uuid"]
+	err = d.network.InstanceDevicePortDelete(instanceUUID, d.name, ovsExternalOVNPort, internalRoutes, externalRoutes)
 	if err != nil {
 		// Don't fail here as we still want the postStop hook to run to clean up the local veth pair.
 		d.logger.Error("Failed to remove OVN device port", log.Ctx{"err": err})
@@ -457,9 +463,7 @@ func (d *nicOVN) postStop() error {
 		"host_name": "",
 	})
 
-	v := d.volatileGet()
-
-	networkVethFillFromVolatile(d.config, v)
+	networkVethFillFromVolatile(d.config, d.volatileGet())
 
 	if d.config["host_name"] != "" && shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["host_name"])) {
 		integrationBridge, err := d.getIntegrationBridgeName()
@@ -492,10 +496,8 @@ func (d *nicOVN) Remove() error {
 
 // State gets the state of an OVN NIC by querying the OVN Northbound logical switch port record.
 func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
-	v := d.volatileGet()
-
 	// Populate device config with volatile fields (hwaddr and host_name) if needed.
-	networkVethFillFromVolatile(d.config, v)
+	networkVethFillFromVolatile(d.config, d.volatileGet())
 
 	addresses := []api.InstanceStateNetworkAddress{}
 	netConfig := d.network.Config()
@@ -518,7 +520,8 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 
 	// OVN only supports dynamic IP allocation if neither IPv4 or IPv6 are statically set.
 	if d.config["ipv4.address"] == "" && d.config["ipv6.address"] == "" {
-		dynamicIPs, err := d.network.InstanceDevicePortDynamicIPs(d.inst.ID(), d.name)
+		instanceUUID := d.inst.LocalConfig()["volatile.uuid"]
+		dynamicIPs, err := d.network.InstanceDevicePortDynamicIPs(instanceUUID, d.name)
 		if err == nil {
 			for _, dynamicIP := range dynamicIPs {
 				family := "inet"
@@ -584,7 +587,11 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 
 	// Retrieve the host counters, as we report the values from the instance's point of view,
 	// those counters need to be reversed below.
-	hostCounters := shared.NetworkGetCounters(d.config["host_name"])
+	hostCounters, err := resources.GetNetworkCounters(d.config["host_name"])
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed getting network interface counters")
+	}
+
 	network := api.InstanceStateNetwork{
 		Addresses: addresses,
 		Counters: api.InstanceStateNetworkCounters{

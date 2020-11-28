@@ -235,6 +235,8 @@ var APIExtensions = []string{
 	"network_ovn_external_routes_remove",
 	"tpm_device_type",
 	"storage_zfs_clone_copy_rebase",
+	"gpu_mdev",
+	"resources_pci_iommu",
 }
 
 // APIExtensionsCount returns the number of available API extensions.

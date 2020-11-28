@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -19,6 +21,7 @@ import (
 	"github.com/lxc/lxd/lxd/db"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
+	"github.com/lxc/lxd/lxd/instance/drivers"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/project"
@@ -48,7 +51,7 @@ func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, 
 			return
 		}
 
-		inst.Delete()
+		inst.Delete(true)
 	}()
 
 	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
@@ -149,14 +152,9 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 		return nil, errors.Wrap(err, "Failed creating instance record")
 	}
 
-	revert := true
-	defer func() {
-		if !revert {
-			return
-		}
-
-		inst.Delete()
-	}()
+	revert := revert.New()
+	defer revert.Fail()
+	revert.Add(func() { inst.Delete(true) })
 
 	err = s.Cluster.UpdateImageLastUseDate(hash, time.Now().UTC())
 	if err != nil {
@@ -178,7 +176,7 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 		return nil, err
 	}
 
-	revert = false
+	revert.Success()
 	return inst, nil
 }
 
@@ -191,7 +189,7 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 			return
 		}
 
-		revertInst.Delete()
+		revertInst.Delete(true)
 	}()
 
 	if refresh {
@@ -238,7 +236,7 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 
 			// Delete extra snapshots first.
 			for _, snap := range deleteSnapshots {
-				err := snap.Delete()
+				err := snap.Delete(true)
 				if err != nil {
 					return nil, err
 				}
@@ -389,7 +387,7 @@ func instanceCreateAsSnapshot(s *state.State, args db.InstanceArgs, sourceInstan
 	if err != nil {
 		return nil, errors.Wrapf(err, "Failed creating instance snapshot record %q", args.Name)
 	}
-	revert.Add(func() { inst.Delete() })
+	revert.Add(func() { inst.Delete(true) })
 
 	pool, err := storagePools.GetPoolByInstance(s, inst)
 	if err != nil {
@@ -497,7 +495,7 @@ func instanceCreateInternal(s *state.State, args db.InstanceArgs) (instance.Inst
 	checkedProfiles := []string{}
 	for _, profile := range args.Profiles {
 		if !shared.StringInSlice(profile, profiles) {
-			return nil, fmt.Errorf("Requested profile '%s' doesn't exist", profile)
+			return nil, fmt.Errorf("Requested profile %q doesn't exist", profile)
 		}
 
 		if shared.StringInSlice(profile, checkedProfiles) {
@@ -611,7 +609,7 @@ func instanceCreateInternal(s *state.State, args db.InstanceArgs) (instance.Inst
 			if shared.IsSnapshot(args.Name) {
 				thing = "Snapshot"
 			}
-			return nil, fmt.Errorf("%s '%s' already exists", thing, args.Name)
+			return nil, fmt.Errorf("%s %q already exists", thing, args.Name)
 		}
 		return nil, err
 	}
@@ -628,7 +626,8 @@ func instanceCreateInternal(s *state.State, args db.InstanceArgs) (instance.Inst
 	args = db.InstanceToArgs(&dbInst)
 	inst, err := instance.Create(s, args)
 	if err != nil {
-		return nil, errors.Wrap(err, "Create instance")
+		logger.Error("Failed initialising instance", log.Ctx{"project": args.Project, "instance": args.Name, "type": args.Type, "err": err})
+		return nil, errors.Wrap(err, "Failed initialising instance")
 	}
 
 	// Wipe any existing log for this instance name.
@@ -875,7 +874,7 @@ func pruneExpiredContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 func pruneExpiredContainerSnapshots(ctx context.Context, d *Daemon, snapshots []instance.Instance) error {
 	// Find snapshots to delete
 	for _, snapshot := range snapshots {
-		err := snapshot.Delete()
+		err := snapshot.Delete(true)
 		if err != nil {
 			return errors.Wrapf(err, "Failed to delete expired instance snapshot '%s' in project '%s'", snapshot.Name(), snapshot.Project())
 		}
@@ -930,4 +929,39 @@ func containerDetermineNextSnapshotName(d *Daemon, c instance.Instance, defaultP
 	}
 
 	return pattern, nil
+}
+
+var instanceDriversCacheVal atomic.Value
+var instanceDriversCacheLock sync.Mutex
+
+func readInstanceDriversCache() map[string]string {
+	drivers := instanceDriversCacheVal.Load()
+	if drivers == nil {
+		createInstanceDriversCache()
+		drivers = instanceDriversCacheVal.Load()
+	}
+
+	return drivers.(map[string]string)
+}
+
+func createInstanceDriversCache() {
+	// Create the list of instance drivers in use on this LXD instance
+	// namely LXC and QEMU. Given that LXC and QEMU cannot update while
+	// the LXD instance is running, only one cache is ever needed.
+
+	data := map[string]string{}
+
+	info := drivers.SupportedInstanceDrivers()
+	for _, entry := range info {
+		if entry.Version != "" {
+			data[entry.Name] = entry.Version
+		}
+	}
+
+	// Store the value in the cache
+	instanceDriversCacheLock.Lock()
+	instanceDriversCacheVal.Store(data)
+	instanceDriversCacheLock.Unlock()
+
+	return
 }
