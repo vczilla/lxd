@@ -6,7 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/lxc/lxd/lxd/cluster"
+	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/revert"
@@ -97,11 +97,11 @@ func (n *physical) checkParentUse(ourConfig map[string]string) (bool, error) {
 
 // Create checks whether the referenced parent interface is used by other networks or instance devices, as we
 // need to have exclusive access to the interface.
-func (n *physical) Create(clientType cluster.ClientType) error {
+func (n *physical) Create(clientType request.ClientType) error {
 	n.logger.Debug("Create", log.Ctx{"clientType": clientType, "config": n.config})
 
 	// We only need to check in the database once, not on every clustered node.
-	if clientType == cluster.ClientTypeNormal {
+	if clientType == request.ClientTypeNormal {
 		inUse, err := n.checkParentUse(n.config)
 		if err != nil {
 			return err
@@ -111,14 +111,14 @@ func (n *physical) Create(clientType cluster.ClientType) error {
 		}
 	}
 
-	return nil
+	return n.common.create(clientType)
 }
 
 // Delete deletes a network.
-func (n *physical) Delete(clientType cluster.ClientType) error {
+func (n *physical) Delete(clientType request.ClientType) error {
 	n.logger.Debug("Delete", log.Ctx{"clientType": clientType})
 
-	if n.LocalStatus() == api.NetworkStatusCreated {
+	if n.LocalStatus() == api.NetworkStatusCreated || n.LocalStatus() == api.NetworkStatusUnknown {
 		err := n.Stop()
 		if err != nil {
 			return err
@@ -217,7 +217,7 @@ func (n *physical) Stop() error {
 
 // Update updates the network. Accepts notification boolean indicating if this update request is coming from a
 // cluster notification, in which case do not update the database, just apply local changes needed.
-func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientType cluster.ClientType) error {
+func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error {
 	n.logger.Debug("Update", log.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
 	dbUpdateNeeeded, changedKeys, oldNetwork, err := n.common.configChanged(newNetwork)
@@ -240,7 +240,7 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 	hostNameChanged := shared.StringInSlice("vlan", changedKeys) || shared.StringInSlice("parent", changedKeys)
 
 	// We only need to check in the database once, not on every clustered node.
-	if clientType == cluster.ClientTypeNormal {
+	if clientType == request.ClientTypeNormal {
 		if hostNameChanged {
 			isUsed, err := n.IsUsed()
 			if isUsed || err != nil {
