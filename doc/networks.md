@@ -118,7 +118,6 @@ lxc network set <network> <key> <value>
 ```
 
 ### Integration with systemd-resolved
-
 If the system running LXD uses systemd-resolved to perform DNS
 lookups, it's possible to notify resolved of the domain(s) that
 LXD is able to resolve.  This requires telling resolved the
@@ -158,6 +157,10 @@ This resolved configuration will persist as long as the bridge
 exists, so you must repeat this command each reboot and after
 LXD is restarted.  Also note this only works if the bridge
 `dns.mode` is not `none`.
+
+Note that depending on the `dns.domain` used, you may need to disable
+DNSSEC in resolved to allow for DNS resolution. This can be done through
+the `DNSSEC` option in `resolved.conf`.
 
 ### IPv6 prefix size
 For optimal operation, a prefix size of 64 is preferred.
@@ -297,8 +300,10 @@ bridge.mtu                      | integer   | -                     | 1442      
 dns.domain                      | string    | -                     | lxd                       | Domain to advertise to DHCP clients and use for DNS resolution
 dns.search                      | string    | -                     | -                         | Full comma separated domain search list, defaulting to `dns.domain` value
 ipv4.address                    | string    | standard mode         | auto (on create only)     | IPv4 address for the bridge (CIDR notation). Use "none" to turn off IPv4 or "auto" to generate a new random unused subnet
+ipv4.dhcp                       | boolean   | ipv4 address          | true                      | Whether to allocate addresses using DHCP
 ipv4.nat                        | boolean   | ipv4 address          | false                     | Whether to NAT (will default to true if unset and a random ipv4.address is generated)
 ipv6.address                    | string    | standard mode         | auto (on create only)     | IPv6 address for the bridge (CIDR notation). Use "none" to turn off IPv6 or "auto" to generate a new random unused subnet
+ipv6.dhcp                       | boolean   | ipv6 address          | true                      | Whether to provide additional network configuration over DHCP
 ipv6.dhcp.stateful              | boolean   | ipv6 dhcp             | false                     | Whether to allocate addresses using DHCP
 ipv6.nat                        | boolean   | ipv6 address          | false                     | Whether to NAT (will default to true if unset and a random ipv6.address is generated)
 network                         | string    | -                     | -                         | Uplink network to use for external network access
@@ -319,7 +324,10 @@ vlan                            | integer   | -                     | -         
 ipv4.gateway                    | string    | standard mode         | -                         | IPv4 address for the gateway and network (CIDR notation)
 ipv4.ovn.ranges                 | string    | -                     | -                         | Comma separate list of IPv4 ranges to use for child OVN network routers (FIRST-LAST format)
 ipv4.routes                     | string    | ipv4 address          | -                         | Comma separated list of additional IPv4 CIDR subnets that can be used with child OVN networks ipv4.routes.external setting
+ipv4.routes.anycast             | boolean   | ipv4 address          | false                     | Allow the overlapping routes to be used on multiple networks/NIC at the same time.
 ipv6.gateway                    | string    | standard mode         | -                         | IPv6 address for the gateway and network  (CIDR notation)
 ipv6.ovn.ranges                 | string    | -                     | -                         | Comma separate list of IPv6 ranges to use for child OVN network routers (FIRST-LAST format)
 ipv6.routes                     | string    | ipv6 address          | -                         | Comma separated list of additional IPv6 CIDR subnets that can be used with child OVN networks ipv6.routes.external setting
+ipv6.routes.anycast             | boolean   | ipv6 address          | false                     | Allow the overlapping routes to be used on multiple networks/NIC at the same time.
 dns.nameservers                 | string    | standard mode         | -                         | List of DNS server IPs on physical network
+ovn.ingress\_mode               | string    | standard mode         | l2proxy                   | Sets the method that OVN NIC external IPs will be advertised on uplink network. Either `l2proxy` (proxy ARP/NDP) or `routed`.
