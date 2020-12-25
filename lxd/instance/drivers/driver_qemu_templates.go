@@ -14,7 +14,7 @@ type = "q35"
 {{end -}}
 {{if eq .architecture "aarch64" -}}
 type = "virt"
-gic-version = "max"
+gic-version = "2"
 {{end -}}
 {{if eq .architecture "ppc64le" -}}
 type = "pseries"
@@ -22,7 +22,6 @@ type = "pseries"
 {{if eq .architecture "s390x" -}}
 type = "s390-ccw-virtio"
 {{end -}}
-accel = "kvm"
 usb = "off"
 graphics = "off"
 

@@ -861,7 +861,7 @@ func (d *qemu) Start(stateful bool) error {
 		"-name", d.Name(),
 		"-uuid", instUUID,
 		"-daemonize",
-		"-cpu", "host",
+//		"-cpu", "host",
 		"-nographic",
 		"-serial", "chardev:console",
 		"-nodefaults",
