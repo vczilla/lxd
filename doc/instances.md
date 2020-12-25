@@ -321,6 +321,7 @@ maas.subnet.ipv6         | string  | -                 | no       | yes     | MA
 boot.priority            | integer | -                 | no       | no      | Boot priority for VMs (higher boots first)
 vlan                     | integer | -                 | no       | no      | The VLAN ID to use for untagged traffic (Can be `none` to remove port from default VLAN)
 vlan.tagged              | integer | -                 | no       | no      | Comma delimited list of VLAN IDs to join for tagged traffic
+security.port\_isolation | boolean | false             | no       | no      | Prevent the NIC from communicating with other NICs in the network that have port isolation enabled
 
 #### nic: macvlan
 
@@ -791,7 +792,7 @@ mdev        | string    | -                 | no        | The mdev profile to us
 
 ### Type: proxy
 
-Supported instance types: container
+Supported instance types: container (`nat` and non-`nat` modes), VM (`nat` mode only)
 
 Proxy devices allow forwarding network connections between host and instance.
 This makes it possible to forward traffic hitting one of the host's

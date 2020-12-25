@@ -69,7 +69,7 @@ func (n *physical) checkParentUse(ourConfig map[string]string) (bool, error) {
 	var projectNetworks map[string]map[int64]api.Network
 
 	err = n.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		projectNetworks, err = tx.GetNonPendingNetworks()
+		projectNetworks, err = tx.GetCreatedNetworks()
 		return err
 	})
 	if err != nil {
@@ -232,8 +232,10 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 		return nil // Nothing changed.
 	}
 
-	if n.LocalStatus() == api.NetworkStatusPending {
-		// Apply DB change to local node only.
+	// If the network as a whole has not had any previous creation attempts, or the node itself is still
+	// pending, then don't apply the new settings to the node, just to the database record (ready for the
+	// actual global create request to be initiated).
+	if n.Status() == api.NetworkStatusPending || n.LocalStatus() == api.NetworkStatusPending {
 		return n.common.update(newNetwork, targetNode, clientType)
 	}
 
@@ -247,7 +249,7 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 		if hostNameChanged {
 			isUsed, err := n.IsUsed()
 			if isUsed || err != nil {
-				return fmt.Errorf("Cannot update network host name when in use")
+				return fmt.Errorf("Cannot update network parent interface when in use")
 			}
 
 			inUse, err := n.checkParentUse(newNetwork.Config)

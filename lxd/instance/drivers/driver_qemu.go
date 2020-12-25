@@ -343,9 +343,12 @@ func (d *qemu) getStoragePool() (storagePools.Pool, error) {
 }
 
 func (d *qemu) getMonitorEventHandler() func(event string, data map[string]interface{}) {
+	// Create local variables from instance properties we need so as not to keep references to instance around
+	// after we have returned the callback function.
 	projectName := d.Project()
 	instanceName := d.Name()
 	state := d.state
+	logger := d.logger
 
 	return func(event string, data map[string]interface{}) {
 		if !shared.StringInSlice(event, []string{"SHUTDOWN"}) {
@@ -354,11 +357,13 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]inter
 
 		inst, err := instance.LoadByProjectAndName(state, projectName, instanceName)
 		if err != nil {
-			d.logger.Error("Failed to load instance", log.Ctx{"err": err})
+			logger.Error("Failed to load instance", log.Ctx{"err": err})
 			return
 		}
 
 		if event == "SHUTDOWN" {
+			logger.Debug("Instance stopped")
+
 			target := "stop"
 			entry, ok := data["reason"]
 			if ok && entry == "guest-reset" {
@@ -367,7 +372,7 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]inter
 
 			err = inst.(*qemu).onStop(target)
 			if err != nil {
-				d.logger.Error("Failed to cleanly stop instance", log.Ctx{"err": err})
+				logger.Error("Failed to cleanly stop instance", log.Ctx{"err": err})
 				return
 			}
 		}
@@ -812,6 +817,7 @@ func (d *qemu) Start(stateful bool) error {
 	}
 
 	devConfs := make([]*deviceConfig.RunConfig, 0, len(d.expandedDevices))
+	postStartHooks := []func() error{}
 
 	// Setup devices in sorted order, this ensures that device mounts are added in path order.
 	for _, entry := range d.expandedDevices.Sorted() {
@@ -834,6 +840,11 @@ func (d *qemu) Start(stateful bool) error {
 				d.logger.Error("Failed to cleanup device", log.Ctx{"devName": dev.Name, "err": err})
 			}
 		})
+
+		// Add post-start hooks
+		if len(runConf.PostHooks) > 0 {
+			postStartHooks = append(postStartHooks, runConf.PostHooks...)
+		}
 
 		devConfs = append(devConfs, runConf)
 	}
@@ -1119,6 +1130,15 @@ func (d *qemu) Start(stateful bool) error {
 	}
 
 	revert.Success()
+
+	// Run any post-start hooks.
+	err = d.runHooks(postStartHooks)
+	if err != nil {
+		op.Done(err)
+		// Shut down the VM if hooks fail.
+		d.Stop(false)
+		return err
+	}
 
 	if op.Action() == "start" {
 		d.lifecycle("started", nil)
@@ -1785,7 +1805,7 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 		return "", err
 	}
 
-	err = d.addCPUMemoryConfig(sb)
+	cpuCount, err := d.addCPUMemoryConfig(sb)
 	if err != nil {
 		return "", err
 	}
@@ -1988,7 +2008,7 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 
 		// Add network device.
 		if len(runConf.NetworkInterface) > 0 {
-			err = d.addNetDevConfig(sb, bus, bootIndexes, runConf.NetworkInterface, fdFiles)
+			err = d.addNetDevConfig(sb, cpuCount, bus, bootIndexes, runConf.NetworkInterface, fdFiles)
 			if err != nil {
 				return "", err
 			}
@@ -2038,7 +2058,7 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 }
 
 // addCPUMemoryConfig adds the qemu config required for setting the number of virtualised CPUs and memory.
-func (d *qemu) addCPUMemoryConfig(sb *strings.Builder) error {
+func (d *qemu) addCPUMemoryConfig(sb *strings.Builder) (int, error) {
 	// Default to a single core.
 	cpus := d.expandedConfig["limits.cpu"]
 	if cpus == "" {
@@ -2062,7 +2082,7 @@ func (d *qemu) addCPUMemoryConfig(sb *strings.Builder) error {
 		// Expand to a set of CPU identifiers and get the pinning map.
 		nrSockets, nrCores, nrThreads, vcpus, numaNodes, err := d.cpuTopology(cpus)
 		if err != nil {
-			return err
+			return -1, err
 		}
 
 		// Figure out socket-id/core-id/thread-id for all vcpus.
@@ -2119,14 +2139,14 @@ func (d *qemu) addCPUMemoryConfig(sb *strings.Builder) error {
 
 	memSizeBytes, err := units.ParseByteSizeString(memSize)
 	if err != nil {
-		return fmt.Errorf("limits.memory invalid: %v", err)
+		return -1, fmt.Errorf("limits.memory invalid: %v", err)
 	}
 
 	ctx["hugepages"] = ""
 	if shared.IsTrue(d.expandedConfig["limits.memory.hugepages"]) {
 		hugetlb, err := util.HugepagesPath()
 		if err != nil {
-			return err
+			return -1, err
 		}
 
 		ctx["hugepages"] = hugetlb
@@ -2143,11 +2163,11 @@ func (d *qemu) addCPUMemoryConfig(sb *strings.Builder) error {
 		"memSizeBytes": memSizeBytes,
 	})
 	if err != nil {
-		return err
+		return -1, err
 	}
 
 	// Configure the CPU limit.
-	return qemuCPU.Execute(sb, ctx)
+	return ctx["cpuCount"].(int), qemuCPU.Execute(sb, ctx)
 }
 
 // addFileDescriptor adds a file path to the list of files to open and pass file descriptor to qemu.
@@ -2316,7 +2336,7 @@ func (d *qemu) addDriveConfig(sb *strings.Builder, bootIndexes map[string]int, d
 }
 
 // addNetDevConfig adds the qemu config required for adding a network device.
-func (d *qemu) addNetDevConfig(sb *strings.Builder, bus *qemuBus, bootIndexes map[string]int, nicConfig []deviceConfig.RunConfigItem, fdFiles *[]string) error {
+func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, bootIndexes map[string]int, nicConfig []deviceConfig.RunConfigItem, fdFiles *[]string) error {
 	var devName, nicName, devHwaddr, pciSlotName string
 	for _, nicItem := range nicConfig {
 		if nicItem.Key == "devName" {
@@ -2335,6 +2355,8 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, bus *qemuBus, bootIndexes ma
 		"bus":       bus.name,
 		"devName":   devName,
 		"devHwaddr": devHwaddr,
+		"vectors":   0,
+		"queues":    0,
 		"bootIndex": bootIndexes[devName],
 	}
 
@@ -2357,6 +2379,19 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, bus *qemuBus, bootIndexes ma
 	} else if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/tun_flags", nicName)) {
 		// Detect TAP (via TUN driver) device.
 		tplFields["ifName"] = nicName
+
+		// Run with a minimum of two queues.
+		queueCount := cpuCount
+		if queueCount < 2 {
+			queueCount = 2
+		}
+
+		// Number of queues is the same as number of vCPUs.
+		tplFields["queues"] = queueCount
+
+		// Number of vectors is number of vCPUs * 2 (RX/TX) + 2 (config/control MSI-X).
+		tplFields["vectors"] = 2*queueCount + 2
+
 		tpl = qemuNetDevTapTun
 	} else if pciSlotName != "" {
 		// Detect physical passthrough device.

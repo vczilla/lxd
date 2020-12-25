@@ -229,8 +229,9 @@ func (b *lxdBackend) Update(clientType request.ClientType, newDesc string, newCo
 		return fmt.Errorf("Pool source cannot be changed when not in pending state")
 	}
 
-	// Apply changes to local node if not pending and non-user config changed.
-	if len(changedConfig) != 0 && b.LocalStatus() != api.StoragePoolStatusPending && !userOnly {
+	// Apply changes to local node if both global pool and node are not pending and non-user config changed.
+	// Otherwise just apply changes to DB (below) ready for the actual global create request to be initiated.
+	if len(changedConfig) > 0 && b.Status() != api.StoragePoolStatusPending && b.LocalStatus() != api.StoragePoolStatusPending && !userOnly {
 		err = b.driver.Update(changedConfig)
 		if err != nil {
 			return err
@@ -238,7 +239,7 @@ func (b *lxdBackend) Update(clientType request.ClientType, newDesc string, newCo
 	}
 
 	// Update the database if something changed and we're in ClientTypeNormal mode.
-	if clientType == request.ClientTypeNormal && (len(changedConfig) != 0 || newDesc != b.db.Description) {
+	if clientType == request.ClientTypeNormal && (len(changedConfig) > 0 || newDesc != b.db.Description) {
 		err = b.state.Cluster.UpdateStoragePool(b.name, newDesc, newConfig)
 		if err != nil {
 			return err
@@ -1995,9 +1996,9 @@ func (b *lxdBackend) DeleteInstanceSnapshot(inst instance.Instance, op *operatio
 		return err
 	}
 
-	// Remove the snapshot volume record from the database.
+	// Remove the snapshot volume record from the database if exists.
 	err = b.state.Cluster.RemoveStoragePoolVolume(inst.Project(), drivers.GetSnapshotVolumeName(parentName, snapName), volDBType, b.ID())
-	if err != nil {
+	if err != nil && err != db.ErrNoSuchObject {
 		return err
 	}
 
@@ -2063,23 +2064,25 @@ func (b *lxdBackend) RestoreInstanceSnapshot(inst instance.Instance, src instanc
 
 			// Go through all the snapshots.
 			for _, snap := range snaps {
-				_, snapName, _ := shared.InstanceGetParentAndSnapshotName(src.Name())
+				_, snapName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
 				if !shared.StringInSlice(snapName, snapErr.Snapshots) {
 					continue
 				}
 
-				// Delete if listed.
-				err := b.DeleteInstanceSnapshot(snap, op)
+				// Delete snapshot instance if listed in the error as one that needs removing.
+				err := snap.Delete(true)
 				if err != nil {
 					return err
 				}
 			}
 
-			// Now try again.
+			// Now try restoring again.
 			err = b.driver.RestoreVolume(vol, snapshotName, op)
 			if err != nil {
 				return err
 			}
+
+			return nil
 		}
 
 		return err
