@@ -4,6 +4,6 @@
 # export CGO_LDFLAGS_ALLOW="-Wl,-wrap,pthread_create"
 
 export GOPATH=${HOME}/go
-export CGO_CFLAGS="-I${GOPATH}/include -D__ANDROID_API__=29"
-export CGO_LDFLAGS="-L${GOPATH}/lib -Wl,-R\$ORIGIN/../lib"
+export CGO_CFLAGS="-I${GOPATH}/include -U__ANDROID_API__ -D__ANDROID_API__=29"
+export CGO_LDFLAGS="-L${GOPATH}/lib -Wl,-R\$ORIGIN/../lib:/system/lib64 -Wl,--as-needed -fuse-ld=lld"
 export CGO_LDFLAGS_ALLOW="-Wl,-wrap,pthread_create -Wl,--as-needed -fuse-ld=lld"
