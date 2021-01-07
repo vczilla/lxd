@@ -205,6 +205,16 @@ func (n *ovn) Validate(config map[string]string) error {
 		return err
 	}
 
+	// Check that if IPv6 enabled then the network size must be at least a /64 as both RA and DHCPv6
+	// in OVN (as it generates addresses using EUI64) require at least a /64 subnet to operate.
+	_, ipv6Net, _ := net.ParseCIDR(config["ipv6.address"])
+	if ipv6Net != nil {
+		ones, _ := ipv6Net.Mask.Size()
+		if ones < 64 {
+			return fmt.Errorf("IPv6 subnet must be at least a /64")
+		}
+	}
+
 	// Load the project to get uplink network restrictions.
 	p, err := n.state.Cluster.GetProject(n.project)
 	if err != nil {
@@ -1547,18 +1557,19 @@ func (n *ovn) setup(update bool) error {
 		return err
 	}
 
-	revert.Add(func() { client.ChassisGroupDelete(n.getChassisGroupName()) })
-
-	// Create logical router.
-	if update {
-		client.LogicalRouterDelete(n.getRouterName())
+	if !update {
+		revert.Add(func() { client.ChassisGroupDelete(n.getChassisGroupName()) })
 	}
 
-	err = client.LogicalRouterAdd(n.getRouterName())
+	// Create logical router.
+	err = client.LogicalRouterAdd(n.getRouterName(), update)
 	if err != nil {
 		return errors.Wrapf(err, "Failed adding router")
 	}
-	revert.Add(func() { client.LogicalRouterDelete(n.getRouterName()) })
+
+	if !update {
+		revert.Add(func() { client.LogicalRouterDelete(n.getRouterName()) })
+	}
 
 	// Configure logical router.
 
@@ -1579,23 +1590,24 @@ func (n *ovn) setup(update bool) error {
 	}
 
 	if len(extRouterIPs) > 0 {
-		// Create external logical switch.
-		if update {
-			client.LogicalSwitchDelete(n.getExtSwitchName())
-		}
-
-		err = client.LogicalSwitchAdd(n.getExtSwitchName(), false)
+		err = client.LogicalSwitchAdd(n.getExtSwitchName(), update)
 		if err != nil {
 			return errors.Wrapf(err, "Failed adding external switch")
 		}
-		revert.Add(func() { client.LogicalSwitchDelete(n.getExtSwitchName()) })
+
+		if !update {
+			revert.Add(func() { client.LogicalSwitchDelete(n.getExtSwitchName()) })
+		}
 
 		// Create external router port.
-		err = client.LogicalRouterPortAdd(n.getRouterName(), n.getRouterExtPortName(), routerMAC, extRouterIPs...)
+		err = client.LogicalRouterPortAdd(n.getRouterName(), n.getRouterExtPortName(), routerMAC, extRouterIPs, update)
 		if err != nil {
 			return errors.Wrapf(err, "Failed adding external router port")
 		}
-		revert.Add(func() { client.LogicalRouterPortDelete(n.getRouterExtPortName()) })
+
+		if !update {
+			revert.Add(func() { client.LogicalRouterPortDelete(n.getRouterExtPortName()) })
+		}
 
 		// Associate external router port to chassis group.
 		err = client.LogicalRouterPortLinkChassisGroup(n.getRouterExtPortName(), n.getChassisGroupName())
@@ -1604,11 +1616,14 @@ func (n *ovn) setup(update bool) error {
 		}
 
 		// Create external switch port and link to router port.
-		err = client.LogicalSwitchPortAdd(n.getExtSwitchName(), n.getExtSwitchRouterPortName(), false)
+		err = client.LogicalSwitchPortAdd(n.getExtSwitchName(), n.getExtSwitchRouterPortName(), update)
 		if err != nil {
 			return errors.Wrapf(err, "Failed adding external switch router port")
 		}
-		revert.Add(func() { client.LogicalSwitchPortDelete(n.getExtSwitchRouterPortName()) })
+
+		if !update {
+			revert.Add(func() { client.LogicalSwitchPortDelete(n.getExtSwitchRouterPortName()) })
+		}
 
 		err = client.LogicalSwitchPortLinkRouter(n.getExtSwitchRouterPortName(), n.getRouterExtPortName())
 		if err != nil {
@@ -1616,44 +1631,68 @@ func (n *ovn) setup(update bool) error {
 		}
 
 		// Create external switch port and link to external provider network.
-		err = client.LogicalSwitchPortAdd(n.getExtSwitchName(), n.getExtSwitchProviderPortName(), false)
+		err = client.LogicalSwitchPortAdd(n.getExtSwitchName(), n.getExtSwitchProviderPortName(), update)
 		if err != nil {
 			return errors.Wrapf(err, "Failed adding external switch provider port")
 		}
-		revert.Add(func() { client.LogicalSwitchPortDelete(n.getExtSwitchProviderPortName()) })
+
+		if !update {
+			revert.Add(func() { client.LogicalSwitchPortDelete(n.getExtSwitchProviderPortName()) })
+		}
 
 		err = client.LogicalSwitchPortLinkProviderNetwork(n.getExtSwitchProviderPortName(), uplinkNet.extSwitchProviderName)
 		if err != nil {
 			return errors.Wrapf(err, "Failed linking external switch provider port to external provider network")
 		}
 
+		// Remove any existing SNAT rules on update. As currently these are only defined from the network
+		// config rather than from any instance NIC config, so we can re-create the active config below.
+		if update {
+			err = client.LogicalRouterSNATDeleteAll(n.getRouterName())
+			if err != nil {
+				return errors.Wrapf(err, "Failed removing existing router SNAT rules")
+			}
+		}
+
 		// Add SNAT rules.
 		if shared.IsTrue(n.config["ipv4.nat"]) && routerIntPortIPv4Net != nil && routerExtPortIPv4 != nil {
-			err = client.LogicalRouterSNATAdd(n.getRouterName(), routerIntPortIPv4Net, routerExtPortIPv4)
+			err = client.LogicalRouterSNATAdd(n.getRouterName(), routerIntPortIPv4Net, routerExtPortIPv4, update)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "Failed adding router IPv4 SNAT rule")
 			}
 		}
 
 		if shared.IsTrue(n.config["ipv6.nat"]) && routerIntPortIPv6Net != nil && routerExtPortIPv6 != nil {
-			err = client.LogicalRouterSNATAdd(n.getRouterName(), routerIntPortIPv6Net, routerExtPortIPv6)
+			err = client.LogicalRouterSNATAdd(n.getRouterName(), routerIntPortIPv6Net, routerExtPortIPv6, update)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "Failed adding router IPv6 SNAT rule")
 			}
 		}
 
-		// Add default routes.
+		// Add or remove default routes as config dictates.
+		defaultIPv4Route := &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
 		if uplinkNet.routerExtGwIPv4 != nil {
-			err = client.LogicalRouterRouteAdd(n.getRouterName(), &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}, uplinkNet.routerExtGwIPv4, false)
+			err = client.LogicalRouterRouteAdd(n.getRouterName(), defaultIPv4Route, uplinkNet.routerExtGwIPv4, update)
 			if err != nil {
 				return errors.Wrapf(err, "Failed adding IPv4 default route")
 			}
+		} else if update {
+			err = client.LogicalRouterRouteDelete(n.getRouterName(), defaultIPv4Route, nil)
+			if err != nil {
+				return errors.Wrapf(err, "Failed removing IPv4 default route")
+			}
 		}
 
+		defaultIPv6Route := &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
 		if uplinkNet.routerExtGwIPv6 != nil {
-			err = client.LogicalRouterRouteAdd(n.getRouterName(), &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}, uplinkNet.routerExtGwIPv6, false)
+			err = client.LogicalRouterRouteAdd(n.getRouterName(), defaultIPv6Route, uplinkNet.routerExtGwIPv6, update)
 			if err != nil {
 				return errors.Wrapf(err, "Failed adding IPv6 default route")
+			}
+		} else if update {
+			err = client.LogicalRouterRouteDelete(n.getRouterName(), defaultIPv6Route, nil)
+			if err != nil {
+				return errors.Wrapf(err, "Failed removing IPv6 default route")
 			}
 		}
 	}
@@ -1663,7 +1702,10 @@ func (n *ovn) setup(update bool) error {
 	if err != nil {
 		return errors.Wrapf(err, "Failed adding internal switch")
 	}
-	revert.Add(func() { client.LogicalSwitchDelete(n.getIntSwitchName()) })
+
+	if !update {
+		revert.Add(func() { client.LogicalSwitchDelete(n.getIntSwitchName()) })
+	}
 
 	var excludeIPV4 []shared.IPRange
 	if routerIntPortIPv4 != nil {
@@ -1680,6 +1722,38 @@ func (n *ovn) setup(update bool) error {
 		return errors.Wrapf(err, "Failed setting IP allocation settings on internal switch")
 	}
 
+	// Gather internal router port IPs (in CIDR format).
+	intRouterIPs := []*net.IPNet{}
+
+	if routerIntPortIPv4Net != nil {
+		intRouterIPs = append(intRouterIPs, &net.IPNet{
+			IP:   routerIntPortIPv4,
+			Mask: routerIntPortIPv4Net.Mask,
+		})
+	}
+
+	if routerIntPortIPv6Net != nil {
+		intRouterIPs = append(intRouterIPs, &net.IPNet{
+			IP:   routerIntPortIPv6,
+			Mask: routerIntPortIPv6Net.Mask,
+		})
+	}
+
+	if len(intRouterIPs) <= 0 {
+		return fmt.Errorf("No internal IPs defined for network router")
+	}
+
+	// Create internal router port.
+	err = client.LogicalRouterPortAdd(n.getRouterName(), n.getRouterIntPortName(), routerMAC, intRouterIPs, update)
+	if err != nil {
+		return errors.Wrapf(err, "Failed adding internal router port")
+	}
+
+	if !update {
+		revert.Add(func() { client.LogicalRouterPortDelete(n.getRouterIntPortName()) })
+	}
+
+	// Configure DHCP option sets.
 	var dhcpv4UUID, dhcpv6UUID string
 	dhcpV4Subnet := n.DHCPv4Subnet()
 	dhcpV6Subnet := n.DHCPv6Subnet()
@@ -1721,27 +1795,6 @@ func (n *ovn) setup(update bool) error {
 		}
 	}
 
-	// Internal router port IPs (in CIDR format).
-	intRouterIPs := []*net.IPNet{}
-
-	if routerIntPortIPv4Net != nil {
-		intRouterIPs = append(intRouterIPs, &net.IPNet{
-			IP:   routerIntPortIPv4,
-			Mask: routerIntPortIPv4Net.Mask,
-		})
-	}
-
-	if routerIntPortIPv6Net != nil {
-		intRouterIPs = append(intRouterIPs, &net.IPNet{
-			IP:   routerIntPortIPv6,
-			Mask: routerIntPortIPv6Net.Mask,
-		})
-	}
-
-	if len(intRouterIPs) <= 0 {
-		return fmt.Errorf("No IPs defined for network router")
-	}
-
 	// Create DHCPv4 options for internal switch.
 	if dhcpV4Subnet != nil {
 		err = client.LogicalSwitchDHCPv4OptionsSet(n.getIntSwitchName(), dhcpv4UUID, dhcpV4Subnet, &openvswitch.OVNDHCPv4Opts{
@@ -1770,18 +1823,14 @@ func (n *ovn) setup(update bool) error {
 		}
 	}
 
-	// Create internal router port.
-	err = client.LogicalRouterPortAdd(n.getRouterName(), n.getRouterIntPortName(), routerMAC, intRouterIPs...)
-	if err != nil {
-		return errors.Wrapf(err, "Failed adding internal router port")
-	}
-	revert.Add(func() { client.LogicalRouterPortDelete(n.getRouterIntPortName()) })
-
 	// Set IPv6 router advertisement settings.
-	if dhcpV6Subnet != nil {
+	if routerIntPortIPv6Net != nil {
 		adressMode := openvswitch.OVNIPv6AddressModeSLAAC
-		if shared.IsTrue(n.config["ipv6.dhcp.stateful"]) {
-			adressMode = openvswitch.OVNIPv6AddressModeDHCPStateful
+		if dhcpV6Subnet != nil {
+			adressMode = openvswitch.OVNIPv6AddressModeDHCPStateless
+			if shared.IsTrue(n.config["ipv6.dhcp.stateful"]) {
+				adressMode = openvswitch.OVNIPv6AddressModeDHCPStateful
+			}
 		}
 
 		var recursiveDNSServer net.IP
@@ -1804,6 +1853,11 @@ func (n *ovn) setup(update bool) error {
 		if err != nil {
 			return errors.Wrapf(err, "Failed setting internal router port IPv6 advertisement settings")
 		}
+	} else {
+		err = client.LogicalRouterPortDeleteIPv6Advertisements(n.getRouterIntPortName())
+		if err != nil {
+			return errors.Wrapf(err, "Failed removing internal router port IPv6 advertisement settings")
+		}
 	}
 
 	// Create internal switch port and link to router port.
@@ -1811,7 +1865,10 @@ func (n *ovn) setup(update bool) error {
 	if err != nil {
 		return errors.Wrapf(err, "Failed adding internal switch router port")
 	}
-	revert.Add(func() { client.LogicalSwitchPortDelete(n.getIntSwitchRouterPortName()) })
+
+	if !update {
+		revert.Add(func() { client.LogicalSwitchPortDelete(n.getIntSwitchRouterPortName()) })
+	}
 
 	err = client.LogicalSwitchPortLinkRouter(n.getIntSwitchRouterPortName(), n.getRouterIntPortName())
 	if err != nil {
@@ -2068,6 +2125,54 @@ func (n *ovn) getInstanceDevicePortName(instanceUUID string, deviceName string) 
 	return openvswitch.OVNSwitchPort(fmt.Sprintf("%s-%s-%s", n.getIntSwitchInstancePortPrefix(), instanceUUID, deviceName))
 }
 
+// InstanceDevicePortConfigParse parses the instance NIC device config and returns MAC address, static IPs,
+// internal routes and external routes.
+func (n *ovn) InstanceDevicePortConfigParse(deviceConfig map[string]string) (net.HardwareAddr, []net.IP, []*net.IPNet, []*net.IPNet, error) {
+	mac, err := net.ParseMAC(deviceConfig["hwaddr"])
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	ips := []net.IP{}
+	for _, key := range []string{"ipv4.address", "ipv6.address"} {
+		if deviceConfig[key] == "" {
+			continue
+		}
+
+		ip := net.ParseIP(deviceConfig[key])
+		if ip == nil {
+			return nil, nil, nil, nil, fmt.Errorf("Invalid %s value %q", key, deviceConfig[key])
+		}
+		ips = append(ips, ip)
+	}
+
+	internalRoutes := []*net.IPNet{}
+	for _, key := range []string{"ipv4.routes", "ipv6.routes"} {
+		if deviceConfig[key] == "" {
+			continue
+		}
+
+		internalRoutes, err = SubnetParseAppend(internalRoutes, strings.Split(deviceConfig[key], ",")...)
+		if err != nil {
+			return nil, nil, nil, nil, errors.Wrapf(err, "Invalid %q value", key)
+		}
+	}
+
+	externalRoutes := []*net.IPNet{}
+	for _, key := range []string{"ipv4.routes.external", "ipv6.routes.external"} {
+		if deviceConfig[key] == "" {
+			continue
+		}
+
+		externalRoutes, err = SubnetParseAppend(externalRoutes, strings.Split(deviceConfig[key], ",")...)
+		if err != nil {
+			return nil, nil, nil, nil, errors.Wrapf(err, "Invalid %q value", key)
+		}
+	}
+
+	return mac, ips, internalRoutes, externalRoutes, nil
+}
+
 // InstanceDevicePortValidateExternalRoutes validates the external routes for an OVN instance port.
 func (n *ovn) InstanceDevicePortValidateExternalRoutes(deviceInstance instance.Instance, deviceName string, portExternalRoutes []*net.IPNet) error {
 	var err error
@@ -2186,7 +2291,7 @@ func (n *ovn) InstanceDevicePortValidateExternalRoutes(deviceInstance instance.I
 }
 
 // InstanceDevicePortAdd adds an instance device port to the internal logical switch and returns the port name.
-func (n *ovn) InstanceDevicePortAdd(instanceUUID string, instanceName string, deviceName string, mac net.HardwareAddr, ips []net.IP, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) (openvswitch.OVNSwitchPort, error) {
+func (n *ovn) InstanceDevicePortAdd(uplinkConfig map[string]string, instanceUUID string, instanceName string, deviceName string, mac net.HardwareAddr, ips []net.IP, internalRoutes []*net.IPNet, externalRoutes []*net.IPNet) (openvswitch.OVNSwitchPort, error) {
 	if instanceUUID == "" {
 		return "", fmt.Errorf("Instance UUID is required")
 	}
@@ -2199,12 +2304,6 @@ func (n *ovn) InstanceDevicePortAdd(instanceUUID string, instanceName string, de
 	client, err := n.getClient()
 	if err != nil {
 		return "", err
-	}
-
-	// Load uplink network config.
-	_, uplink, _, err := n.state.Cluster.GetNetworkInAnyState(project.Default, n.config["network"])
-	if err != nil {
-		return "", errors.Wrapf(err, "Failed to load uplink network %q", n.config["network"])
 	}
 
 	dhcpv4Subnet := n.DHCPv4Subnet()
@@ -2302,7 +2401,7 @@ func (n *ovn) InstanceDevicePortAdd(instanceUUID string, instanceName string, de
 	revert.Add(func() { client.LogicalSwitchPortDeleteDNS(n.getIntSwitchName(), dnsUUID) })
 
 	// Publish NIC's IPs on uplink network if NAT is disabled and using l2proxy ingress mode on uplink.
-	if shared.StringInSlice(uplink.Config["ovn.ingress_mode"], []string{"l2proxy", ""}) {
+	if shared.StringInSlice(uplinkConfig["ovn.ingress_mode"], []string{"l2proxy", ""}) {
 		for _, k := range []string{"ipv4.nat", "ipv6.nat"} {
 			if shared.IsTrue(n.config[k]) {
 				continue
@@ -2371,7 +2470,7 @@ func (n *ovn) InstanceDevicePortAdd(instanceUUID string, instanceName string, de
 		// knowledge this is the only way to get the OVN router to respond to ARP/NDP requests for IPs that
 		// it doesn't actually have). However we have to add each IP in the external route individually as
 		// DNAT doesn't support whole subnets.
-		if shared.StringInSlice(uplink.Config["ovn.ingress_mode"], []string{"l2proxy", ""}) {
+		if shared.StringInSlice(uplinkConfig["ovn.ingress_mode"], []string{"l2proxy", ""}) {
 			err = SubnetIterate(externalRoute, func(ip net.IP) error {
 				err = client.LogicalRouterDNATSNATAdd(n.getRouterName(), ip, ip, true, true)
 				if err != nil {
@@ -2528,6 +2627,11 @@ func (n *ovn) DHCPv6Subnet() *net.IPNet {
 		return nil
 	}
 
+	ones, _ := subnet.Mask.Size()
+	if ones < 64 {
+		return nil // OVN only supports DHCPv6 allocated using EUI64 (which requires at least a /64).
+	}
+
 	return subnet
 }
 
@@ -2663,4 +2767,104 @@ func (n *ovn) uplinkHasIngressRoutedAnycastIPv4(uplink *api.Network) bool {
 // uplinkHasIngressRoutedAnycastIPv6 returns true if the uplink network has routed IPv6 ingress anycast enabled.
 func (n *ovn) uplinkHasIngressRoutedAnycastIPv6(uplink *api.Network) bool {
 	return shared.IsTrue(uplink.Config["ipv6.routes.anycast"]) && uplink.Config["ovn.ingress_mode"] == "routed"
+}
+
+// handleDependencyChange applies changes from uplink network if specific watched keys have changed.
+func (n *ovn) handleDependencyChange(uplinkName string, uplinkConfig map[string]string, changedKeys []string) error {
+	// Detect changes that need to be applied to the network.
+	for _, k := range []string{"dns.nameservers"} {
+		if shared.StringInSlice(k, changedKeys) {
+			n.logger.Debug("Applying changes from uplink network", log.Ctx{"uplink": uplinkName})
+
+			// Re-setup logical network in order to apply uplink changes.
+			err := n.setup(true)
+			if err != nil {
+				return err
+			}
+
+			break // Only run setup once per notification (all changes will be applied).
+		}
+	}
+
+	// Add or remove the instance NIC l2proxy DNAT_AND_SNAT rules if uplink's ovn.ingress_mode has changed.
+	if shared.StringInSlice("ovn.ingress_mode", changedKeys) {
+		n.logger.Debug("Applying ingress mode changes from uplink network to instance NICs", log.Ctx{"uplink": uplinkName})
+
+		client, err := n.getClient()
+		if err != nil {
+			return err
+		}
+
+		if shared.StringInSlice(uplinkConfig["ovn.ingress_mode"], []string{"l2proxy", ""}) {
+			// Find all instance NICs that use this network, and re-add the logical OVN instance port.
+			// This will restore the l2proxy DNAT_AND_SNAT rules.
+			err = n.state.Cluster.InstanceList(func(inst db.Instance, p api.Project, profiles []api.Profile) error {
+				// Get the instance's effective network project name.
+				instNetworkProject := project.NetworkProjectFromRecord(&p)
+
+				// Skip instances who's effective network project doesn't match this network's
+				// project.
+				if n.Project() != instNetworkProject {
+					return nil
+				}
+
+				devices := db.ExpandInstanceDevices(deviceConfig.NewDevices(inst.Devices), profiles).CloneNative()
+
+				// Iterate through each of the instance's devices, looking for NICs that are linked
+				// this network.
+				for devName, devConfig := range devices {
+					if devConfig["type"] != "nic" || n.Name() != devConfig["network"] {
+						continue
+					}
+
+					// Check if instance port exists, if not then we can skip.
+					instanceUUID := inst.Config["volatile.uuid"]
+					instancePortName := n.getInstanceDevicePortName(instanceUUID, devName)
+					portExists, err := client.LogicalSwitchPortExists(instancePortName)
+					if err != nil {
+						n.logger.Error("Failed checking instance OVN NIC port exists", log.Ctx{"project": inst.Project, "instance": inst.Name, "err": err})
+						continue
+					}
+
+					if !portExists {
+						continue // No need to update a port that isn't started yet.
+					}
+
+					if devConfig["hwaddr"] == "" {
+						// Load volatile MAC if no static MAC specified.
+						devConfig["hwaddr"] = inst.Config[fmt.Sprintf("volatile.%s.hwaddr", devName)]
+					}
+
+					// Parse NIC config into structures used by OVN network's instance port functions.
+					mac, ips, internalRoutes, externalRoutes, err := n.InstanceDevicePortConfigParse(devConfig)
+					if err != nil {
+						n.logger.Error("Failed parsing instance OVN NIC config", log.Ctx{"project": inst.Project, "instance": inst.Name, "err": err})
+						continue
+					}
+
+					// Re-add logical switch port to apply the l2proxy DNAT_AND_SNAT rules.
+					n.logger.Debug("Re-adding instance OVN NIC port to apply ingress mode changes", log.Ctx{"project": inst.Project, "instance": inst.Name, "device": devName})
+					_, err = n.InstanceDevicePortAdd(uplinkConfig, instanceUUID, inst.Name, devName, mac, ips, internalRoutes, externalRoutes)
+					if err != nil {
+						n.logger.Error("Failed re-adding instance OVN NIC port", log.Ctx{"project": inst.Project, "instance": inst.Name, "err": err})
+						continue
+					}
+				}
+
+				return nil
+			})
+			if err != nil {
+				return errors.Wrapf(err, "Failed adding instance NIC ingress mode l2proxy rules")
+			}
+		} else {
+			// Remove all DNAT_AND_SNAT rules if not using l2proxy ingress mode, as currently we only
+			// use DNAT_AND_SNAT rules for this feature so it is safe to do.
+			err = client.LogicalRouterDNATSNATDeleteAll(n.getRouterName())
+			if err != nil {
+				return errors.Wrapf(err, "Failed deleting instance NIC ingress mode l2proxy rules")
+			}
+		}
+	}
+
+	return nil
 }
