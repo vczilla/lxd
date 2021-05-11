@@ -127,6 +127,13 @@ snap_restore() {
   lxc exec bar -- ln -s file_only_in_snap0 /root/statelink
   lxc stop bar --force
 
+  # Check parent volume.block.filesystem is copied to snapshot and not from pool.
+  if [ "$lxd_backend" = "lvm" ] || [ "$lxd_backend" = "ceph" ]; then
+    # Change pool volume.block.filesystem setting after creation of instance and before snapshot.
+    pool=$(lxc config profile device get default root pool)
+    lxc storage set "${pool}" volume.block.filesystem=xfs
+  fi
+
   lxc snapshot bar snap0
 
   ## prepare snap1
@@ -148,6 +155,21 @@ snap_restore() {
   lxc config set bar limits.cpu 1
 
   lxc snapshot bar snap1
+
+  # Check volume.block.filesystem on storage volume in parent and snapshot match.
+  if [ "${lxd_backend}" = "lvm" ] || [ "${lxd_backend}" = "ceph" ]; then
+    # Change pool volume.block.filesystem setting after creation of instance and before snapshot.
+    pool=$(lxc config profile device get default root pool)
+    parentFS=$(lxc storage volume get "${pool}" container/bar block.filesystem)
+    snapFS=$(lxc storage volume get "${pool}" container/bar/snap0 block.filesystem)
+
+    if [ "${parentFS}" != "${snapFS}" ]; then
+      echo "block.filesystem settings do not match in parent and snapshot"
+      false
+    fi
+
+    lxc storage unset "${pool}" volume.block.filesystem
+  fi
 
   ##########################################################
 
@@ -243,4 +265,31 @@ test_snap_expiry() {
 
   lxc rm -f c1
   lxc rm -f c2
+}
+
+test_snap_schedule() {
+  # shellcheck disable=2039
+  local lxd_backend
+  lxd_backend=$(storage_backend "$LXD_DIR")
+
+  ensure_import_testimage
+  ensure_has_localhost_remote "${LXD_ADDR}"
+
+  # Check we get a snapshot on first start
+  lxc launch testimage c1 -c snapshots.schedule='@startup'
+  lxc launch testimage c2 -c snapshots.schedule='@startup, @daily'
+  lxc launch testimage c3 -c snapshots.schedule='@startup, 10 5,6 * * *'
+  lxc launch testimage c4 -c snapshots.schedule='@startup, 10 5-8 * * *'
+  lxc launch testimage c5 -c snapshots.schedule='@startup, 10 2,5-8/2 * * *'
+  lxc info c1 | grep -q snap0
+  lxc info c2 | grep -q snap0
+  lxc info c3 | grep -q snap0
+  lxc info c4 | grep -q snap0
+  lxc info c5 | grep -q snap0
+
+  # Check we get a new snapshot on restart
+  lxc restart c1 -f
+  lxc info c1 | grep -q snap1
+
+  lxc rm -f c1 c2 c3 c4 c5
 }

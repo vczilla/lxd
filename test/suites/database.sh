@@ -19,11 +19,11 @@ EOF
   # Create the version 1 schema as the database
   sqlite3 "${MIGRATE_DB}" > /dev/null < deps/schema1.sql
 
-  # Start an LXD demon in the tmp directory. This should start the updates.
+  # Start a LXD daemon in the tmp directory. This should start the updates.
   spawn_lxd "${LXD_MIGRATE_DIR}" true
 
   # Assert there are enough tables.
-  expected_tables=5
+  expected_tables=6
   tables=$(sqlite3 "${MIGRATE_DB}" ".dump" | grep -c "CREATE TABLE")
   [ "${tables}" -eq "${expected_tables}" ] || { echo "FAIL: Wrong number of tables after database migration. Found: ${tables}, expected ${expected_tables}"; false; }
 

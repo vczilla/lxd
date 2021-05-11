@@ -55,6 +55,14 @@ func (c *cmdCluster) Command() *cobra.Command {
 	clusterEditCmd := cmdClusterEdit{global: c.global, cluster: c}
 	cmd.AddCommand(clusterEditCmd.Command())
 
+	// Add
+	cmdClusterAdd := cmdClusterAdd{global: c.global, cluster: c}
+	cmd.AddCommand(cmdClusterAdd.Command())
+
+	// List tokens
+	cmdClusterListTokens := cmdClusterListTokens{global: c.global, cluster: c}
+	cmd.AddCommand(cmdClusterListTokens.Command())
+
 	return cmd
 }
 
@@ -73,7 +81,7 @@ func (c *cmdClusterList) Command() *cobra.Command {
 	cmd.Short = i18n.G("List all the cluster members")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
 		`List all the cluster members`))
-	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	cmd.RunE = c.Run
 
@@ -123,7 +131,7 @@ func (c *cmdClusterList) Run(cmd *cobra.Command, args []string) error {
 		if member.Database {
 			database = "YES"
 		}
-		line := []string{member.ServerName, member.URL, database, strings.ToUpper(member.Status), member.Message, member.Architecture, member.FailureDomain}
+		line := []string{member.ServerName, member.URL, database, member.Architecture, member.FailureDomain, member.Description, strings.ToUpper(member.Status), member.Message}
 		data = append(data, line)
 	}
 	sort.Sort(byName(data))
@@ -132,10 +140,11 @@ func (c *cmdClusterList) Run(cmd *cobra.Command, args []string) error {
 		i18n.G("NAME"),
 		i18n.G("URL"),
 		i18n.G("DATABASE"),
-		i18n.G("STATE"),
-		i18n.G("MESSAGE"),
 		i18n.G("ARCHITECTURE"),
 		i18n.G("FAILURE DOMAIN"),
+		i18n.G("DESCRIPTION"),
+		i18n.G("STATE"),
+		i18n.G("MESSAGE"),
 	}
 
 	return utils.RenderTable(c.flagFormat, header, data, members)
@@ -501,7 +510,7 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 		// Respawn the editor
 		if err != nil {
 			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
-			fmt.Println(i18n.G("Press enter to open the editor again"))
+			fmt.Println(i18n.G("Press enter to open the editor again or ctrl+c to abort change"))
 
 			_, err := os.Stdin.Read(make([]byte, 1))
 			if err != nil {
@@ -518,4 +527,204 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func clusterJoinTokenOperationToAPI(op *api.Operation) (*api.ClusterMemberJoinToken, error) {
+	serverName, ok := op.Metadata["serverName"].(string)
+	if !ok {
+		return nil, fmt.Errorf("Operation serverName is type %T not string", op.Metadata["serverName"])
+	}
+
+	secret, ok := op.Metadata["secret"].(string)
+	if !ok {
+		return nil, fmt.Errorf("Operation secret is type %T not string", op.Metadata["secret"])
+	}
+
+	fingerprint, ok := op.Metadata["fingerprint"].(string)
+	if !ok {
+		return nil, fmt.Errorf("Operation fingerprint is type %T not string", op.Metadata["fingerprint"])
+	}
+
+	addresses, ok := op.Metadata["addresses"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("Operation addresses is type %T not []interface{}", op.Metadata["addresses"])
+	}
+
+	joinToken := api.ClusterMemberJoinToken{
+		ServerName:  serverName,
+		Secret:      secret,
+		Fingerprint: fingerprint,
+		Addresses:   make([]string, 0, len(addresses)),
+	}
+
+	for i, address := range addresses {
+		addressString, ok := address.(string)
+		if !ok {
+			return nil, fmt.Errorf("Operation address index %d is type %T not string", i, address)
+		}
+
+		joinToken.Addresses = append(joinToken.Addresses, addressString)
+	}
+
+	return &joinToken, nil
+}
+
+// Add
+type cmdClusterAdd struct {
+	global  *cmdGlobal
+	cluster *cmdCluster
+}
+
+func (c *cmdClusterAdd) Command() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Use = usage("add", i18n.G("[<remote>:]<member>"))
+	cmd.Aliases = []string{"rm"}
+	cmd.Short = i18n.G("Request a join token for adding a cluster member")
+	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(`Request a join token for adding a cluster member`))
+
+	cmd.RunE = c.Run
+
+	return cmd
+}
+
+func (c *cmdClusterAdd) Run(cmd *cobra.Command, args []string) error {
+	// Sanity checks.
+	exit, err := c.global.CheckArgs(cmd, args, 1, 1)
+	if exit {
+		return err
+	}
+
+	// Parse remote.
+	resources, err := c.global.ParseServers(args[0])
+	if err != nil {
+		return err
+	}
+
+	resource := resources[0]
+
+	if resource.name == "" {
+		return fmt.Errorf(i18n.G("Missing cluster member name"))
+	}
+
+	// Request the join token.
+	member := api.ClusterMembersPost{
+		ServerName: resource.name,
+	}
+
+	op, err := resource.server.CreateClusterMember(member)
+	if err != nil {
+		return err
+	}
+
+	if !c.global.flagQuiet {
+		opAPI := op.Get()
+		joinToken, err := clusterJoinTokenOperationToAPI(&opAPI)
+		if err != nil {
+			return errors.Wrapf(err, "Failed converting token operation to join token")
+		}
+
+		fmt.Printf(i18n.G("Member %s join token: %s")+"\n", resource.name, joinToken.String())
+	}
+
+	return nil
+}
+
+// List Tokens.
+type cmdClusterListTokens struct {
+	global  *cmdGlobal
+	cluster *cmdCluster
+
+	flagFormat string
+}
+
+func (c *cmdClusterListTokens) Command() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Use = usage("list-tokens", i18n.G("[<remote>:]"))
+	cmd.Short = i18n.G("List all active cluster member join tokens")
+	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(`List all active cluster member join tokens`))
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
+
+	cmd.RunE = c.Run
+
+	return cmd
+}
+
+func (c *cmdClusterListTokens) Run(cmd *cobra.Command, args []string) error {
+	// Sanity checks.
+	exit, err := c.global.CheckArgs(cmd, args, 0, 1)
+	if exit {
+		return err
+	}
+
+	// Parse remote.
+	remote := ""
+	if len(args) == 1 {
+		remote = args[0]
+	}
+
+	resources, err := c.global.ParseServers(remote)
+	if err != nil {
+		return err
+	}
+
+	resource := resources[0]
+
+	// Check if clustered.
+	cluster, _, err := resource.server.GetCluster()
+	if err != nil {
+		return err
+	}
+
+	if !cluster.Enabled {
+		return fmt.Errorf(i18n.G("LXD server isn't part of a cluster"))
+	}
+
+	// Get the cluster member join tokens.
+	ops, err := resource.server.GetOperations()
+	if err != nil {
+		return err
+	}
+
+	// Convert the join token operation into encoded form for display.
+	type displayToken struct {
+		ServerName string
+		Token      string
+	}
+
+	displayTokens := make([]displayToken, 0)
+
+	for _, op := range ops {
+		if op.Class != api.OperationClassToken {
+			continue
+		}
+
+		if op.StatusCode != api.Running {
+			continue // Tokens are single use, so if cancelled but not deleted yet its not available.
+		}
+
+		joinToken, err := clusterJoinTokenOperationToAPI(&op)
+		if err != nil {
+			continue // Operation is not a valid cluster member join token operation.
+		}
+
+		displayTokens = append(displayTokens, displayToken{
+			ServerName: joinToken.ServerName,
+			Token:      joinToken.String(),
+		})
+	}
+
+	// Render the table.
+	data := [][]string{}
+	for _, token := range displayTokens {
+		line := []string{token.ServerName, token.Token}
+		data = append(data, line)
+	}
+	sort.Sort(byName(data))
+
+	header := []string{
+		i18n.G("NAME"),
+		i18n.G("TOKEN"),
+	}
+
+	return utils.RenderTable(c.flagFormat, header, data, displayTokens)
 }

@@ -166,7 +166,7 @@ Filtering is available for the instance and image endpoints.
 There is no default value for filter which means that all results found will
 be returned. The following is the language used for the filter argument:
 
-?filter=field_name eq desired_field_assignment
+?filter=field\_name eq desired\_field\_assignment
 
 The language follows the OData conventions for structuring REST API filtering
 logic. Logical operators are also supported for filtering: not(not), equals(eq),
@@ -174,11 +174,11 @@ not equals(ne), and(and), or(or). Filters are evaluated with left associativity.
 Values with spaces can be surrounded with quotes. Nesting filtering is also supported. 
 For instance, to filter on a field in a config you would pass:
 
-?filter=config.field_name eq desired_field_assignment
+?filter=config.field\_name eq desired\_field\_assignment
 
 For filtering on device attributes you would pass:
 
-?filter=devices.device_name.field_name eq desired_field_assignment
+?filter=devices.device\_name.field\_name eq desired\_field\_assignment
 
 Here are a few GET query examples of the different filtering methods mentioned above:
 
@@ -262,6 +262,8 @@ much like `/1.0/containers` will only show you instances of that type.
  * [`/1.0/networks`](#10networks)
    * [`/1.0/networks/<name>`](#10networksname)
    * [`/1.0/networks/<name>/state`](#10networksnamestate)
+ * [`/1.0/network-acls`](#10network-acls)
+   * [`/1.0/network-acls/<name>`](#10network-aclsname)
  * [`/1.0/operations`](#10operations)
    * [`/1.0/operations/<uuid>`](#10operationsuuid)
      * [`/1.0/operations/<uuid>/wait`](#10operationsuuidwait)
@@ -281,10 +283,13 @@ much like `/1.0/containers` will only show you instances of that type.
             * [`/1.0/storage-pools/<pool>/volumes/<type>/<name>/backups`](#10storage-poolspoolvolumestypenamebackups)
              * [`/1.0/storage-pools/<pool>/volumes/<type>/<volume>/backups/<name>`](#10storage-poolspoolvolumestypevolumebackupsname)
                * [`/1.0/storage-pools/<pool>/volumes/<type>/<volume>/backups/<name>/export`](#10storage-poolspoolvolumestypevolumebackupsnameexport)
+           * [`/1.0/storage-pools/<pool>/volumes/<type>/<name>/state`](#10storage-poolspoolvolumestypenamestate)
  * [`/1.0/resources`](#10resources)
  * [`/1.0/cluster`](#10cluster)
    * [`/1.0/cluster/members`](#10clustermembers)
      * [`/1.0/cluster/members/<name>`](#10clustermembersname)
+ * [`/1.0/warnings`](#10warnings)
+   * [`/1.0/warnings/<uuid>`](#10warningsuuid)
 
 ## API details
 ### `/`
@@ -338,7 +343,7 @@ Return value (if trusted):
         "kernel_version": "3.16",
         "server": "lxd",
         "server_pid": 10224,
-        "server_version": "0.8.1"}
+        "server_version": "0.8.1",
         "storage": "btrfs",
         "storage_version": "3.19",
     },
@@ -725,7 +730,28 @@ Input (using a remote instance, in push mode sent over the migration websocket v
 
 Input (using a backup):
 
-Raw compressed tarball as provided by a backup download.
+Raw compressed tarball as provided by a backup export (`/1.0/instances/<name>/backups/<backup>/export`).
+The `X-LXD-name` header can be set to override the target instance name.
+The `X-LXD-pool` header can be set to override the target storage pool.
+
+#### PUT
+ * Description: perform bulk operations on instances
+ * Authentication: trusted
+ * Operation: async
+ * Return: background operation of standard error
+
+Input:
+
+```js
+{
+    "state": {
+        "action": "start",      // State change action (stop, start, restart, freeze or unfreeze)
+        "timeout": 30,          // A timeout after which the state change is considered as failed
+        "force": true,          // Force the state change (currently only valid for stop and restart where it means killing the instance)
+        "stateful": true        // Whether to store or restore runtime state before stopping or starting (only valid for stop and start, defaults to false)
+    }
+}
+```
 
 ### `/1.0/instances/<name>`
 #### GET
@@ -1434,7 +1460,7 @@ Input:
     "action": "stop",       // State change action (stop, start, restart, freeze or unfreeze)
     "timeout": 30,          // A timeout after which the state change is considered as failed
     "force": true,          // Force the state change (currently only valid for stop and restart where it means killing the instance)
-    "stateful": true        // Whether to store or restore runtime state before stopping or startiong (only valid for stop and start, defaults to false)
+    "stateful": true        // Whether to store or restore runtime state before stopping or starting (only valid for stop and start, defaults to false)
 }
 ```
 
@@ -1618,10 +1644,11 @@ Input:
 
 ```js
 {
-    "name": "backupName",      // unique identifier for the backup
-    "expiry": 3600,            // when to delete the backup automatically
-    "instance_only": true,     // if True, snapshots aren't included
-    "optimized_storage": true  // if True, btrfs send or zfs send is used for instance and snapshots
+    "name": "backupName",                      // unique identifier for the backup
+    "expires_at": "2018-04-23T12:16:09+02:00", // when to delete the backup automatically
+    "instance_only": true,                     // if True, snapshots aren't included
+    "optimized_storage": true,                 // if True, btrfs send or zfs send is used for instance and snapshots (can only be imported on matching storage pool driver)
+    "compression_algorithm": "xz"              // Override the compression algorithm for the backup (optional)
 }
 ```
 
@@ -1673,15 +1700,7 @@ Input:
  * Introduced: with API extension `container_backup`
  * Authentication: trusted
  * Operation: sync
- * Return: dict containing the backup tarball
-
-Output:
-
-```json
-{
-    "data": "<byte-stream>"
-}
-```
+ * Return: Raw backup file or standard error
 
 ### `/1.0/events`
 This URL isn't a real REST API endpoint, instead doing a GET query on it
@@ -2296,6 +2315,162 @@ Return:
 }
 ```
 
+
+### `/1.0/network-acls`
+#### GET
+ * Description: list of network ACLs
+ * Introduced: with API extension `network_acl`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: list of URLs for network ACLs that are current defined on the host
+
+Return:
+
+```json
+[
+    "/1.0/network-acls/myacl1",
+    "/1.0/network-acls/myacl2"
+]
+```
+
+#### POST
+ * Description: define a new network ACL
+ * Introduced: with API extension `network_acl`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+```json
+{
+    "name": "my-network-acl",
+    "description": "My network ACL",
+    "config": {
+        "user.somekey": "my own optional reference",
+    },
+    "ingress": [
+        {
+            "action": "allow",
+            "source": "192.168.1.1/32",
+            "destination": "192.168.1.2/32",
+            "protocol": "tcp",
+            "source_port": "",
+            "destination_port": "22",
+            "icmp_type": "",
+            "icmp_code": "",
+            "description": "Allow a known IP to reach another known IP using SSH",
+            "state": "enabled"
+        },
+    ],
+    "egress": [],
+}
+```
+
+### `/1.0/network-acls/<name>`
+#### GET
+ * Description: information about a network ACL
+ * Introduced: with API extension `network_acl`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing a network
+
+Return:
+
+```json
+{
+    "name": "my-network-acl",
+    "description": "My network ACL",
+    "config": {
+        "user.somekey": "my own optional reference",
+    },
+    "ingress": [
+        {
+            "action": "allow",
+            "source": "192.168.1.1/32",
+            "destination": "192.168.1.2/32",
+            "protocol": "tcp",
+            "source_port": "",
+            "destination_port": "22",
+            "icmp_type": "",
+            "icmp_code": "",
+            "description": "Allow a known IP to reach another known IP using SSH",
+            "state": "enabled"
+        },
+    ],
+    "egress": [],
+    "used_by": []
+}
+```
+
+#### PUT (ETag supported)
+ * Description: replace the network ACL information
+ * Introduced: with API extension `network_acl`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+```json
+{
+    "description": "My network ACL",
+    "config": {
+        "user.somekey": "my own optional reference",
+    },
+    "ingress": [
+        {
+            "action": "allow",
+            "source": "192.168.1.1/32",
+            "destination": "192.168.1.2/32",
+            "protocol": "tcp",
+            "source_port": "",
+            "destination_port": "22",
+            "icmp_type": "",
+            "icmp_code": "",
+            "description": "Allow a known IP to reach another known IP using SSH",
+            "state": "enabled"
+        },
+    ],
+    "egress": [],
+}
+```
+
+#### POST
+ * Description: rename a network ACL
+ * Introduced: with API extension `network_acl`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input (rename a network ACL):
+
+```json
+{
+    "name": "new-name"
+}
+```
+
+HTTP return value must be 204 (No content) and Location must point to the renamed resource.
+
+Renaming to an existing name must return the 409 (Conflict) HTTP code.
+
+#### DELETE
+ * Description: remove a network ACL
+ * Introduced: with API extension `network_acl`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input (none at present):
+
+```json
+{
+}
+```
+
+HTTP code for this should be 202 (Accepted).
+
 ### `/1.0/operations`
 #### GET
  * Description: list of operations
@@ -2680,6 +2855,55 @@ HTTP code for this should be 202 (Accepted).
 
 Attempting to delete the `default` project will return the 403 (Forbidden) HTTP code.
 
+### `/1.0/projects/<name>/state`
+#### GET
+ * Description: project usage
+ * Introduced: with API extension `project_usage`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict representing the project allocations
+
+Output:
+
+```json
+{
+    "resources": {
+        "containers": {
+            "limit": 10,
+            "usage": 4
+        },
+        "cpu": {
+            "limit": -1,
+            "usage": 8
+        },
+        "disk": {
+            "limit": 838860800,
+            "usage": 419430400
+        },
+        "instances": {
+            "limit": 12,
+            "usage": 5
+        },
+        "memory": {
+            "limit": 17179869184,
+            "usage": 536870912
+        },
+        "networks": {
+            "limit": 10,
+            "usage": 2
+        },
+        "processes": {
+            "limit": 10000,
+            "usage": 500
+        },
+        "virtual-machines": {
+            "limit": 5,
+            "usage": 1
+        }
+    }
+}
+```
+
 ### `/1.0/storage-pools`
 #### GET
  * Description: list of storage pools
@@ -2943,6 +3167,10 @@ Input (when migrating a volume):
 }
 ```
 
+Input (using a backup):
+
+Raw compressed tarball as provided by a backup export (`/1.0/storage-pools/<pool>/volumes/<type>/<name>/backups/<backup>/export`).
+
 ### `/1.0/storage-pools/<pool>/volumes/<type>`
 #### POST
  * Description: create a new storage volume of a particular type on a given storage pool
@@ -2988,6 +3216,10 @@ Input (when migrating a volume):
     }
 }
 ```
+
+Input (using a backup):
+
+Raw compressed tarball as provided by a backup export (`/1.0/storage-pools/<pool>/volumes/<type>/<name>/backups/<backup>/export`).
 
 ### `/1.0/storage-pools/<pool>/volumes/<type>/<name>`
 #### POST
@@ -3231,10 +3463,11 @@ Input:
 
 ```js
 {
-    "name": "backupName",      // unique identifier for the backup
-    "expiry": 3600,            // when to delete the backup automatically
-    "volume_only": true,     // if True, snapshots aren't included
-    "optimized_storage": true  // if True, btrfs send or zfs send is used for volume and snapshots
+    "name": "backupName",                      // unique identifier for the backup
+    "expires_at": "2018-04-23T12:16:09+02:00", // when to delete the backup automatically
+    "volume_only": true,                       // if True, snapshots aren't included
+    "optimized_storage": true,                 // if True, btrfs send or zfs send is used for volume and snapshots
+    "compression_algorithm": "xz"              // Override the compression algorithm for the backup (optional)
 }
 ```
 
@@ -3286,13 +3519,23 @@ Input:
  * Introduced: with API extension `custom_volume_backup`
  * Authentication: trusted
  * Operation: sync
- * Return: dict containing the backup tarball
+ * Return: Raw backup file or standard error
 
-Output:
+### `/1.0/storage-pools/<pool>/volumes/<type>/<name>/state`
+#### GET
+ * Description: Storage volume state information
+ * Introduced: with API extension `storage_volume_state`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: dict containing state information
+
+Return value:
 
 ```json
 {
-    "data": "<byte-stream>"
+    "usage": {
+        "used": 2578112512
+    }
 }
 ```
 
@@ -3485,3 +3728,91 @@ Input (none at present):
 {
 }
 ```
+
+### `/1.0/warnings`
+#### GET
+ * Description: list of warnings
+ * Introduced: with API extension `warnings`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: list of warnings
+
+Return:
+```json
+[
+    "/1.0/warnings/0e3bff13-f7a1-45b9-9df9-30e4856b7603",
+    "/1.0/warnings/01a7faeb-cb5b-4d8d-b670-0650c9ad5e90"
+]
+```
+
+### `/1.0/warnings/<uuid>`
+#### GET
+ * Description: server warning
+ * Introduced: with API extension `warnings`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: server warning
+
+Return:
+
+```js
+{
+    "count": 1,
+    "entity_url": "/1.0/instances/c1?project=default",
+    "first_seen_at": "2021-03-23T17:38:37.753398689-04:00",
+    "last_message": "Couldn't find the CGroup blkio.weight, disk priority will be ignored",
+    "last_seen_at": "2021-03-23T17:38:37.753398689-04:00",
+    "location": "node1",
+    "project": "default",
+    "severity": "low",
+    "status": "new",
+    "type": "Couldn't find CGroup",
+    "uuid": "e9e9da0d-2538-4351-8047-46d4a8ae4dbb"
+}
+```
+
+#### PUT (ETag supported)
+ * Description: Update warning status
+ * Introduced: with API extension `warnings`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+```json
+{
+  "status": "new"
+}
+```
+
+#### PATCH (ETag supported)
+ * Description: Update warning status
+ * Introduced: with API extension `warnings`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input:
+
+```json
+{
+  "status": "new"
+}
+```
+
+#### DELETE
+ * Description: delete a warning that has been resolved
+ * Introduced: with API extension `warnings`
+ * Authentication: trusted
+ * Operation: sync
+ * Return: standard return value or standard error
+
+Input (none at present):
+
+```json
+{
+}
+```
+
+HTTP code for this should be 202 (Accepted).

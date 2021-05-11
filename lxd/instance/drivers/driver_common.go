@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"database/sql"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/query"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/device/nictype"
 	"github.com/lxc/lxd/lxd/instance"
@@ -18,6 +20,7 @@ import (
 	"github.com/lxc/lxd/lxd/instance/operationlock"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/project"
+	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/state"
 	storagePools "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
@@ -185,9 +188,14 @@ func (d *common) Backups() ([]backup.InstanceBackup, error) {
 	return backups, nil
 }
 
-// DeferTemplateApply not used currently.
-func (d *common) DeferTemplateApply(trigger string) error {
-	err := d.VolatileSet(map[string]string{"volatile.apply_template": trigger})
+// DeferTemplateApply records a template trigger to apply on next instance start.
+func (d *common) DeferTemplateApply(trigger instance.TemplateTrigger) error {
+	// Avoid over-writing triggers that have already been set.
+	if d.localConfig["volatile.apply_template"] != "" {
+		return nil
+	}
+
+	err := d.VolatileSet(map[string]string{"volatile.apply_template": string(trigger)})
 	if err != nil {
 		return errors.Wrap(err, "Failed to set apply_template volatile key")
 	}
@@ -326,7 +334,7 @@ func (d *common) TemplatesPath() string {
 // SECTION: internal functions
 //
 
-// deviceResetVolatile resets a device's volatile data when its removed or updated in such a way
+// deviceVolatileReset resets a device's volatile data when its removed or updated in such a way
 // that it is removed then added immediately afterwards.
 func (d *common) deviceVolatileReset(devName string, oldConfig, newConfig deviceConfig.Device) error {
 	volatileClear := make(map[string]string)
@@ -432,12 +440,40 @@ func (d *common) expandDevices(profiles []api.Profile) error {
 	return nil
 }
 
-// restart handles instance restarts.
-func (d *common) restart(inst instance.Instance, timeout time.Duration) error {
+// restartCommon handles the common part of instance restarts.
+func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) error {
 	// Setup a new operation for the stop/shutdown phase.
 	op, err := operationlock.Create(d.id, "restart", true, true)
 	if err != nil {
 		return errors.Wrap(err, "Create restart operation")
+	}
+
+	// Handle ephemeral instances.
+	ephemeral := inst.IsEphemeral()
+	if ephemeral {
+		// Unset ephemeral flag
+		args := db.InstanceArgs{
+			Architecture: inst.Architecture(),
+			Config:       inst.LocalConfig(),
+			Description:  inst.Description(),
+			Devices:      inst.LocalDevices(),
+			Ephemeral:    false,
+			Profiles:     inst.Profiles(),
+			Project:      inst.Project(),
+			Type:         inst.Type(),
+			Snapshot:     inst.IsSnapshot(),
+		}
+
+		err := inst.Update(args, false)
+		if err != nil {
+			return err
+		}
+
+		// On function return, set the flag back on
+		defer func() {
+			args.Ephemeral = ephemeral
+			inst.Update(args, false)
+		}()
 	}
 
 	if timeout == 0 {
@@ -490,6 +526,60 @@ func (d *common) runHooks(hooks []func() error) error {
 	return nil
 }
 
+// snapshot handles the common part of the snapshoting process.
+func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time.Time, stateful bool) error {
+	revert := revert.New()
+	defer revert.Fail()
+
+	// Setup the arguments.
+	args := db.InstanceArgs{
+		Project:      inst.Project(),
+		Architecture: inst.Architecture(),
+		Config:       inst.LocalConfig(),
+		Type:         inst.Type(),
+		Snapshot:     true,
+		Devices:      inst.LocalDevices(),
+		Ephemeral:    inst.IsEphemeral(),
+		Name:         inst.Name() + shared.SnapshotDelimiter + name,
+		Profiles:     inst.Profiles(),
+		Stateful:     stateful,
+		ExpiryDate:   expiry,
+	}
+
+	// Create the snapshot.
+	snap, err := instance.CreateInternal(d.state, args)
+	if err != nil {
+		return errors.Wrapf(err, "Failed creating instance snapshot record %q", name)
+	}
+	revert.Add(func() { snap.Delete(true) })
+
+	pool, err := storagePools.GetPoolByInstance(d.state, snap)
+	if err != nil {
+		return err
+	}
+
+	err = pool.CreateInstanceSnapshot(snap, inst, d.op)
+	if err != nil {
+		return errors.Wrap(err, "Create instance snapshot")
+	}
+
+	// Mount volume for backup.yaml writing.
+	_, err = pool.MountInstance(inst, d.op)
+	if err != nil {
+		return errors.Wrap(err, "Create instance snapshot (mount source)")
+	}
+	defer pool.UnmountInstance(inst, d.op)
+
+	// Attempt to update backup.yaml for instance.
+	err = inst.UpdateBackupFile()
+	if err != nil {
+		return err
+	}
+
+	revert.Success()
+	return nil
+}
+
 // updateProgress updates the operation metadata with a new progress string.
 func (d *common) updateProgress(progress string) {
 	if d.op == nil {
@@ -523,4 +613,62 @@ func (d *common) lifecycle(action string, ctx map[string]interface{}) error {
 	}
 
 	return d.state.Events.SendLifecycle(d.project, fmt.Sprintf("%s-%s", prefix, action), u, ctx)
+}
+
+// insertConfigkey function attempts to insert the instance config key into the database. If the insert fails
+// then the database is queried to check whether another query inserted the same key. If the key is still
+// unpopulated then the insert querty is retried until it succeeds or a retry limit is reached.
+// If the insert succeeds or the key is found to have been populated then the value of the key is returned.
+func (d *common) insertConfigkey(key string, value string) (string, error) {
+	err := query.Retry(func() error {
+		err := query.Transaction(d.state.Cluster.DB(), func(tx *sql.Tx) error {
+			return db.CreateInstanceConfig(tx, d.id, map[string]string{key: value})
+		})
+		if err != nil {
+			// Check if something else filled it in behind our back.
+			existingValue, errCheckExists := d.state.Cluster.GetInstanceConfig(d.id, key)
+			if errCheckExists != nil {
+				return err
+			}
+
+			value = existingValue
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return value, nil
+}
+
+// isRunningStatusCode returns if instance is running from status code.
+func (d *common) isRunningStatusCode(statusCode api.StatusCode) bool {
+	return statusCode != api.Error && statusCode != api.Stopped
+}
+
+// startupSnapshot triggers a snapshot if configured.
+func (d *common) startupSnapshot(inst instance.Instance) error {
+	schedule := strings.ToLower(d.expandedConfig["snapshots.schedule"])
+	if schedule == "" {
+		return nil
+	}
+
+	triggers := strings.Split(schedule, ", ")
+	if !shared.StringInSlice("@startup", triggers) {
+		return nil
+	}
+
+	expiry, err := shared.GetSnapshotExpiry(time.Now(), d.expandedConfig["snapshots.expiry"])
+	if err != nil {
+		return err
+	}
+
+	name, err := instance.NextSnapshotName(d.state, inst, "snap%d")
+	if err != nil {
+		return err
+	}
+
+	return inst.Snapshot(name, expiry, false)
 }

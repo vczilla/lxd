@@ -148,7 +148,7 @@ func (b *mockBackend) GetInstanceUsage(inst instance.Instance) (int64, error) {
 	return 0, nil
 }
 
-func (b *mockBackend) SetInstanceQuota(inst instance.Instance, size string, op *operations.Operation) error {
+func (b *mockBackend) SetInstanceQuota(inst instance.Instance, size string, vmStateSize string, op *operations.Operation) error {
 	return nil
 }
 
@@ -213,7 +213,7 @@ func (b *mockBackend) RenameCustomVolume(projectName string, volName string, new
 }
 
 func (b *mockBackend) UpdateCustomVolume(projectName string, volName string, newDesc string, newConfig map[string]string, op *operations.Operation) error {
-	return ErrNotImplemented
+	return drivers.ErrNotImplemented
 }
 
 func (b *mockBackend) DeleteCustomVolume(projectName string, volName string, op *operations.Operation) error {

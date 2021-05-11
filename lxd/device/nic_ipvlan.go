@@ -8,10 +8,12 @@ import (
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/ip"
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/validate"
+	"github.com/pkg/errors"
 )
 
 const ipvlanModeL3S = "l3s"
@@ -42,9 +44,11 @@ func (d *nicIPVLAN) validateConfig(instConf instance.ConfigReader) error {
 		"ipv6.gateway",
 		"ipv4.host_table",
 		"ipv6.host_table",
+		"gvrp",
 	}
 
-	rules := nicValidationRules(requiredFields, optionalFields)
+	rules := nicValidationRules(requiredFields, optionalFields, instConf)
+	rules["gvrp"] = validate.Optional(validate.IsBool)
 	rules["ipv4.address"] = func(value string) error {
 		if value == "" {
 			return nil
@@ -144,7 +148,7 @@ func (d *nicIPVLAN) validateEnvironment() error {
 		return fmt.Errorf("Requires liblxc has following API extensions: network_ipvlan, network_l2proxy, network_gateway_device_route")
 	}
 
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["parent"])) {
+	if !network.InterfaceExists(d.config["parent"]) {
 		return fmt.Errorf("Parent device '%s' doesn't exist", d.config["parent"])
 	}
 
@@ -162,7 +166,7 @@ func (d *nicIPVLAN) validateEnvironment() error {
 
 	// If the effective parent doesn't exist and the vlan option is specified, it means we are going to create
 	// the VLAN parent at start, and we will configure the needed sysctls so don't need to check them yet.
-	if d.config["vlan"] != "" && !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", effectiveParentName)) {
+	if d.config["vlan"] != "" && !network.InterfaceExists(effectiveParentName) {
 		return nil
 	}
 
@@ -170,7 +174,7 @@ func (d *nicIPVLAN) validateEnvironment() error {
 		// Check necessary sysctls are configured for use with l2proxy parent in IPVLAN l3s mode.
 		ipv4FwdPath := fmt.Sprintf("net/ipv4/conf/%s/forwarding", effectiveParentName)
 		sysctlVal, err := util.SysctlGet(ipv4FwdPath)
-		if err != nil || sysctlVal != "1\n" {
+		if err != nil {
 			return fmt.Errorf("Error reading net sysctl %s: %v", ipv4FwdPath, err)
 		}
 		if sysctlVal != "1\n" {
@@ -218,10 +222,15 @@ func (d *nicIPVLAN) Start() (*deviceConfig.RunConfig, error) {
 
 	saveData := make(map[string]string)
 
+	// Record a random host name to use to detach the ipvlan interface back onto the host at stop time so we
+	// can remove it and not have to rely on the kernel to do it when the namespace is destroyed, as this is
+	// not always reliable.
+	saveData["host_name"] = network.RandomDevName("lxd")
+
 	// Decide which parent we should use based on VLAN setting.
 	parentName := network.GetHostDevice(d.config["parent"], d.config["vlan"])
 
-	statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], parentName, d.config["vlan"])
+	statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], parentName, d.config["vlan"], shared.IsTrue(d.config["gvrp"]))
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +364,13 @@ func (d *nicIPVLAN) postStart() error {
 		if d.config["ipv4.host_table"] != "" {
 			for _, addr := range strings.Split(d.config["ipv4.address"], ",") {
 				addr = strings.TrimSpace(addr)
-				_, err := shared.RunCommand("ip", "-4", "route", "add", "table", d.config["ipv4.host_table"], fmt.Sprintf("%s/32", addr), "dev", "lo")
+				r := &ip.Route{
+					DevName: "lo",
+					Route:   fmt.Sprintf("%s/32", addr),
+					Table:   d.config["ipv4.host_table"],
+					Family:  ip.FamilyV4,
+				}
+				err := r.Add()
 				if err != nil {
 					return err
 				}
@@ -369,7 +384,13 @@ func (d *nicIPVLAN) postStart() error {
 		if d.config["ipv6.host_table"] != "" {
 			for _, addr := range strings.Split(d.config["ipv6.address"], ",") {
 				addr = strings.TrimSpace(addr)
-				_, err := shared.RunCommand("ip", "-6", "route", "add", "table", d.config["ipv6.host_table"], fmt.Sprintf("%s/128", addr), "dev", "lo")
+				r := &ip.Route{
+					DevName: "lo",
+					Route:   fmt.Sprintf("%s/128", addr),
+					Table:   d.config["ipv6.host_table"],
+					Family:  ip.FamilyV6,
+				}
+				err := r.Add()
 				if err != nil {
 					return err
 				}
@@ -382,8 +403,16 @@ func (d *nicIPVLAN) postStart() error {
 
 // Stop is run when the device is removed from the instance.
 func (d *nicIPVLAN) Stop() (*deviceConfig.RunConfig, error) {
+	v := d.volatileGet()
 	runConf := deviceConfig.RunConfig{
 		PostHooks: []func() error{d.postStop},
+	}
+
+	// Add instruction for removal of ipvlan interface back to host if set.
+	if v["host_name"] != "" {
+		runConf.NetworkInterface = []deviceConfig.RunConfigItem{
+			{Key: "link", Value: v["host_name"]},
+		}
 	}
 
 	return &runConf, nil
@@ -393,18 +422,37 @@ func (d *nicIPVLAN) Stop() (*deviceConfig.RunConfig, error) {
 func (d *nicIPVLAN) postStop() error {
 	defer d.volatileSet(map[string]string{
 		"last_state.created": "",
+		"host_name":          "",
 	})
 
 	v := d.volatileGet()
+
+	networkVethFillFromVolatile(d.config, v)
+
+	errs := []error{}
+
+	// Delete host-side detached interface if not removed by liblxc.
+	if network.InterfaceExists(d.config["host_name"]) {
+		err := network.InterfaceRemove(d.config["host_name"])
+		if err != nil {
+			errs = append(errs, errors.Wrapf(err, "Failed to remove interface %q", d.config["host_name"]))
+		}
+	}
 
 	if d.config["ipv4.address"] != "" {
 		// Remove static routes to instance IPs to custom routing tables if specified.
 		if d.config["ipv4.host_table"] != "" {
 			for _, addr := range strings.Split(d.config["ipv4.address"], ",") {
 				addr = strings.TrimSpace(addr)
-				_, err := shared.RunCommand("ip", "-4", "route", "delete", "table", d.config["ipv4.host_table"], fmt.Sprintf("%s/32", addr), "dev", "lo")
+				r := &ip.Route{
+					DevName: "lo",
+					Route:   fmt.Sprintf("%s/32", addr),
+					Table:   d.config["ipv4.host_table"],
+					Family:  ip.FamilyV4,
+				}
+				err := r.Delete()
 				if err != nil {
-					return err
+					errs = append(errs, err)
 				}
 			}
 		}
@@ -415,9 +463,15 @@ func (d *nicIPVLAN) postStop() error {
 		if d.config["ipv6.host_table"] != "" {
 			for _, addr := range strings.Split(d.config["ipv6.address"], ",") {
 				addr = strings.TrimSpace(addr)
-				_, err := shared.RunCommand("ip", "-6", "route", "delete", "table", d.config["ipv6.host_table"], fmt.Sprintf("%s/128", addr), "dev", "lo")
+				r := &ip.Route{
+					DevName: "lo",
+					Route:   fmt.Sprintf("%s/128", addr),
+					Table:   d.config["ipv6.host_table"],
+					Family:  ip.FamilyV6,
+				}
+				err := r.Delete()
 				if err != nil {
-					return err
+					errs = append(errs, err)
 				}
 			}
 		}
@@ -428,8 +482,12 @@ func (d *nicIPVLAN) postStop() error {
 		parentName := network.GetHostDevice(d.config["parent"], d.config["vlan"])
 		err := networkRemoveInterfaceIfNeeded(d.state, parentName, d.inst, d.config["parent"], d.config["vlan"])
 		if err != nil {
-			return err
+			errs = append(errs, err)
 		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%v", errs)
 	}
 
 	return nil

@@ -1,3 +1,4 @@
+//go:build linux && cgo && !agent
 // +build linux,cgo,!agent
 
 package db
@@ -15,6 +16,7 @@ import (
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/osarch"
 	"github.com/lxc/lxd/shared/version"
 )
@@ -51,6 +53,109 @@ func (n NodeInfo) IsOffline(threshold time.Duration) bool {
 	return nodeIsOffline(threshold, n.Heartbeat)
 }
 
+// ToAPI returns a LXD API entry.
+func (n NodeInfo) ToAPI(cluster *Cluster, node *Node) (*api.ClusterMember, error) {
+	// Load some needed data.
+	var err error
+	var offlineThreshold time.Duration
+	var maxVersion [2]int
+	var failureDomain string
+
+	// From cluster database.
+	err = cluster.Transaction(func(tx *ClusterTx) error {
+		// Get offline threshold.
+		offlineThreshold, err = tx.GetNodeOfflineThreshold()
+		if err != nil {
+			return errors.Wrap(err, "Load offline threshold config")
+		}
+
+		// Get failure domains.
+		nodesDomains, err := tx.GetNodesFailureDomains()
+		if err != nil {
+			return errors.Wrap(err, "Load nodes failure domains")
+		}
+
+		domainsNames, err := tx.GetFailureDomainsNames()
+		if err != nil {
+			return errors.Wrap(err, "Load failure domains names")
+		}
+
+		domainID := nodesDomains[n.Address]
+		failureDomain = domainsNames[domainID]
+
+		// Get the highest schema and API versions.
+		maxVersion, err = tx.GetNodeMaxVersion()
+		if err != nil {
+			return errors.Wrap(err, "Get max version")
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// From local database.
+	var raftNode *RaftNode
+	err = node.Transaction(func(tx *NodeTx) error {
+		nodes, err := tx.GetRaftNodes()
+		if err != nil {
+			return errors.Wrap(err, "Load offline threshold config")
+		}
+
+		for _, node := range nodes {
+			if node.Address != n.Address {
+				continue
+			}
+
+			raftNode = &node
+			break
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Fill in the struct.
+	result := api.ClusterMember{}
+	result.Description = n.Description
+	result.ServerName = n.Name
+	result.URL = fmt.Sprintf("https://%s", n.Address)
+	result.Database = raftNode != nil && raftNode.Role == RaftVoter
+	result.Roles = n.Roles
+	if result.Database {
+		result.Roles = append(result.Roles, string(ClusterRoleDatabase))
+	}
+	result.Architecture, err = osarch.ArchitectureName(n.Architecture)
+	if err != nil {
+		return nil, err
+	}
+	result.FailureDomain = failureDomain
+
+	if n.IsOffline(offlineThreshold) {
+		result.Status = "Offline"
+		result.Message = fmt.Sprintf("No heartbeat for %s (%s)", time.Now().Sub(n.Heartbeat), n.Heartbeat)
+	} else {
+		// Check if up to date.
+		n, err := util.CompareVersions(maxVersion, n.Version())
+		if err != nil {
+			return nil, err
+		}
+
+		if n == 1 {
+			result.Status = "Blocked"
+			result.Message = "Needs updating to newer version"
+		} else {
+			result.Status = "Online"
+			result.Message = "Fully operational"
+		}
+	}
+
+	return &result, nil
+}
+
 // Version returns the node's version, composed by its schema level and
 // number of extensions.
 func (n NodeInfo) Version() [2]int {
@@ -61,6 +166,49 @@ func (n NodeInfo) Version() [2]int {
 func (c *ClusterTx) GetNodeByAddress(address string) (NodeInfo, error) {
 	null := NodeInfo{}
 	nodes, err := c.nodes(false /* not pending */, "address=?", address)
+	if err != nil {
+		return null, err
+	}
+	switch len(nodes) {
+	case 0:
+		return null, ErrNoSuchObject
+	case 1:
+		return nodes[0], nil
+	default:
+		return null, fmt.Errorf("more than one node matches")
+	}
+}
+
+// GetNodeMaxVersion returns the highest version possible on the cluster.
+func (c *ClusterTx) GetNodeMaxVersion() ([2]int, error) {
+	version := [2]int{}
+
+	// Get the maximum DB schema.
+	var maxSchema int
+	row := c.tx.QueryRow("SELECT MAX(schema) FROM nodes")
+	err := row.Scan(&maxSchema)
+	if err != nil {
+		return version, err
+	}
+
+	// Get the maximum API extension.
+	var maxAPI int
+	row = c.tx.QueryRow("SELECT MAX(api_extensions) FROM nodes")
+	err = row.Scan(&maxAPI)
+	if err != nil {
+		return version, err
+	}
+
+	// Compute the combined version.
+	version = [2]int{maxSchema, maxAPI}
+
+	return version, nil
+}
+
+// GetNodeWithID returns the node with the given ID.
+func (c *ClusterTx) GetNodeWithID(nodeID int) (NodeInfo, error) {
+	null := NodeInfo{}
+	nodes, err := c.nodes(false /* not pending */, "id=?", nodeID)
 	if err != nil {
 		return null, err
 	}
@@ -223,6 +371,26 @@ func (c *ClusterTx) RenameNode(old, new string) error {
 	if n != 1 {
 		return fmt.Errorf("expected to update one row, not %d", n)
 	}
+	return nil
+}
+
+// SetDescription changes the description of the given node.
+func (c *ClusterTx) SetDescription(id int64, description string) error {
+	stmt := `UPDATE nodes SET description=? WHERE id=?`
+	result, err := c.tx.Exec(stmt, description, id)
+	if err != nil {
+		return errors.Wrap(err, "Failed to update node name")
+	}
+
+	n, err := result.RowsAffected()
+	if err != nil {
+		return errors.Wrap(err, "Failed to get rows count")
+	}
+
+	if n != 1 {
+		return fmt.Errorf("Expected to update one row, not %d", n)
+	}
+
 	return nil
 }
 
@@ -620,9 +788,13 @@ func (c *ClusterTx) SetNodeHeartbeat(address string, heartbeat time.Time) error 
 	if err != nil {
 		return err
 	}
-	if n != 1 {
-		return fmt.Errorf("expected to update one row and not %d", n)
+
+	if n < 1 {
+		return ErrNoSuchObject
+	} else if n > 1 {
+		return fmt.Errorf("Expected to update one row and not %d", n)
 	}
+
 	return nil
 }
 
@@ -762,7 +934,7 @@ func (c *ClusterTx) GetNodeOfflineThreshold() (time.Duration, error) {
 // the least number of containers (either already created or being created with
 // an operation). If archs is not empty, then return only nodes with an
 // architecture in that list.
-func (c *ClusterTx) GetNodeWithLeastInstances(archs []int) (string, error) {
+func (c *ClusterTx) GetNodeWithLeastInstances(archs []int, defaultArch int) (string, error) {
 	threshold, err := c.GetNodeOfflineThreshold()
 	if err != nil {
 		return "", errors.Wrap(err, "failed to get offline threshold")
@@ -775,31 +947,36 @@ func (c *ClusterTx) GetNodeWithLeastInstances(archs []int) (string, error) {
 
 	name := ""
 	containers := -1
+	isDefaultArchChosen := false
 	for _, node := range nodes {
 		if node.IsOffline(threshold) {
 			continue
 		}
 
-		if len(archs) > 0 {
-			// Get personalities too.
-			personalities, err := osarch.ArchitecturePersonalities(node.Architecture)
-			if err != nil {
-				return "", err
-			}
+		// Get personalities too.
+		personalities, err := osarch.ArchitecturePersonalities(node.Architecture)
+		if err != nil {
+			return "", err
+		}
 
-			supported := []int{node.Architecture}
-			supported = append(supported, personalities...)
+		supported := []int{node.Architecture}
+		supported = append(supported, personalities...)
 
-			match := false
-			for _, entry := range supported {
-				if shared.IntInSlice(entry, archs) {
-					match = true
-				}
+		match := false
+		isDefaultArch := false
+		for _, entry := range supported {
+			if shared.IntInSlice(entry, archs) {
+				match = true
 			}
-
-			if !match {
-				continue
+			if entry == defaultArch {
+				isDefaultArch = true
 			}
+		}
+		if len(archs) > 0 && !match {
+			continue
+		}
+		if !isDefaultArch && isDefaultArchChosen {
+			continue
 		}
 
 		// Fetch the number of containers already created on this node.
@@ -816,9 +993,12 @@ func (c *ClusterTx) GetNodeWithLeastInstances(archs []int) (string, error) {
 		}
 
 		count := created + pending
-		if containers == -1 || count < containers {
+		if containers == -1 || count < containers || (isDefaultArch == true && isDefaultArchChosen == false) {
 			containers = count
 			name = node.Name
+			if isDefaultArch {
+				isDefaultArchChosen = true
+			}
 		}
 	}
 	return name, nil

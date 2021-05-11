@@ -36,7 +36,7 @@ func (r *eventsServe) String() string {
 }
 
 func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
-	project := projectParam(r)
+	projectName := projectParam(r)
 	types := strings.Split(r.FormValue("type"), ",")
 	if len(types) == 1 && types[0] == "" {
 		types = []string{}
@@ -84,7 +84,7 @@ func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
 	// If this request is an internal one initiated by another node wanting
 	// to watch the events on this node, set the listener to broadcast only
 	// local events.
-	listener, err := d.events.AddListener(project, c, types, serverName, isClusterNotification(r))
+	listener, err := d.events.AddListener(projectName, c, types, serverName, isClusterNotification(r))
 	if err != nil {
 		return err
 	}
@@ -118,6 +118,35 @@ func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
 	return nil
 }
 
+// swagger:operation GET /1.0/events server events_get
+//
+// Get the event stream
+//
+// Connects to the event API using websocket.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+//   - in: query
+//     name: type
+//     description: Event type(s), comma separated (valid types are logging, operation or lifecycle)
+//     type: string
+//     example: logging,lifecycle
+// responses:
+//   "200":
+//     description: Websocket message (JSON)
+//     schema:
+//       $ref: "#/definitions/Event"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func eventsGet(d *Daemon, r *http.Request) response.Response {
 	return &eventsServe{req: r, d: d}
 }

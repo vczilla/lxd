@@ -409,13 +409,51 @@ func (s *execWs) Do(op *operations.Operation) error {
 	return finisher(exitCode, err)
 }
 
-func containerExecPost(d *Daemon, r *http.Request) response.Response {
+// swagger:operation POST /1.0/instances/{name}/exec instances instance_exec_post
+//
+// Run a command
+//
+// Executes a command inside an instance.
+//
+// The returned operation metadata will contain either 2 or 4 websockets.
+// In non-interactive mode, you'll get one websocket for each of stdin, stdout and stderr.
+// In interactive mode, a single bi-directional websocket is used for stdin and stdout/stderr.
+//
+// An additional "control" socket is always added on top which can be used for out of band communication with LXD.
+// This allows sending signals and window sizing information through.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+//   - in: body
+//     name: exec
+//     description: Exec request
+//     schema:
+//       $ref: "#/definitions/InstanceExecPost"
+// responses:
+//   "200":
+//     $ref: "#/responses/Operation"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	post := api.InstanceExecPost{}
@@ -429,24 +467,23 @@ func containerExecPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Forward the request if the container is remote.
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, project, name, cert, instanceType)
+	client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, projectName, name, d.endpoints.NetworkCert(), d.serverCert(), instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	if client != nil {
-		url := fmt.Sprintf("/instances/%s/exec?project=%s", name, project)
+		url := fmt.Sprintf("/instances/%s/exec?project=%s", name, projectName)
 		op, _, err := client.RawOperation("POST", url, post, "")
 		if err != nil {
 			return response.SmartError(err)
 		}
 
 		opAPI := op.Get()
-		return operations.ForwardedOperationResponse(project, &opAPI)
+		return operations.ForwardedOperationResponse(projectName, &opAPI)
 	}
 
-	inst, err := instance.LoadByProjectAndName(d.State(), project, name)
+	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -546,12 +583,13 @@ func containerExecPost(d *Daemon, r *http.Request) response.Response {
 		ws.req = post
 
 		resources := map[string][]string{}
-		if ws.instance.Type() == instancetype.Container {
-			resources["containers"] = []string{ws.instance.Name()}
-		}
 		resources["instances"] = []string{ws.instance.Name()}
 
-		op, err := operations.OperationCreate(d.State(), project, operations.OperationClassWebsocket, db.OperationCommandExec, resources, ws.Metadata(), ws.Do, nil, ws.Connect)
+		if ws.instance.Type() == instancetype.Container {
+			resources["containers"] = resources["instances"]
+		}
+
+		op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, db.OperationCommandExec, resources, ws.Metadata(), ws.Do, nil, ws.Connect)
 		if err != nil {
 			return response.InternalError(err)
 		}
@@ -616,12 +654,13 @@ func containerExecPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	resources := map[string][]string{}
-	if inst.Type() == instancetype.Container {
-		resources["containers"] = []string{name}
-	}
 	resources["instances"] = []string{name}
 
-	op, err := operations.OperationCreate(d.State(), project, operations.OperationClassTask, db.OperationCommandExec, resources, nil, run, nil, nil)
+	if inst.Type() == instancetype.Container {
+		resources["containers"] = resources["instances"]
+	}
+
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationCommandExec, resources, nil, run, nil, nil)
 	if err != nil {
 		return response.InternalError(err)
 	}

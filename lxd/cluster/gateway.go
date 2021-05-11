@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,9 +22,11 @@ import (
 
 	dqlite "github.com/canonical/go-dqlite"
 	client "github.com/canonical/go-dqlite/client"
+
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
+	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/pkg/errors"
 )
@@ -38,7 +41,7 @@ import (
 // After creation, the Daemon is expected to expose whatever http handlers the
 // HandlerFuncs method returns and to access the dqlite cluster using the
 // dialer returned by the DialFunc method.
-func NewGateway(db *db.Node, cert *shared.CertInfo, options ...Option) (*Gateway, error) {
+func NewGateway(db *db.Node, networkCert *shared.CertInfo, serverCert func() *shared.CertInfo, options ...Option) (*Gateway, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	o := newOptions()
@@ -48,17 +51,18 @@ func NewGateway(db *db.Node, cert *shared.CertInfo, options ...Option) (*Gateway
 	}
 
 	gateway := &Gateway{
-		db:        db,
-		cert:      cert,
-		options:   o,
-		ctx:       ctx,
-		cancel:    cancel,
-		upgradeCh: make(chan struct{}, 0),
-		acceptCh:  make(chan net.Conn),
-		store:     &dqliteNodeStore{},
+		db:          db,
+		networkCert: networkCert,
+		serverCert:  serverCert,
+		options:     o,
+		ctx:         ctx,
+		cancel:      cancel,
+		upgradeCh:   make(chan struct{}, 0),
+		acceptCh:    make(chan net.Conn),
+		store:       &dqliteNodeStore{},
 	}
 
-	err := gateway.init()
+	err := gateway.init(false)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +74,10 @@ func NewGateway(db *db.Node, cert *shared.CertInfo, options ...Option) (*Gateway
 // possibly runs a dqlite replica on this LXD node (if we're configured to do
 // so).
 type Gateway struct {
-	db      *db.Node
-	cert    *shared.CertInfo
-	options *options
+	db          *db.Node
+	networkCert *shared.CertInfo
+	serverCert  func() *shared.CertInfo
+	options     *options
 
 	// The raft instance to use for creating the dqlite driver. It's nil if
 	// this LXD node is not supposed to be part of the raft cluster.
@@ -107,13 +112,15 @@ type Gateway struct {
 	upgradeTriggered bool
 
 	// Used for the heartbeat handler
-	Cluster           *db.Cluster
-	HeartbeatNodeHook func(*APIHeartbeat)
+	Cluster                   *db.Cluster
+	HeartbeatNodeHook         func(*APIHeartbeat)
+	HeartbeatOfflineThreshold time.Duration
 
 	// NodeStore wrapper.
 	store *dqliteNodeStore
 
-	lock sync.RWMutex
+	lock          sync.RWMutex
+	heartbeatLock sync.Mutex
 
 	// Abstract unix socket that the local dqlite task is listening to.
 	bindAddress string
@@ -139,12 +146,12 @@ func setDqliteVersionHeader(request *http.Request) {
 // These handlers might return 404, either because this LXD node is a
 // non-clustered node not available over the network or because it is not a
 // database node part of the dqlite cluster.
-func (g *Gateway) HandlerFuncs(nodeRefreshTask func(*APIHeartbeat)) map[string]http.HandlerFunc {
+func (g *Gateway) HandlerFuncs(nodeRefreshTask func(*APIHeartbeat), trustedCerts func() map[int]map[string]x509.Certificate) map[string]http.HandlerFunc {
 	database := func(w http.ResponseWriter, r *http.Request) {
 		g.lock.RLock()
 		defer g.lock.RUnlock()
 
-		if !tlsCheckCert(r, g.cert) {
+		if !tlsCheckCert(r, g.networkCert, g.serverCert(), trustedCerts()) {
 			http.Error(w, "403 invalid client certificate", http.StatusForbidden)
 			return
 		}
@@ -394,6 +401,7 @@ func (g *Gateway) DialFunc() client.DialFunc {
 		// leader is ourselves, and we were recently elected. In that case
 		// trigger a full heartbeat now: it will be a no-op if we aren't
 		// actually leaders.
+		logger.Debug("Triggering an out of schedule hearbeat", log.Ctx{"address": address})
 		go g.heartbeat(g.ctx, true)
 
 		return conn, nil
@@ -481,7 +489,7 @@ func (g *Gateway) TransferLeadership() error {
 		if err != nil {
 			return err
 		}
-		if !HasConnectivity(g.cert, address) {
+		if !HasConnectivity(g.networkCert, g.serverCert(), address) {
 			continue
 		}
 		id = server.ID
@@ -583,7 +591,7 @@ func (g *Gateway) getClient() (*client.Client, error) {
 // the given certificate.
 //
 // This is used when disabling clustering on a node.
-func (g *Gateway) Reset(cert *shared.CertInfo) error {
+func (g *Gateway) Reset(networkCert *shared.CertInfo) error {
 	err := g.Shutdown()
 	if err != nil {
 		return err
@@ -598,9 +606,13 @@ func (g *Gateway) Reset(cert *shared.CertInfo) error {
 	if err != nil {
 		return err
 	}
-	g.cert = cert
-	return g.init()
+	g.networkCert = networkCert
+
+	return g.init(false)
 }
+
+// ErrNodeIsNotClustered indicates the node is not clustered.
+var ErrNodeIsNotClustered error = fmt.Errorf("Node is not clustered")
 
 // LeaderAddress returns the address of the current raft leader.
 func (g *Gateway) LeaderAddress() (string, error) {
@@ -609,7 +621,7 @@ func (g *Gateway) LeaderAddress() (string, error) {
 
 	// If we aren't clustered, return an error.
 	if g.memoryDial != nil {
-		return "", fmt.Errorf("Node is not clustered")
+		return "", ErrNodeIsNotClustered
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -638,7 +650,7 @@ func (g *Gateway) LeaderAddress() (string, error) {
 
 	// If this isn't a raft node, contact a raft node and ask for the
 	// address of the current leader.
-	config, err := tlsClientConfig(g.cert)
+	config, err := tlsClientConfig(g.networkCert, g.serverCert())
 	if err != nil {
 		return "", err
 	}
@@ -688,12 +700,14 @@ func (g *Gateway) LeaderAddress() (string, error) {
 			logger.Debugf("Request for leader address from %s failed", address)
 			continue
 		}
+
 		info := map[string]string{}
-		err = shared.ReadToJSON(response.Body, &info)
+		err = json.NewDecoder(response.Body).Decode(&info)
 		if err != nil {
 			logger.Debugf("Failed to parse leader address from %s", address)
 			continue
 		}
+
 		leader := info["leader"]
 		if leader == "" {
 			logger.Debugf("Raft node %s returned no leader address", address)
@@ -707,11 +721,13 @@ func (g *Gateway) LeaderAddress() (string, error) {
 
 // Initialize the gateway, creating a new raft factory and gRPC server (if this
 // node is a database node), and a gRPC dialer.
-func (g *Gateway) init() error {
+// @bootstrap should only be true when turning a non-clustered LXD instance into
+// the first (and leader) node of a new LXD cluster.
+func (g *Gateway) init(bootstrap bool) error {
 	logger.Debugf("Initializing database gateway")
 	g.stopCh = make(chan struct{}, 0)
 
-	info, err := loadInfo(g.db, g.cert)
+	info, err := loadInfo(g.db, g.networkCert)
 	if err != nil {
 		return errors.Wrap(err, "Failed to create raft factory")
 	}
@@ -768,6 +784,21 @@ func (g *Gateway) init() error {
 		)
 		if err != nil {
 			return errors.Wrap(err, "Failed to create dqlite server")
+		}
+
+		// Force the correct configuration into the bootstrap node, this is needed
+		// when the raft node already has log entries, in which case a regular
+		// bootstrap fails, resulting in the node containing outdated configuration.
+		if bootstrap {
+			logger.Debugf("Bootstrap database gateway ID:%v Address:%v",
+				info.ID, info.Address)
+			cluster := []dqlite.NodeInfo{
+				{ID: uint64(info.ID), Address: info.Address},
+			}
+			err = server.Recover(cluster)
+			if err != nil {
+				return errors.Wrap(err, "Failed to recover database state")
+			}
 		}
 
 		err = server.Start()
@@ -903,7 +934,7 @@ func (g *Gateway) nodeAddress(raftAddress string) (string, error) {
 }
 
 func dqliteNetworkDial(ctx context.Context, addr string, g *Gateway) (net.Conn, error) {
-	config, err := tlsClientConfig(g.cert)
+	config, err := tlsClientConfig(g.networkCert, g.serverCert())
 	if err != nil {
 		return nil, err
 	}

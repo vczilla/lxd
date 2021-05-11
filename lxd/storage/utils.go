@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"gopkg.in/robfig/cron.v2"
 
 	"github.com/lxc/lxd/lxd/db"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
@@ -192,14 +191,14 @@ func VolumeContentTypeNameToContentType(contentTypeName string) (int, error) {
 }
 
 // VolumeDBCreate creates a volume in the database.
-func VolumeDBCreate(s *state.State, pool Pool, projectName string, volumeName string, volumeDescription string, volumeTypeName string, snapshot bool, volumeConfig map[string]string, expiryDate time.Time, contentTypeName string) error {
-	// Convert the volume type name to our internal integer representation.
-	volDBType, err := VolumeTypeNameToDBType(volumeTypeName)
+func VolumeDBCreate(s *state.State, pool Pool, projectName string, volumeName string, volumeDescription string, volumeType drivers.VolumeType, snapshot bool, volumeConfig map[string]string, expiryDate time.Time, contentType drivers.ContentType) error {
+	// Convert the volume type to our internal integer representation.
+	volDBType, err := VolumeTypeToDBType(volumeType)
 	if err != nil {
 		return err
 	}
 
-	volDBContentType, err := VolumeContentTypeNameToContentType(contentTypeName)
+	volDBContentType, err := VolumeContentTypeToDBContentType(contentType)
 	if err != nil {
 		return err
 	}
@@ -207,7 +206,7 @@ func VolumeDBCreate(s *state.State, pool Pool, projectName string, volumeName st
 	// Check that a storage volume of the same storage volume type does not already exist.
 	volumeID, _ := s.Cluster.GetStoragePoolNodeVolumeID(projectName, volumeName, volDBType, pool.ID())
 	if volumeID > 0 {
-		return fmt.Errorf("A storage volume of type %s already exists", volumeTypeName)
+		return fmt.Errorf("A storage volume of type %q already exists", volumeType)
 	}
 
 	// Make sure that we don't pass a nil to the next function.
@@ -220,7 +219,7 @@ func VolumeDBCreate(s *state.State, pool Pool, projectName string, volumeName st
 		return err
 	}
 
-	vol := drivers.NewVolume(pool.Driver(), pool.Name(), volType, drivers.ContentType(contentTypeName), volumeName, volumeConfig, pool.Driver().Config())
+	vol := drivers.NewVolume(pool.Driver(), pool.Name(), volType, contentType, volumeName, volumeConfig, pool.Driver().Config())
 
 	// Fill default config.
 	err = pool.Driver().FillVolumeConfig(vol)
@@ -241,7 +240,7 @@ func VolumeDBCreate(s *state.State, pool Pool, projectName string, volumeName st
 		_, err = s.Cluster.CreateStoragePoolVolume(projectName, volumeName, volumeDescription, volDBType, pool.ID(), vol.Config(), volDBContentType)
 	}
 	if err != nil {
-		return fmt.Errorf("Error inserting %q of type %q into database %q", pool.Name(), volumeTypeName, err)
+		return fmt.Errorf("Error inserting volume %q for project %q in pool %q of type %q into database %q", volumeName, projectName, pool.Name(), volumeType, err)
 	}
 
 	return nil
@@ -377,23 +376,8 @@ func validateVolumeCommonRules(vol drivers.Volume) map[string]func(string) error
 			_, err := shared.GetSnapshotExpiry(time.Time{}, value)
 			return err
 		},
-		"snapshots.schedule": func(value string) error {
-			if value == "" {
-				return nil
-			}
-
-			if len(strings.Split(value, " ")) != 5 {
-				return fmt.Errorf("Schedule must be of the form: <minute> <hour> <day-of-month> <month> <day-of-week>")
-			}
-
-			_, err := cron.Parse(fmt.Sprintf("* %s", value))
-			if err != nil {
-				return errors.Wrap(err, "Error parsing schedule")
-			}
-
-			return nil
-		},
-		"snapshots.pattern": validate.IsAny,
+		"snapshots.schedule": validate.Optional(validate.IsCron([]string{"@hourly", "@daily", "@midnight", "@weekly", "@monthly", "@annually", "@yearly"})),
+		"snapshots.pattern":  validate.IsAny,
 	}
 
 	// volatile.idmap settings only make sense for filesystem volumes.
@@ -711,7 +695,7 @@ func VolumeUsedByInstanceDevices(s *state.State, poolName string, projectName st
 		return err
 	}
 
-	return s.Cluster.InstanceList(func(inst db.Instance, p api.Project, profiles []api.Profile) error {
+	return s.Cluster.InstanceList(nil, func(inst db.Instance, p api.Project, profiles []api.Profile) error {
 		// If the volume has a specific cluster member which is different than the instance then skip as
 		// instance cannot be using this volume.
 		if vol.Location != "" && inst.Node != vol.Location {
@@ -786,24 +770,27 @@ func VolumeUsedByExclusiveRemoteInstancesWithProfiles(s *state.State, poolName s
 	var localNode string
 	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		localNode, err = tx.GetLocalNodeName()
-		return err
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "Fetch node name")
-	}
-
-	// Find if volume is attached to a remote instance.
-	var errAttached = fmt.Errorf("Volume is remotely attached")
-	var remoteInstance *db.Instance
-	err = VolumeUsedByInstanceDevices(s, poolName, projectName, vol, true, func(dbInst db.Instance, project api.Project, profiles []api.Profile, usedByDevices []string) error {
-		if dbInst.Node != localNode {
-			remoteInstance = &dbInst
-			return errAttached // Stop the search, this volume is attached to a remote instance.
+		if err != nil {
+			return errors.Wrapf(err, "Failed to get local node name")
 		}
 
 		return nil
 	})
-	if err != nil && err != errAttached {
+	if err != nil {
+		return nil, err
+	}
+
+	// Find if volume is attached to a remote instance.
+	var remoteInstance *db.Instance
+	err = VolumeUsedByInstanceDevices(s, poolName, projectName, vol, true, func(dbInst db.Instance, project api.Project, profiles []api.Profile, usedByDevices []string) error {
+		if dbInst.Node != localNode {
+			remoteInstance = &dbInst
+			return db.ErrInstanceListStop // Stop the search, this volume is attached to a remote instance.
+		}
+
+		return nil
+	})
+	if err != nil && err != db.ErrInstanceListStop {
 		return nil, err
 	}
 

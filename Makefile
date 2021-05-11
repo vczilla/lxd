@@ -8,6 +8,7 @@ ARCHIVE=lxd-$(VERSION).tar
 HASH := \#
 TAG_SQLITE3=$(shell printf "$(HASH)include <dqlite.h>\nvoid main(){dqlite_node_id n = 1;}" | $(CC) ${CGO_CFLAGS} -o /dev/null -xc - >/dev/null 2>&1 && echo "libsqlite3")
 GOPATH ?= $(HOME)/go
+export GO111MODULE=off
 
 .PHONY: default
 default:
@@ -90,10 +91,15 @@ update-protobuf:
 
 .PHONY: update-schema
 update-schema:
-	cd shared/generate && go build -o lxd-generate -tags "$(TAG_SQLITE3)" $(DEBUG) && cd -
-	mv shared/generate/lxd-generate $(GOPATH)/bin
+	cd lxd/db/generate && go build -o lxd-generate -tags "$(TAG_SQLITE3)" $(DEBUG) && cd -
+	mv lxd/db/generate/lxd-generate $(GOPATH)/bin
 	go generate ./...
 	@echo "Code generation completed"
+
+.PHONY: update-api
+update-api:
+	GO111MODULE=on go get -v -x github.com/go-swagger/go-swagger/cmd/swagger
+	swagger generate spec -o doc/rest-api.yaml -w ./lxd -m
 
 .PHONY: debug
 debug:

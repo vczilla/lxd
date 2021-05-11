@@ -301,7 +301,7 @@ func (c *cmdStorageEdit) Run(cmd *cobra.Command, args []string) error {
 		// Respawn the editor
 		if err != nil {
 			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
-			fmt.Println(i18n.G("Press enter to open the editor again"))
+			fmt.Println(i18n.G("Press enter to open the editor again or ctrl+c to abort change"))
 
 			_, err := os.Stdin.Read(make([]byte, 1))
 			if err != nil {
@@ -512,7 +512,7 @@ func (c *cmdStorageList) Command() *cobra.Command {
 	cmd.Short = i18n.G("List available storage pools")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
 		`List available storage pools`))
-	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	cmd.RunE = c.Run
 
@@ -548,28 +548,34 @@ func (c *cmdStorageList) Run(cmd *cobra.Command, args []string) error {
 	data := [][]string{}
 	for _, pool := range pools {
 		usedby := strconv.Itoa(len(pool.UsedBy))
-		details := []string{pool.Name, pool.Description, pool.Driver}
-		if resource.server.IsClustered() {
-			details = append(details, strings.ToUpper(pool.Status))
-		} else {
+		details := []string{pool.Name, pool.Driver}
+		if !resource.server.IsClustered() {
 			details = append(details, pool.Config["source"])
 		}
+
+		details = append(details, pool.Description)
 		details = append(details, usedby)
+		if resource.server.IsClustered() {
+			details = append(details, strings.ToUpper(pool.Status))
+		}
+
 		data = append(data, details)
 	}
 	sort.Sort(byName(data))
 
 	header := []string{
 		i18n.G("NAME"),
-		i18n.G("DESCRIPTION"),
 		i18n.G("DRIVER"),
 	}
-	if resource.server.IsClustered() {
-		header = append(header, i18n.G("STATE"))
-	} else {
+	if !resource.server.IsClustered() {
 		header = append(header, i18n.G("SOURCE"))
 	}
+
+	header = append(header, i18n.G("DESCRIPTION"))
 	header = append(header, i18n.G("USED BY"))
+	if resource.server.IsClustered() {
+		header = append(header, i18n.G("STATE"))
+	}
 
 	return utils.RenderTable(c.flagFormat, header, data, pools)
 }

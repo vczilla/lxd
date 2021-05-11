@@ -62,6 +62,7 @@ linux.kernel\_modules                       | string    | -                 | ye
 migration.incremental.memory                | boolean   | false             | yes           | container                 | Incremental memory transfer of the instance's memory to reduce downtime
 migration.incremental.memory.goal           | integer   | 70                | yes           | container                 | Percentage of memory to have in sync before stopping the instance
 migration.incremental.memory.iterations     | integer   | 10                | yes           | container                 | Maximum number of transfer operations to go through before stopping the instance
+migration.stateful                          | boolean   | false             | no            | virtual-machine           | Allow for stateful stop/start and snapshots. This will prevent the use of some features that are incompatible with it
 nvidia.driver.capabilities                  | string    | compute,utility   | no            | container                 | What driver capabilities the instance needs (sets libnvidia-container NVIDIA\_DRIVER\_CAPABILITIES)
 nvidia.runtime                              | boolean   | false             | no            | container                 | Pass the host NVIDIA and CUDA runtime libraries into the instance
 nvidia.require.cuda                         | string    | -                 | no            | container                 | Version expression for the required CUDA version (sets libnvidia-container NVIDIA\_REQUIRE\_CUDA)
@@ -93,7 +94,7 @@ security.syscalls.intercept.mount.allowed   | string    | -                 | ye
 security.syscalls.intercept.mount.fuse      | string    | -                 | yes           | container                 | Whether to redirect mounts of a given filesystem to their fuse implemenation (e.g. ext4=fuse2fs)
 security.syscalls.intercept.mount.shift     | boolean   | false             | yes           | container                 | Whether to mount shiftfs on top of filesystems handled through mount syscall interception
 security.syscalls.intercept.setxattr        | boolean   | false             | no            | container                 | Handles the `setxattr` system call (allows setting a limited subset of restricted extended attributes)
-snapshots.schedule                          | string    | -                 | no            | -                         | Cron expression (`<minute> <hour> <dom> <month> <dow>`)
+snapshots.schedule                          | string    | -                 | no            | -                         | Cron expression (`<minute> <hour> <dom> <month> <dow>`), or a comma separated list of schedule aliases `<@hourly> <@daily> <@midnight> <@weekly> <@monthly> <@annually> <@yearly> <@startup>`
 snapshots.schedule.stopped                  | bool      | false             | no            | -                         | Controls whether or not stopped instances are to be snapshoted automatically
 snapshots.pattern                           | string    | snap%d            | no            | -                         | Pongo2 template string which represents the snapshot name (used for scheduled snapshots and unnamed snapshots)
 snapshots.expiry                            | string    | -                 | no            | -                         | Controls when snapshots are to be deleted (expects expression like `1M 2H 3d 4w 5m 6y`)
@@ -239,7 +240,8 @@ ID (database)   | Name                               | Condition     | Descripti
 7               | [infiniband](#type-infiniband)     | container     | Infiniband device
 8               | [proxy](#type-proxy)               | container     | Proxy device
 9               | [unix-hotplug](#type-unix-hotplug) | container     | Unix hotplug device
-10              | [tpm](#tpm)                        | -             | TPM device
+10              | [tpm](#type-tpm)                   | -             | TPM device
+11              | [pci](#type-pci)                   | VM            | PCI device
 
 ### Type: none
 
@@ -339,8 +341,9 @@ parent                  | string  | -                 | yes      | yes     | The
 network                 | string  | -                 | yes      | no      | The LXD network to link device to (instead of parent)
 name                    | string  | kernel assigned   | no       | no      | The name of the interface inside the instance
 mtu                     | integer | parent MTU        | no       | yes     | The MTU of the new interface
-hwaddr                  | string  | randomly assigned | no       | no      | TThe MAC address of the new interface
-vlan                    | integer | -                 | no       | no      | TThe VLAN ID to attach to
+hwaddr                  | string  | randomly assigned | no       | no      | The MAC address of the new interface
+vlan                    | integer | -                 | no       | no      | The VLAN ID to attach to
+gvrp                    | boolean | false             | no       | no      | Register VLAN using GARP VLAN Registration Protocol
 maas.subnet.ipv4        | string  | -                 | no       | yes     | MAAS IPv4 subnet to register the instance in
 maas.subnet.ipv6        | string  | -                 | no       | yes     | MAAS IPv6 subnet to register the instance in
 boot.priority           | integer | -                 | no       | no      | Boot priority for VMs (higher boots first)
@@ -378,17 +381,24 @@ Uses an existing OVN network and creates a virtual device pair to connect the in
 
 Device configuration properties:
 
-Key                     | Type    | Default           | Required | Managed | Description
-:--                     | :--     | :--               | :--      | :--     | :--
-network                 | string  | -                 | yes      | yes     | The LXD network to link device to
-name                    | string  | kernel assigned   | no       | no      | The name of the interface inside the instance
-host\_name              | string  | randomly assigned | no       | no      | The name of the interface inside the host
-hwaddr                  | string  | randomly assigned | no       | no      | The MAC address of the new interface
-ipv4.address            | string  | -                 | no       | no      | An IPv4 address to assign to the instance through DHCP
-ipv6.address            | string  | -                 | no       | no      | An IPv6 address to assign to the instance through DHCP
-ipv4.routes.external    | string  | -                 | no       | no      | Comma delimited list of IPv4 static routes to route to the NIC and publish on uplink network
-ipv6.routes.external    | string  | -                 | no       | no      | Comma delimited list of IPv6 static routes to route to the NIC and publish on uplink network
-boot.priority           | integer | -                 | no       | no      | Boot priority for VMs (higher boots first)
+Key                                  | Type    | Default           | Required | Managed | Description
+:--                                  | :--     | :--               | :--      | :--     | :--
+network                              | string  | -                 | yes      | yes     | The LXD network to link device to
+name                                 | string  | kernel assigned   | no       | no      | The name of the interface inside the instance
+host\_name                           | string  | randomly assigned | no       | no      | The name of the interface inside the host
+hwaddr                               | string  | randomly assigned | no       | no      | The MAC address of the new interface
+ipv4.address                         | string  | -                 | no       | no      | An IPv4 address to assign to the instance through DHCP
+ipv6.address                         | string  | -                 | no       | no      | An IPv6 address to assign to the instance through DHCP
+ipv4.routes                          | string  | -                 | no       | no      | Comma delimited list of IPv4 static routes to route to the NIC
+ipv6.routes                          | string  | -                 | no       | no      | Comma delimited list of IPv6 static routes to route to the NIC
+ipv4.routes.external                 | string  | -                 | no       | no      | Comma delimited list of IPv4 static routes to route to the NIC and publish on uplink network
+ipv6.routes.external                 | string  | -                 | no       | no      | Comma delimited list of IPv6 static routes to route to the NIC and publish on uplink network
+boot.priority                        | integer | -                 | no       | no      | Boot priority for VMs (higher boots first)
+security.acls                        | string  | -                 | no       | no      | Comma separated list of Network ACLs to apply
+security.acls.default.ingress.action | string  | reject            | no       | no      | Action to use for ingress traffic that doesn't match any ACL rule
+security.acls.default.egress.action  | string  | reject            | no       | no      | Action to use for egress traffic that doesn't match any ACL rule
+security.acls.default.ingress.logged | boolean | false             | no       | no      | Whether to log ingress traffic that doesn't match any ACL rule
+security.acls.default.egress.logged  | boolean | false             | no       | no      | Whether to log egress traffic that doesn't match any ACL rule
 
 #### nic: physical
 
@@ -407,6 +417,7 @@ name                    | string  | kernel assigned   | no       | The name of t
 mtu                     | integer | parent MTU        | no       | The MTU of the new interface
 hwaddr                  | string  | randomly assigned | no       | The MAC address of the new interface
 vlan                    | integer | -                 | no       | The VLAN ID to attach to
+gvrp                    | boolean | false             | no       | Register VLAN using GARP VLAN Registration Protocol
 maas.subnet.ipv4        | string  | -                 | no       | MAAS IPv4 subnet to register the instance in
 maas.subnet.ipv6        | string  | -                 | no       | MAAS IPv6 subnet to register the instance in
 boot.priority           | integer | -                 | no       | Boot priority for VMs (higher boots first)
@@ -456,6 +467,7 @@ ipv6.address            | string  | -                  | no       | Comma delimi
 ipv6.gateway            | string  | auto (l3s), - (l2) | no       | In `l3s` mode, whether to add an automatic default IPv6 gateway, can be `auto` or `none`. In `l2` mode specifies the IPv6 address of the gateway.
 ipv6.host\_table        | integer | -                  | no       | The custom policy routing table ID to add IPv6 static routes to (in addition to main routing table).
 vlan                    | integer | -                  | no       | The VLAN ID to attach to
+gvrp                    | boolean | false              | no       | Register VLAN using GARP VLAN Registration Protocol
 
 #### nic: p2p
 
@@ -549,6 +561,7 @@ ipv6.gateway            | string  | auto              | no       | Whether to ad
 ipv6.host\_address      | string  | fe80::1           | no       | The IPv6 address to add to the host-side veth interface.
 ipv6.host\_table        | integer | -                 | no       | The custom policy routing table ID to add IPv6 static routes to (in addition to main routing table).
 vlan                    | integer | -                 | no       | The VLAN ID to attach to
+gvrp                    | boolean | false             | no       | Register VLAN using GARP VLAN Registration Protocol
 
 #### bridged, macvlan or ipvlan for connection to physical network
 
@@ -679,6 +692,7 @@ source              | string    | -         | yes       | Path on the host, eith
 required            | boolean   | true      | no        | Controls whether to fail if the source doesn't exist
 readonly            | boolean   | false     | no        | Controls whether to make the mount read-only
 size                | string    | -         | no        | Disk size in bytes (various suffixes supported, see below). This is only supported for the rootfs (/)
+size.state          | string    | -         | no        | Same as size above but applies to the filesystem volume used for saving runtime state in virtual machines.
 recursive           | boolean   | false     | no        | Whether or not to recursively mount the source path
 pool                | string    | -         | no        | The storage pool the disk device belongs to. This is only applicable for storage volumes managed by LXD
 propagation         | string    | -         | no        | Controls how a bind-mount is shared between the instance and the host. (Can be one of `private`, the default, or `shared`, `slave`, `unbindable`,  `rshared`, `rslave`, `runbindable`,  `rprivate`. Please see the Linux Kernel [shared subtree](https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt) documentation for a full explanation)
@@ -756,11 +770,15 @@ instance.
 The following GPUs can be specified using the `gputype` property:
 
  - [physical](#gpu-physical) Passes through an entire GPU. This is the default if `gputype` is unspecified.
- - [mdev](#gpu-mdev) Creates and passes through a virtual GPU.
+ - [mdev](#gpu-mdev) Creates and passes through a virtual GPU into the instance.
+ - [mig](#gpu-mig) Creates and passes through a MIG (Multi-Instance GPU) device into the instance.
+ - [sriov](#gpu-sriov) Passes a virtual function of an SR-IOV enabled GPU into the instance.
 
 #### gpu: physical
 
 Supported instance types: container, VM
+
+Passes through an entire GPU.
 
 The following properties exist:
 
@@ -778,7 +796,7 @@ mode        | int       | 0660              | no        | Mode of the device in 
 
 Supported instance types: VM
 
-Create a virtual GPU and pass it. A list of available mdev profiles can be found by running `lxc info --resources`.
+Creates and passes through a virtual GPU into the instance. A list of available mdev profiles can be found by running `lxc info --resources`.
 
 The following properties exist:
 
@@ -788,7 +806,39 @@ vendorid    | string    | -                 | no        | The vendor id of the G
 productid   | string    | -                 | no        | The product id of the GPU device
 id          | string    | -                 | no        | The card id of the GPU device
 pci         | string    | -                 | no        | The pci address of the GPU device
-mdev        | string    | -                 | no        | The mdev profile to use (e.g. i915-GVTg_V5_4)
+mdev        | string    | -                 | yes       | The mdev profile to use (e.g. i915-GVTg\_V5\_4)
+
+#### gpu: mig
+
+Supported instance types: container
+
+Creates and passes through a MIG compute instance. This currently requires NVIDIA MIG instances to be pre-created.
+
+The following properties exist:
+
+Key         | Type      | Default           | Required  | Description
+:--         | :--       | :--               | :--       | :--
+vendorid    | string    | -                 | no        | The vendor id of the GPU device
+productid   | string    | -                 | no        | The product id of the GPU device
+id          | string    | -                 | no        | The card id of the GPU device
+pci         | string    | -                 | no        | The pci address of the GPU device
+mig.ci      | int       | -                 | yes       | Existing MIG compute instance ID
+mig.gi      | int       | -                 | yes       | Existing MIG GPU instance ID
+
+#### gpu: sriov
+
+Supported instance types: VM
+
+Passes a virtual function of an SR-IOV enabled GPU into the instance.
+
+The following properties exist:
+
+Key         | Type      | Default           | Required  | Description
+:--         | :--       | :--               | :--       | :--
+vendorid    | string    | -                 | no        | The vendor id of the parent GPU device
+productid   | string    | -                 | no        | The product id of the parent GPU device
+id          | string    | -                 | no        | The card id of the parent GPU device
+pci         | string    | -                 | no        | The pci address of the parent GPU device
 
 ### Type: proxy
 
@@ -889,6 +939,19 @@ The following properties exist:
 Key                 | Type      | Default   | Required  | Description
 :--                 | :--       | :--       | :--       | :--
 path                | string    | -         | yes       | Path inside the instance (only for containers).
+
+### Type: pci
+
+Supported instance types: VM
+
+PCI device entries are used to pass raw PCI devices from the host into a virtual machine.
+
+The following properties exist:
+
+Key                 | Type      | Default   | Required  | Description
+:--                 | :--       | :--       | :--       | :--
+address             | string    | -         | yes       | PCI address of the device.
+
 
 ## Units for storage and network limits
 Any value representing bytes or bits can make use of a number of useful

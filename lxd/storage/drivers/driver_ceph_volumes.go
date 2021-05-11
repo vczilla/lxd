@@ -607,8 +607,11 @@ func (d *ceph) DeleteVolume(vol Volume, op *operations.Operation) error {
 	}
 
 	if vol.volType == VolumeTypeImage {
-		// Try to umount but don't fail.
-		d.UnmountVolume(vol, false, op)
+		// Unmount and unmap.
+		_, err := d.UnmountVolume(vol, false, op)
+		if err != nil {
+			return err
+		}
 
 		hasReadonlySnapshot := d.hasVolume(d.getRBDVolumeName(vol, "readonly", false, false))
 		hasDependendantSnapshots := false
@@ -625,11 +628,6 @@ func (d *ceph) DeleteVolume(vol Volume, op *operations.Operation) error {
 		if hasDependendantSnapshots {
 			// If the image has dependant snapshots, then we just mark it as deleted, but don't
 			// actually remove it yet.
-			err := d.rbdUnmapVolume(vol, true)
-			if err != nil {
-				return err
-			}
-
 			err = d.rbdMarkVolumeDeleted(vol, vol.name)
 			if err != nil {
 				return err
@@ -656,12 +654,6 @@ func (d *ceph) DeleteVolume(vol Volume, op *operations.Operation) error {
 				return err
 			}
 
-			// Unmap image.
-			err = d.rbdUnmapVolume(vol, true)
-			if err != nil {
-				return err
-			}
-
 			// Delete image.
 			err = d.rbdDeleteVolume(vol)
 			if err != nil {
@@ -669,6 +661,7 @@ func (d *ceph) DeleteVolume(vol Volume, op *operations.Operation) error {
 			}
 		}
 	} else {
+		// Unmount and unmap.
 		_, err := d.UnmountVolume(vol, false, op)
 		if err != nil {
 			return err
@@ -1063,7 +1056,10 @@ func (d *ceph) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Opera
 		// For VMs, unmount the filesystem volume.
 		if vol.IsVMBlock() {
 			fsVol := vol.NewVMBlockFilesystemVolume()
-			return d.UnmountVolume(fsVol, false, op)
+			_, err := d.UnmountVolume(fsVol, false, op)
+			if err != nil {
+				return false, err
+			}
 		}
 
 		if !keepBlockDev {
@@ -1090,22 +1086,34 @@ func (d *ceph) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Opera
 }
 
 // RenameVolume renames a volume and its snapshots.
-func (d *ceph) RenameVolume(vol Volume, newName string, op *operations.Operation) error {
+func (d *ceph) RenameVolume(vol Volume, newVolName string, op *operations.Operation) error {
 	return vol.UnmountTask(func(op *operations.Operation) error {
 		revert := revert.New()
 		defer revert.Fail()
 
-		err := d.rbdRenameVolume(vol, newName)
+		err := d.rbdRenameVolume(vol, newVolName)
 		if err != nil {
 			return err
 		}
 
-		newVol := NewVolume(d, d.name, vol.volType, vol.contentType, newName, nil, nil)
+		newVol := NewVolume(d, d.name, vol.volType, vol.contentType, newVolName, nil, nil)
 		revert.Add(func() { d.rbdRenameVolume(newVol, vol.name) })
 
-		err = genericVFSRenameVolume(d, vol, newName, op)
-		if err != nil {
-			return err
+		// Rename volume dir.
+		if vol.contentType == ContentTypeFS {
+			err = genericVFSRenameVolume(d, vol, newVolName, op)
+			if err != nil {
+				return err
+			}
+		}
+
+		// For VMs, also rename the filesystem volume.
+		if vol.IsVMBlock() {
+			fsVol := vol.NewVMBlockFilesystemVolume()
+			err = d.RenameVolume(fsVol, newVolName, op)
+			if err != nil {
+				return err
+			}
 		}
 
 		revert.Success()
@@ -1243,7 +1251,7 @@ func (d *ceph) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *mi
 }
 
 // BackupVolume creates an exported version of a volume.
-func (d *ceph) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWriter, optimized bool, snapshots bool, op *operations.Operation) error {
+func (d *ceph) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWriter, optimized bool, snapshots []string, op *operations.Operation) error {
 	return genericVFSBackupVolume(d, vol, tarWriter, snapshots, op)
 }
 
@@ -1508,7 +1516,7 @@ func (d *ceph) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) (
 	return true, nil
 }
 
-// VolumeSnapshots returns a list of snapshots for the volume.
+// VolumeSnapshots returns a list of snapshots for the volume (in no particular order).
 func (d *ceph) VolumeSnapshots(vol Volume, op *operations.Operation) ([]string, error) {
 	snapshots, err := d.rbdListVolumeSnapshots(vol)
 	if err != nil {

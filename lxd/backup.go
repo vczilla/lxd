@@ -45,7 +45,7 @@ func backupCreate(s *state.State, args db.InstanceBackup, sourceInst instance.In
 	// Get storage pool.
 	pool, err := storagePools.GetPoolByInstance(s, sourceInst)
 	if err != nil {
-		return errors.Wrap(err, "Load instance storage pool")
+		return errors.Wrap(err, "Failed loading instance storage pool")
 	}
 
 	// Ignore requests for optimized backups when pool driver doesn't support it.
@@ -77,10 +77,20 @@ func backupCreate(s *state.State, args db.InstanceBackup, sourceInst instance.In
 	if b.CompressionAlgorithm() != "" {
 		compress = b.CompressionAlgorithm()
 	} else {
-		compress, err = cluster.ConfigGetString(s.Cluster, "backups.compression_algorithm")
+		p, err := s.Cluster.GetProject(sourceInst.Project())
 		if err != nil {
 			return err
 		}
+
+		if p.Config["backups.compression_algorithm"] != "" {
+			compress = p.Config["backups.compression_algorithm"]
+		} else {
+			compress, err = cluster.ConfigGetString(s.Cluster, "backups.compression_algorithm")
+			if err != nil {
+				return err
+			}
+		}
+
 	}
 
 	// Create the target path if needed.

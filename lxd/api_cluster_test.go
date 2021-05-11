@@ -346,7 +346,7 @@ func TestCluster_JoinDifferentServerAddress(t *testing.T) {
 	assert.Equal(t, "Online", nodes[1].Status)
 }
 
-// If an LXD node is already for networking and the user asks to configure a
+// If a LXD node is already for networking and the user asks to configure a
 // the same address as cluster address, the request still succeeds.
 func TestCluster_JoinSameServerAddress(t *testing.T) {
 	t.Skip("issue #6122")
@@ -643,8 +643,8 @@ func (f *clusterFixture) RegisterCertificate(daemon1, daemon2 *Daemon, name, pas
 		Password:    password,
 		Certificate: certificate,
 	}
-	post.Name = fmt.Sprintf("lxd.cluster.%s", name)
-	post.Type = "client"
+	post.Name = name
+	post.Type = api.CertificateTypeClient
 
 	client2 := f.ClientUnix(daemon2)
 	err = client2.CreateCertificate(post)

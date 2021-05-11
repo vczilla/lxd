@@ -28,6 +28,9 @@ navigation:
         - title: Networks
           location: networks.md
 
+        - title: Network ACLs
+          location: network-acls.md
+
         - title: Preseed files
           location: preseed.md
 
@@ -67,6 +70,9 @@ navigation:
 
         - title: Production setup
           location: production-setup.md
+
+        - title: Remotes
+          location: remotes.md
 
     - title: REST API
       children:

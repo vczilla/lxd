@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,6 +31,7 @@ import (
 	storagePools "github.com/lxc/lxd/lxd/storage"
 	storageDrivers "github.com/lxc/lxd/lxd/storage/drivers"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/osarch"
@@ -51,6 +54,9 @@ var apiInternal = []APIEndpoint{
 	internalRAFTSnapshotCmd,
 	internalClusterHandoverCmd,
 	internalClusterRaftNodeCmd,
+	internalImageRefreshCmd,
+	internalImageOptimizeCmd,
+	internalWarningCreateCmd,
 }
 
 var internalShutdownCmd = APIEndpoint{
@@ -106,6 +112,103 @@ var internalRAFTSnapshotCmd = APIEndpoint{
 	Path: "raft-snapshot",
 
 	Get: APIEndpointAction{Handler: internalRAFTSnapshot},
+}
+
+var internalImageRefreshCmd = APIEndpoint{
+	Path: "testing/image-refresh",
+
+	Get: APIEndpointAction{Handler: internalRefreshImage},
+}
+
+var internalImageOptimizeCmd = APIEndpoint{
+	Path: "image-optimize",
+
+	Post: APIEndpointAction{Handler: internalOptimizeImage},
+}
+
+var internalWarningCreateCmd = APIEndpoint{
+	Path: "testing/warnings",
+
+	Post: APIEndpointAction{Handler: internalCreateWarning},
+}
+
+type internalImageOptimizePost struct {
+	Image api.Image `json:"image" yaml:"image"`
+	Pool  string    `json:"pool" yaml:"pool"`
+}
+
+type internalWarningCreatePost struct {
+	Location       string `json:"location" yaml:"location"`
+	Project        string `json:"project" yaml:"project"`
+	EntityTypeCode int    `json:"entity_type_code" yaml:"entity_type_code"`
+	EntityID       int    `json:"entity_id" yaml:"entity_id"`
+	TypeCode       int    `json:"type_code" yaml:"type_code"`
+	Message        string `json:"message" yaml:"message"`
+}
+
+// internalCreateWarning creates a warning, and is used for testing only.
+func internalCreateWarning(d *Daemon, r *http.Request) response.Response {
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	rdr1 := ioutil.NopCloser(bytes.NewBuffer(body))
+	rdr2 := ioutil.NopCloser(bytes.NewBuffer(body))
+
+	reqRaw := shared.Jmap{}
+	err = json.NewDecoder(rdr1).Decode(&reqRaw)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	req := internalWarningCreatePost{}
+	err = json.NewDecoder(rdr2).Decode(&req)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	req.EntityTypeCode, _ = reqRaw.GetInt("entity_type_code")
+	req.EntityID, _ = reqRaw.GetInt("entity_id")
+
+	// Check if the entity exists, and fail if it doesn't.
+	_, ok := cluster.EntityNames[req.EntityTypeCode]
+	if req.EntityTypeCode != -1 && !ok {
+		return response.SmartError(fmt.Errorf("Invalid entity type"))
+	}
+
+	err = d.cluster.UpsertWarning(req.Location, req.Project, req.EntityTypeCode, req.EntityID, db.WarningType(req.TypeCode), req.Message)
+	if err != nil {
+		return response.SmartError(errors.Wrap(err, "Failed to create warning"))
+	}
+
+	return response.EmptySyncResponse
+}
+
+func internalOptimizeImage(d *Daemon, r *http.Request) response.Response {
+	req := &internalImageOptimizePost{}
+
+	// Parse the request.
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	err = imageCreateInPool(d, &req.Image, req.Pool)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.EmptySyncResponse
+}
+
+func internalRefreshImage(d *Daemon, r *http.Request) response.Response {
+	err := autoUpdateImages(d.ctx, d)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.EmptySyncResponse
 }
 
 func internalWaitReady(d *Daemon, r *http.Request) response.Response {
@@ -169,7 +272,7 @@ func internalContainerHookLoadFromReference(s *state.State, r *http.Request) (in
 func internalContainerOnStart(d *Daemon, r *http.Request) response.Response {
 	inst, err := internalContainerHookLoadFromReference(d.State(), r)
 	if err != nil {
-		logger.Error("The start hook failed to load", log.Ctx{"instance": inst.Name(), "err": err})
+		logger.Error("The start hook failed to load", log.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -185,7 +288,7 @@ func internalContainerOnStart(d *Daemon, r *http.Request) response.Response {
 func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 	inst, err := internalContainerHookLoadFromReference(d.State(), r)
 	if err != nil {
-		logger.Error("The stopns hook failed to load", log.Ctx{"instance": inst.Name(), "err": err})
+		logger.Error("The stopns hook failed to load", log.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -212,7 +315,7 @@ func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 func internalContainerOnStop(d *Daemon, r *http.Request) response.Response {
 	inst, err := internalContainerHookLoadFromReference(d.State(), r)
 	if err != nil {
-		logger.Error("The stop hook failed to load", log.Ctx{"instance": inst.Name(), "err": err})
+		logger.Error("The stop hook failed to load", log.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -436,7 +539,7 @@ func internalImportFromRecovery(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	resp := internalImport(d, projectName, req)
+	resp := internalImport(d, projectName, req, true)
 	if resp.String() != "success" {
 		return resp
 	}
@@ -451,12 +554,20 @@ func internalImportFromRecovery(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	// If instance isn't running, then unmount instance volume to reset the mount and any left over ref
-	// counters back its non-running state.
-	if !inst.IsRunning() {
+	if inst.IsRunning() {
+		// If the instance is running, then give the instance a chance to regenerate its config file, as
+		// the internalImport function will have cleared its log directory (which contains the conf file).
+		// This allows functionality that relies on a config file to continue after the recovery.
+		err = inst.SaveConfigFile()
+		if err != nil {
+			return response.SmartError(errors.Wrapf(err, "Failed regenerating instance config file"))
+		}
+	} else {
+		// If instance isn't running, then unmount instance volume to reset the mount and any left over
+		// reference counters back its non-running state.
 		_, err = pool.UnmountInstance(inst, nil)
 		if err != nil {
-			return response.SmartError(err)
+			return response.SmartError(errors.Wrapf(err, "Failed unmounting instance"))
 		}
 	}
 
@@ -464,7 +575,7 @@ func internalImportFromRecovery(d *Daemon, r *http.Request) response.Response {
 	// opportunity to reinitialise the quota based on the new storage volume's DB ID).
 	_, rootConfig, err := shared.GetRootDiskDevice(inst.ExpandedDevices().CloneNative())
 	if err == nil {
-		err = pool.SetInstanceQuota(inst, rootConfig["size"], nil)
+		err = pool.SetInstanceQuota(inst, rootConfig["size"], rootConfig["size.state"], nil)
 		if err != nil {
 			return response.SmartError(errors.Wrapf(err, "Failed reinitializing root disk quota %q", rootConfig["size"]))
 		}
@@ -475,7 +586,7 @@ func internalImportFromRecovery(d *Daemon, r *http.Request) response.Response {
 
 // internalImport creates the instance and storage volume DB records.
 // It expects the instance volume to be mounted so that the backup.yaml file is readable.
-func internalImport(d *Daemon, projectName string, req *internalImportPost) response.Response {
+func internalImport(d *Daemon, projectName string, req *internalImportPost, recovery bool) response.Response {
 	if req.Name == "" {
 		return response.BadRequest(fmt.Errorf("The name of the instance is required"))
 	}
@@ -656,47 +767,41 @@ func internalImport(d *Daemon, projectName string, req *internalImportPost) resp
 		}
 	}
 
-	// Prepare root disk entry if needed.
-	rootDev := map[string]string{}
-	rootDev["type"] = "disk"
-	rootDev["path"] = "/"
-	rootDev["pool"] = instancePoolName
-
-	// Mark the filesystem as going through an import.
-	importingFilePath := storagePools.InstanceImportingFilePath(instanceType, instancePoolName, projectName, req.Name)
-	fd, err := os.Create(importingFilePath)
-	if err != nil {
-		return response.InternalError(err)
+	// If recovering an on-disk instance, mark the filesystem as going through a recovery import, so that we
+	// don't delete the on-disk files if an import error occurs.
+	if recovery {
+		importingFilePath := storagePools.InstanceImportingFilePath(instanceType, instancePoolName, projectName, req.Name)
+		fd, err := os.Create(importingFilePath)
+		if err != nil {
+			return response.InternalError(err)
+		}
+		fd.Close()
+		defer os.Remove(fd.Name())
 	}
-	fd.Close()
-	defer os.Remove(fd.Name())
 
 	baseImage := backupConf.Container.Config["volatile.base_image"]
 
-	// Add root device if missing.
-	root, _, _ := shared.GetRootDiskDevice(backupConf.Container.Devices)
-	if root == "" {
-		if backupConf.Container.Devices == nil {
-			backupConf.Container.Devices = map[string]map[string]string{}
-		}
-
-		rootDevName := "root"
-		for i := 0; i < 100; i++ {
-			if backupConf.Container.Devices[rootDevName] == nil {
-				break
-			}
-			rootDevName = fmt.Sprintf("root%d", i)
-			continue
-		}
-
-		backupConf.Container.Devices[rootDevName] = rootDev
+	profiles, err := d.State().Cluster.GetProfiles(projectName, backupConf.Container.Profiles)
+	if err != nil {
+		return response.SmartError(errors.Wrapf(err, "Failed loading profiles for instance"))
 	}
+
+	// Add root device if needed.
+	if backupConf.Container.Devices == nil {
+		backupConf.Container.Devices = make(map[string]map[string]string, 0)
+	}
+
+	if backupConf.Container.ExpandedDevices == nil {
+		backupConf.Container.ExpandedDevices = make(map[string]map[string]string, 0)
+	}
+
+	internalImportRootDevicePopulate(instancePoolName, backupConf.Container.Devices, backupConf.Container.ExpandedDevices, profiles)
 
 	arch, err := osarch.ArchitectureId(backupConf.Container.Architecture)
 	if err != nil {
 		return response.SmartError(err)
 	}
-	_, err = instanceCreateInternal(d.State(), db.InstanceArgs{
+	_, err = instance.CreateInternal(d.State(), db.InstanceArgs{
 		Project:      projectName,
 		Architecture: arch,
 		BaseImage:    baseImage,
@@ -775,26 +880,23 @@ func internalImport(d *Daemon, projectName string, req *internalImportPost) resp
 			return response.SmartError(err)
 		}
 
-		// Add root device if missing.
-		root, _, _ := shared.GetRootDiskDevice(snap.Devices)
-		if root == "" {
-			if snap.Devices == nil {
-				snap.Devices = map[string]map[string]string{}
-			}
-
-			rootDevName := "root"
-			for i := 0; i < 100; i++ {
-				if snap.Devices[rootDevName] == nil {
-					break
-				}
-				rootDevName = fmt.Sprintf("root%d", i)
-				continue
-			}
-
-			snap.Devices[rootDevName] = rootDev
+		profiles, err := d.State().Cluster.GetProfiles(projectName, snap.Profiles)
+		if err != nil {
+			return response.SmartError(errors.Wrapf(err, "Failed loading profiles for instance snapshot %q", snap.Name))
 		}
 
-		_, err = instanceCreateInternal(d.State(), db.InstanceArgs{
+		// Add root device if needed.
+		if snap.Devices == nil {
+			snap.Devices = make(map[string]map[string]string, 0)
+		}
+
+		if snap.ExpandedDevices == nil {
+			snap.ExpandedDevices = make(map[string]map[string]string, 0)
+		}
+
+		internalImportRootDevicePopulate(instancePoolName, snap.Devices, snap.ExpandedDevices, profiles)
+
+		_, err = instance.CreateInternal(d.State(), db.InstanceArgs{
 			Project:      projectName,
 			Architecture: arch,
 			BaseImage:    baseImage,
@@ -826,6 +928,99 @@ func internalImport(d *Daemon, projectName string, req *internalImportPost) resp
 	}
 
 	return response.EmptySyncResponse
+}
+
+// internalImportRootDevicePopulate considers the local and expanded devices from backup.yaml as well as the
+// expanded devices in the current profiles and if needed will populate localDevices with a new root disk config
+// to attempt to maintain the same effective config as specified in backup.yaml. Where possible no new root disk
+// device will be added, if the root disk config in the current profiles matches the effective backup.yaml config.
+func internalImportRootDevicePopulate(instancePoolName string, localDevices map[string]map[string]string, expandedDevices map[string]map[string]string, profiles []api.Profile) {
+	// First, check if localDevices from backup.yaml has a root disk.
+	rootName, _, _ := shared.GetRootDiskDevice(localDevices)
+	if rootName != "" {
+		localDevices[rootName]["pool"] = instancePoolName
+
+		return // Local root disk device has been set to target pool.
+	}
+
+	// Next check if expandedDevices from backup.yaml has a root disk.
+	expandedRootName, expandedRootConfig, _ := shared.GetRootDiskDevice(expandedDevices)
+
+	// Extract root disk from expanded profile devices.
+	profileExpandedDevices := db.ExpandInstanceDevices(deviceConfig.NewDevices(localDevices), profiles)
+	profileExpandedRootName, profileExpandedRootConfig, _ := shared.GetRootDiskDevice(profileExpandedDevices.CloneNative())
+
+	// Record whether we need to add a new local disk device.
+	addLocalDisk := false
+
+	// We need to add a local root disk if the profiles don't have a root disk.
+	if profileExpandedRootName == "" {
+		addLocalDisk = true
+	} else {
+		// Check profile expanded root disk is in the correct pool
+		if profileExpandedRootConfig["pool"] != instancePoolName {
+			addLocalDisk = true
+		} else {
+			// Check profile expanded root disk config matches the old expanded disk in backup.yaml.
+			// Excluding the "pool" property, which we ignore, as we have already checked the new
+			// profile root disk matches the target pool name.
+			if expandedRootName != "" {
+				for k := range expandedRootConfig {
+					if k == "pool" {
+						continue // Ignore old pool name.
+					}
+
+					if expandedRootConfig[k] != profileExpandedRootConfig[k] {
+						addLocalDisk = true
+						break
+					}
+				}
+
+				for k := range profileExpandedRootConfig {
+					if k == "pool" {
+						continue // Ignore old pool name.
+					}
+
+					if expandedRootConfig[k] != profileExpandedRootConfig[k] {
+						addLocalDisk = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Add local root disk entry if needed.
+	if addLocalDisk {
+		rootDev := map[string]string{
+			"type": "disk",
+			"path": "/",
+			"pool": instancePoolName,
+		}
+
+		// Inherit any extra root disk config from the expanded root disk from backup.yaml.
+		if expandedRootName != "" {
+			for k, v := range expandedRootConfig {
+				if _, found := rootDev[k]; !found {
+					rootDev[k] = v
+				}
+			}
+		}
+
+		// If there is already a device called "root" in the instance's config, but it does not qualify as
+		// a root disk, then try to find a free name for the new root disk device.
+		rootDevName := "root"
+		for i := 0; i < 100; i++ {
+			if localDevices[rootDevName] == nil {
+				break
+			}
+
+			rootDevName = fmt.Sprintf("root%d", i)
+			continue
+		}
+
+		localDevices[rootDevName] = rootDev
+	}
 }
 
 func internalGC(d *Daemon, r *http.Request) response.Response {

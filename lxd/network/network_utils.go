@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +24,7 @@ import (
 	"github.com/lxc/lxd/lxd/dnsmasq/dhcpalloc"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/ip"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/util"
@@ -33,26 +33,6 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
 )
-
-// validInterfaceName validates a real network interface name.
-func validInterfaceName(value string) error {
-	// Validate the length.
-	if len(value) < 2 {
-		return fmt.Errorf("Network interface is too short (minimum 2 characters)")
-	}
-
-	if len(value) > 15 {
-		return fmt.Errorf("Network interface is too long (maximum 15 characters)")
-	}
-
-	// Validate the character set.
-	match, _ := regexp.MatchString("^[-_a-zA-Z0-9.]*$", value)
-	if !match {
-		return fmt.Errorf("Network interface contains invalid characters")
-	}
-
-	return nil
-}
 
 func networkValidPort(value string) error {
 	if value == "" {
@@ -86,38 +66,81 @@ func RandomDevName(prefix string) string {
 	return iface
 }
 
+// usedByInstanceDevices looks for instance NIC devices using the network and runs the supplied usageFunc for each.
+func usedByInstanceDevices(s *state.State, networkProjectName string, networkName string, usageFunc func(inst db.Instance, nicName string, nicConfig map[string]string) error) error {
+	return s.Cluster.InstanceList(nil, func(inst db.Instance, p api.Project, profiles []api.Profile) error {
+		// Get the instance's effective network project name.
+		instNetworkProject := project.NetworkProjectFromRecord(&p)
+
+		// Skip instances who's effective network project doesn't match this Network's project.
+		if instNetworkProject != networkProjectName {
+			return nil
+		}
+
+		// Look for NIC devices using this network.
+		devices := db.ExpandInstanceDevices(deviceConfig.NewDevices(inst.Devices), profiles)
+		for devName, devConfig := range devices {
+			inUse, err := isInUseByDevice(s, networkProjectName, networkName, devConfig)
+			if err != nil {
+				return err
+			}
+
+			if inUse {
+				err = usageFunc(inst, devName, devConfig)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	})
+}
+
 // UsedBy returns list of API resources using network. Accepts firstOnly argument to indicate that only the first
 // resource using network should be returned. This can help to quickly check if the network is in use.
 func UsedBy(s *state.State, networkProjectName string, networkName string, firstOnly bool) ([]string, error) {
+	var err error
 	var usedBy []string
 
-	// Look at instances.
-	insts, err := instance.LoadFromAllProjects(s)
-	if err != nil {
-		return nil, err
-	}
+	// Only networks defined in the default project can be used by other networks. Cheapest to do.
+	if networkProjectName == project.Default {
+		// Get all managed networks across all projects.
+		var projectNetworks map[string]map[int64]api.Network
 
-	for _, inst := range insts {
-		inUse, err := isInUseByInstance(s, inst, networkProjectName, networkName)
+		err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+			projectNetworks, err = tx.GetCreatedNetworks()
+			return err
+		})
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrapf(err, "Failed to load all networks")
 		}
 
-		if inUse {
-			uri := fmt.Sprintf("/%s/instances/%s", version.APIVersion, inst.Name())
-			if inst.Project() != project.Default {
-				uri += fmt.Sprintf("?project=%s", inst.Project())
-			}
+		for projectName, networks := range projectNetworks {
+			for _, network := range networks {
+				if networkName == network.Name && networkProjectName == projectName {
+					continue // Skip ourselves.
+				}
 
-			usedBy = append(usedBy, uri)
+				// The network's config references the network we are searching for. Either by
+				// directly referencing our network or by referencing our interface as its parent.
+				if network.Config["network"] == networkName || network.Config["parent"] == networkName {
+					uri := fmt.Sprintf("/%s/networks/%s", version.APIVersion, network.Name)
+					if projectName != project.Default {
+						uri += fmt.Sprintf("?project=%s", projectName)
+					}
 
-			if firstOnly {
-				return usedBy, nil
+					usedBy = append(usedBy, uri)
+
+					if firstOnly {
+						return usedBy, nil
+					}
+				}
 			}
 		}
 	}
 
-	// Look for profiles.
+	// Look for profiles. Next cheapest to do.
 	var profiles []db.Profile
 	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
 		profiles, err = tx.GetProfiles(db.ProfileFilter{})
@@ -151,58 +174,51 @@ func UsedBy(s *state.State, networkProjectName string, networkName string, first
 		}
 	}
 
-	// Only networks defined in the default project can be used by other networks.
-	if networkProjectName == project.Default {
-		// Get all managed networks across all projects.
-		var projectNetworks map[string]map[int64]api.Network
+	// Look at instances. Most expensive to do.
+	err = s.Cluster.InstanceList(nil, func(inst db.Instance, p api.Project, profiles []api.Profile) error {
+		// Get the instance's effective network project name.
+		instNetworkProject := project.NetworkProjectFromRecord(&p)
 
-		err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-			projectNetworks, err = tx.GetCreatedNetworks()
-			return err
-		})
-		if err != nil {
-			return nil, errors.Wrapf(err, "Failed to load all networks")
+		// Skip instances who's effective network project doesn't match this Network's project.
+		if instNetworkProject != networkProjectName {
+			return nil
 		}
 
-		for projectName, networks := range projectNetworks {
-			for _, network := range networks {
-				if networkName == network.Name && networkProjectName == projectName {
-					continue // Skip ourselves.
+		// Look for NIC devices using this network.
+		devices := db.ExpandInstanceDevices(deviceConfig.NewDevices(inst.Devices), profiles)
+		for _, devConfig := range devices {
+			inUse, err := isInUseByDevice(s, networkProjectName, networkName, devConfig)
+			if err != nil {
+				return err
+			}
+
+			if inUse {
+				uri := fmt.Sprintf("/%s/instances/%s", version.APIVersion, inst.Name)
+				if inst.Project != project.Default {
+					uri += fmt.Sprintf("?project=%s", inst.Project)
 				}
 
-				// The network's config references the network we are searching for. Either by
-				// directly referencing our network or by referencing our interface as its parent.
-				if network.Config["network"] == networkName || network.Config["parent"] == networkName {
-					uri := fmt.Sprintf("/%s/networks/%s", version.APIVersion, network.Name)
-					if projectName != project.Default {
-						uri += fmt.Sprintf("?project=%s", projectName)
-					}
+				usedBy = append(usedBy, uri)
 
-					usedBy = append(usedBy, uri)
+				if firstOnly {
+					return db.ErrInstanceListStop
 				}
+
+				return nil // No need to consider other devices on this instance.
 			}
 		}
+
+		return nil
+	})
+	if err != nil {
+		if err == db.ErrInstanceListStop {
+			return usedBy, nil
+		}
+
+		return nil, err
 	}
 
 	return usedBy, nil
-}
-
-// isInUseByInstance indicates if network is referenced by an instance's NIC devices.
-// Checks if the device's parent or network properties match the network name.
-func isInUseByInstance(s *state.State, inst instance.Instance, networkProjectName string, networkName string) (bool, error) {
-	// Get the translated network project name from the instance's project.
-	instNetworkProjectName, _, err := project.NetworkProject(s.Cluster, inst.Project())
-	if err != nil {
-		return false, err
-	}
-
-	// Skip instances who's translated network project doesn't match the requested network's project.
-	// Because its devices can't be using this network.
-	if networkProjectName != instNetworkProjectName {
-		return false, nil
-	}
-
-	return isInUseByDevices(s, networkProjectName, networkName, inst.ExpandedDevices())
 }
 
 // isInUseByProfile indicates if network is referenced by a profile's NIC devices.
@@ -220,36 +236,45 @@ func isInUseByProfile(s *state.State, profile db.Profile, networkProjectName str
 		return false, nil
 	}
 
-	return isInUseByDevices(s, networkProjectName, networkName, deviceConfig.NewDevices(profile.Devices))
-}
-
-// isInUseByDevices inspects a device's config to find references for a network being used.
-func isInUseByDevices(s *state.State, networkProjectName string, networkName string, devices deviceConfig.Devices) (bool, error) {
-	for _, d := range devices {
-		if d["type"] != "nic" {
-			continue
-		}
-
-		nicType, err := nictype.NICType(s, networkProjectName, d)
+	for _, d := range deviceConfig.NewDevices(profile.Devices) {
+		inUse, err := isInUseByDevice(s, networkProjectName, networkName, d)
 		if err != nil {
 			return false, err
 		}
 
-		if !shared.StringInSlice(nicType, []string{"bridged", "macvlan", "ipvlan", "physical", "sriov", "ovn"}) {
-			continue
-		}
-
-		if d["network"] != "" && d["network"] == networkName {
+		if inUse {
 			return true, nil
 		}
+	}
 
-		if d["parent"] == "" {
-			continue
-		}
+	return false, nil
+}
 
-		if GetHostDevice(d["parent"], d["vlan"]) == networkName {
-			return true, nil
-		}
+// isInUseByDevices inspects a device's config to find references for a network being used.
+func isInUseByDevice(s *state.State, networkProjectName string, networkName string, d deviceConfig.Device) (bool, error) {
+	if d["type"] != "nic" {
+		return false, nil
+	}
+
+	nicType, err := nictype.NICType(s, networkProjectName, d)
+	if err != nil {
+		return false, err
+	}
+
+	if !shared.StringInSlice(nicType, []string{"bridged", "macvlan", "ipvlan", "physical", "sriov", "ovn"}) {
+		return false, nil
+	}
+
+	if d["network"] != "" && d["network"] == networkName {
+		return true, nil
+	}
+
+	if d["parent"] == "" {
+		return false, nil
+	}
+
+	if GetHostDevice(d["parent"], d["vlan"]) == networkName {
+		return true, nil
 	}
 
 	return false, nil
@@ -769,32 +794,78 @@ func GetHostDevice(parent string, vlan string) string {
 	return defaultVlan
 }
 
+// NeighbourIPState can be { PERMANENT | NOARP | REACHABLE | STALE | NONE | INCOMPLETE | DELAY | PROBE | FAILED }.
+type NeighbourIPState string
+
+// NeighbourIPStatePermanent the neighbour entry is valid forever and can be only be removed administratively.
+const NeighbourIPStatePermanent = "PERMANENT"
+
+// NeighbourIPStateNoARP the neighbour entry is valid. No attempts to validate this entry will be made but it can
+// be removed when its lifetime expires.
+const NeighbourIPStateNoARP = "NOARP"
+
+// NeighbourIPStateReachable the neighbour entry is valid until the reachability timeout expires.
+const NeighbourIPStateReachable = "REACHABLE"
+
+// NeighbourIPStateStale the neighbour entry is valid but suspicious.
+const NeighbourIPStateStale = "STALE"
+
+// NeighbourIPStateNone this is a pseudo state used when initially creating a neighbour entry or after trying to
+// remove it before it becomes free to do so.
+const NeighbourIPStateNone = "NONE"
+
+// NeighbourIPStateIncomplete the neighbour entry has not (yet) been validated/resolved.
+const NeighbourIPStateIncomplete = "INCOMPLETE"
+
+// NeighbourIPStateDelay neighbor entry validation is currently delayed.
+const NeighbourIPStateDelay = "DELAY"
+
+// NeighbourIPStateProbe neighbor is being probed.
+const NeighbourIPStateProbe = "PROBE"
+
+// NeighbourIPStateFailed max number of probes exceeded without success, neighbor validation has ultimately failed.
+const NeighbourIPStateFailed = "FAILED"
+
+// NeighbourIP represents an IP neighbour entry.
+type NeighbourIP struct {
+	IP    net.IP
+	State NeighbourIPState
+}
+
 // GetNeighbourIPs returns the IP addresses in the neighbour cache for a particular interface and MAC.
-func GetNeighbourIPs(interfaceName string, hwaddr string) ([]net.IP, error) {
-	addresses := []net.IP{}
-
-	// Look for neighbour entries for IPv.
-	out, err := shared.RunCommand("ip", "neigh", "show", "dev", interfaceName)
-	if err == nil {
-		for _, line := range strings.Split(out, "\n") {
-			// Split fields and early validation.
-			fields := strings.Fields(line)
-			if len(fields) != 4 {
-				continue
-			}
-
-			if fields[2] != hwaddr {
-				continue
-			}
-
-			ip := net.ParseIP(fields[0])
-			if ip != nil {
-				addresses = append(addresses, ip)
-			}
-		}
+func GetNeighbourIPs(interfaceName string, hwaddr string) ([]NeighbourIP, error) {
+	neigh := &ip.Neigh{DevName: interfaceName}
+	out, err := neigh.Show()
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to get IP neighbours for interface %q", interfaceName)
 	}
 
-	return addresses, nil
+	neighbours := []NeighbourIP{}
+
+	for _, line := range strings.Split(out, "\n") {
+		// Split fields and early validation.
+		fields := strings.Fields(line)
+		if len(fields) != 4 {
+			continue
+		}
+
+		// Check neighbour matches desired MAC address.
+		if fields[2] != hwaddr {
+			continue
+		}
+
+		ip := net.ParseIP(fields[0])
+		if ip == nil {
+			continue
+		}
+
+		neighbours = append(neighbours, NeighbourIP{
+			IP:    ip,
+			State: NeighbourIPState(fields[3]),
+		})
+	}
+
+	return neighbours, nil
 }
 
 // GetLeaseAddresses returns the lease addresses for a network and hwaddr.
@@ -1023,7 +1094,7 @@ func parseIPRanges(ipRangesList string, allowedNets ...*net.IPNet) ([]*shared.IP
 
 // VLANInterfaceCreate creates a VLAN interface on parent interface (if needed).
 // Returns boolean indicating if VLAN interface was created.
-func VLANInterfaceCreate(parent string, vlanDevice string, vlanID string) (bool, error) {
+func VLANInterfaceCreate(parent string, vlanDevice string, vlanID string, gvrp bool) (bool, error) {
 	if vlanID == "" {
 		return false, nil
 	}
@@ -1033,15 +1104,29 @@ func VLANInterfaceCreate(parent string, vlanDevice string, vlanID string) (bool,
 	}
 
 	// Bring the parent interface up so we can add a vlan to it.
-	_, err := shared.RunCommand("ip", "link", "set", "dev", parent, "up")
+	link := &ip.Link{Name: parent}
+	err := link.SetUp()
 	if err != nil {
 		return false, errors.Wrapf(err, "Failed to bring up parent %q", parent)
 	}
 
-	// Add VLAN interface on top of parent.
-	_, err = shared.RunCommand("ip", "link", "add", "link", parent, "name", vlanDevice, "up", "type", "vlan", "id", vlanID)
+	vlan := &ip.Vlan{
+		Link: ip.Link{
+			Name:   vlanDevice,
+			Parent: parent,
+		},
+		VlanID: vlanID,
+		Gvrp:   gvrp,
+	}
+
+	err = vlan.Add()
 	if err != nil {
 		return false, errors.Wrapf(err, "Failed to create VLAN interface %q on %q", vlanDevice, parent)
+	}
+
+	err = vlan.SetUp()
+	if err != nil {
+		return false, errors.Wrapf(err, "Failed to bring up interface %q", vlanDevice)
 	}
 
 	// Attempt to disable IPv6 router advertisement acceptance.
@@ -1053,13 +1138,14 @@ func VLANInterfaceCreate(parent string, vlanDevice string, vlanID string) (bool,
 
 // InterfaceRemove removes a network interface by name.
 func InterfaceRemove(nic string) error {
-	_, err := shared.RunCommand("ip", "link", "del", "dev", nic)
+	link := &ip.Link{Name: nic}
+	err := link.Delete()
 	return err
 }
 
 // InterfaceExists returns true if network interface exists.
 func InterfaceExists(nic string) bool {
-	if shared.PathExists(fmt.Sprintf("/sys/class/net/%s", nic)) {
+	if nic != "" && shared.PathExists(fmt.Sprintf("/sys/class/net/%s", nic)) {
 		return true
 	}
 
@@ -1069,7 +1155,8 @@ func InterfaceExists(nic string) bool {
 // InterfaceSetMTU sets the MTU of a network interface.
 func InterfaceSetMTU(nic string, mtu string) error {
 	if mtu != "" {
-		_, err := shared.RunCommand("ip", "link", "set", "dev", nic, "mtu", mtu)
+		link := &ip.Link{Name: nic}
+		err := link.SetMtu(mtu)
 		if err != nil {
 			return errors.Wrapf(err, "Failed setting MTU %q on %q", mtu, nic)
 		}
@@ -1136,11 +1223,9 @@ func SubnetIterate(subnet *net.IPNet, ipFunc func(ip net.IP) error) error {
 	return nil
 }
 
-// SubnetParseAppend parses one or more string CIDR subnets. Trims any white space before parsing and appends to
-// the supplied slice. Returns subnets slice.
+// SubnetParseAppend parses one or more string CIDR subnets. Appends to the supplied slice. Returns subnets slice.
 func SubnetParseAppend(subnets []*net.IPNet, parseSubnet ...string) ([]*net.IPNet, error) {
 	for _, subnetStr := range parseSubnet {
-		subnetStr = strings.TrimSpace(subnetStr)
 		_, subnet, err := net.ParseCIDR(subnetStr)
 		if err != nil {
 			return nil, errors.Wrapf(err, "Invalid subnet %q", subnetStr)
@@ -1150,4 +1235,30 @@ func SubnetParseAppend(subnets []*net.IPNet, parseSubnet ...string) ([]*net.IPNe
 	}
 
 	return subnets, nil
+}
+
+// InterfaceBindWait waits for network interface to appear after being bound to a driver.
+func InterfaceBindWait(ifName string) error {
+	for i := 0; i < 10; i++ {
+		if InterfaceExists(ifName) {
+			return nil
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return fmt.Errorf("Bind of interface %q took too long", ifName)
+}
+
+// IPRangesOverlap checks whether two ip ranges have ip addresses in common
+func IPRangesOverlap(r1, r2 *shared.IPRange) bool {
+	if r1.End == nil {
+		return r2.ContainsIP(r1.Start)
+	}
+
+	if r2.End == nil {
+		return r1.ContainsIP(r2.Start)
+	}
+
+	return r1.ContainsIP(r2.Start) || r1.ContainsIP(r2.End)
 }

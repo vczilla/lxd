@@ -52,6 +52,92 @@ var projectCmd = APIEndpoint{
 	Put:    APIEndpointAction{Handler: projectPut, AccessHandler: allowAuthenticated},
 }
 
+var projectStateCmd = APIEndpoint{
+	Path: "projects/{name}/state",
+
+	Get: APIEndpointAction{Handler: projectStateGet, AccessHandler: allowAuthenticated},
+}
+
+// swagger:operation GET /1.0/projects projects projects_get
+//
+// Get the projects
+//
+// Returns a list of projects (URLs).
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: API endpoints
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           type: array
+//           description: List of endpoints
+//           items:
+//             type: string
+//           example: |-
+//             [
+//               "/1.0/projects/default",
+//               "/1.0/projects/foo"
+//             ]
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+
+// swagger:operation GET /1.0/projects?recursion=1 projects projects_get_recursion1
+//
+// Get the projects
+//
+// Returns a list of projects (structs).
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: API endpoints
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           type: array
+//           description: List of projects
+//           items:
+//             $ref: "#/definitions/Project"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func projectsGet(d *Daemon, r *http.Request) response.Response {
 	recursion := util.IsRecursionRequest(r)
 
@@ -103,6 +189,33 @@ func projectsGet(d *Daemon, r *http.Request) response.Response {
 	return response.SyncResponse(true, result)
 }
 
+// swagger:operation POST /1.0/projects projects projects_post
+//
+// Add a project
+//
+// Creates a new project.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: project
+//     description: Project
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ProjectsPost"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func projectsPost(d *Daemon, r *http.Request) response.Response {
 	// Parse the request
 	project := api.ProjectsPost{}
@@ -187,6 +300,40 @@ func projectCreateDefaultProfile(tx *db.ClusterTx, project string) error {
 	return nil
 }
 
+// swagger:operation GET /1.0/projects/{name} projects project_get
+//
+// Get the project
+//
+// Gets a specific project.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: Project
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/Project"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func projectGet(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
 
@@ -209,6 +356,35 @@ func projectGet(d *Daemon, r *http.Request) response.Response {
 	return response.SyncResponseETag(true, project, etag)
 }
 
+// swagger:operation PUT /1.0/projects/{name} projects project_put
+//
+// Update the project
+//
+// Updates the entire project configuration.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: project
+//     description: Project configuration
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ProjectPut"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "412":
+//     $ref: "#/responses/PreconditionFailed"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func projectPut(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
 
@@ -244,6 +420,35 @@ func projectPut(d *Daemon, r *http.Request) response.Response {
 	return projectChange(d, project, req)
 }
 
+// swagger:operation PATCH /1.0/projects/{name} projects project_patch
+//
+// Partially update the project
+//
+// Updates a subset of the project configuration.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: project
+//     description: Project configuration
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ProjectPut"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "412":
+//     $ref: "#/responses/PreconditionFailed"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func projectPatch(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
 
@@ -385,6 +590,33 @@ func projectChange(d *Daemon, project *api.Project, req api.ProjectPut) response
 	return response.EmptySyncResponse
 }
 
+// swagger:operation POST /1.0/projects/{name} projects project_post
+//
+// Rename the project
+//
+// Renames an existing project.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: project
+//     description: Project rename request
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ProjectPost"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func projectPost(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
 
@@ -457,6 +689,24 @@ func projectPost(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
+// swagger:operation DELETE /1.0/projects/{name} projects project_delete
+//
+// Delete the project
+//
+// Removes the project.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func projectDelete(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
 
@@ -497,6 +747,68 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 	return response.EmptySyncResponse
 }
 
+// swagger:operation GET /1.0/projects/{name}/state projects project_state_get
+//
+// Get the project state
+//
+// Gets a specific project resource consumption information.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: Project state
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/ProjectState"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func projectStateGet(d *Daemon, r *http.Request) response.Response {
+	name := mux.Vars(r)["name"]
+
+	// Check user permissions.
+	if !rbac.UserHasPermission(r, name, "view") {
+		return response.Forbidden(nil)
+	}
+
+	// Setup the state struct.
+	state := api.ProjectState{}
+
+	// Get current limits and usage.
+	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		result, err := projecthelpers.GetCurrentAllocations(tx, name)
+		if err != nil {
+			return err
+		}
+		state.Resources = result
+
+		return nil
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	return response.SyncResponse(true, &state)
+}
+
 // Check if a project is empty.
 func projectIsEmpty(project *api.Project) bool {
 	if len(project.UsedBy) > 0 {
@@ -520,10 +832,16 @@ func isEitherAllowOrBlockOrManaged(value string) error {
 func projectValidateConfig(s *state.State, config map[string]string) error {
 	// Validate the project configuration.
 	projectConfigKeys := map[string]func(value string) error{
+		"backups.compression_algorithm":  validate.IsCompressionAlgorithm,
 		"features.profiles":              validate.Optional(validate.IsBool),
 		"features.images":                validate.Optional(validate.IsBool),
 		"features.storage.volumes":       validate.Optional(validate.IsBool),
 		"features.networks":              validate.Optional(validate.IsBool),
+		"images.auto_update_cached":      validate.Optional(validate.IsBool),
+		"images.auto_update_interval":    validate.Optional(validate.IsInt64),
+		"images.compression_algorithm":   validate.IsCompressionAlgorithm,
+		"images.default_architecture":    validate.Optional(validate.IsArchitecture),
+		"images.remote_cache_expiry":     validate.Optional(validate.IsInt64),
 		"limits.instances":               validate.Optional(validate.IsUint32),
 		"limits.containers":              validate.Optional(validate.IsUint32),
 		"limits.virtual-machines":        validate.Optional(validate.IsUint32),
@@ -533,6 +851,8 @@ func projectValidateConfig(s *state.State, config map[string]string) error {
 		"limits.disk":                    validate.Optional(validate.IsSize),
 		"limits.networks":                validate.Optional(validate.IsUint32),
 		"restricted":                     validate.Optional(validate.IsBool),
+		"restricted.backups":             isEitherAllowOrBlock,
+		"restricted.cluster.target":      isEitherAllowOrBlock,
 		"restricted.containers.nesting":  isEitherAllowOrBlock,
 		"restricted.containers.lowlevel": isEitherAllowOrBlock,
 		"restricted.containers.privilege": func(value string) error {
@@ -551,6 +871,7 @@ func projectValidateConfig(s *state.State, config map[string]string) error {
 		"restricted.networks.subnets": validate.Optional(func(value string) error {
 			return projectValidateRestrictedSubnets(s, value)
 		}),
+		"restricted.snapshots": isEitherAllowOrBlock,
 	}
 
 	for k, v := range config {
@@ -607,8 +928,8 @@ func projectValidateName(name string) error {
 // projectValidateRestrictedSubnets checks that the project's restricted.networks.subnets are properly formatted
 // and are within the specified uplink network's routes.
 func projectValidateRestrictedSubnets(s *state.State, value string) error {
-	for _, subnetRaw := range strings.Split(value, ",") {
-		subnetParts := strings.SplitN(strings.TrimSpace(subnetRaw), ":", 2)
+	for _, subnetRaw := range util.SplitNTrimSpace(value, ",", -1, false) {
+		subnetParts := strings.SplitN(subnetRaw, ":", 2)
 		if len(subnetParts) != 2 {
 			return fmt.Errorf(`Subnet %q invalid, must be in the format of "<uplink network>:<subnet>"`, subnetRaw)
 		}
@@ -638,7 +959,7 @@ func projectValidateRestrictedSubnets(s *state.State, value string) error {
 				continue
 			}
 
-			uplinkRoutes, err = network.SubnetParseAppend(uplinkRoutes, strings.Split(uplink.Config[k], ",")...)
+			uplinkRoutes, err = network.SubnetParseAppend(uplinkRoutes, util.SplitNTrimSpace(uplink.Config[k], ",", -1, false)...)
 			if err != nil {
 				return err
 			}

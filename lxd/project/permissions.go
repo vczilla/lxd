@@ -44,20 +44,12 @@ func AllowInstanceCreation(tx *db.ClusterTx, projectName string, req api.Instanc
 		req.Profiles = []string{"default"}
 	}
 
-	instanceTypeCount := 0
-	for _, inst := range info.Instances {
-		if inst.Type == instanceType {
-			instanceTypeCount++
-		}
-	}
-
-	err = checkInstanceCountLimit(info.Project, instanceTypeCount, instanceType)
+	err = checkInstanceCountLimit(info, instanceType)
 	if err != nil {
 		return err
 	}
 
-	totalInstanceCount := len(info.Instances)
-	err = checkTotalInstanceCountLimit(info.Project, totalInstanceCount)
+	err = checkTotalInstanceCountLimit(info)
 	if err != nil {
 		return err
 	}
@@ -71,8 +63,15 @@ func AllowInstanceCreation(tx *db.ClusterTx, projectName string, req api.Instanc
 	})
 
 	// Special case restriction checks on volatile.* keys.
+	strip := false
+
+	if shared.StringInSlice(req.Source.Type, []string{"copy", "migration"}) {
+		// Allow stripping volatile keys if dealing with a copy or migration.
+		strip = true
+	}
+
 	err = checkRestrictionsOnVolatileConfig(
-		info.Project, instanceType, req.Name, req.Config, map[string]string{})
+		info.Project, instanceType, req.Name, req.Config, map[string]string{}, strip)
 	if err != nil {
 		return err
 	}
@@ -85,28 +84,49 @@ func AllowInstanceCreation(tx *db.ClusterTx, projectName string, req api.Instanc
 	return nil
 }
 
-// Check that we have not exceeded the maximum total allotted number of instances
-// for both containers and vms
-func checkTotalInstanceCountLimit(project *api.Project, totalInstanceCount int) error {
-	overallValue, ok := project.Config["limits.instances"]
-	if ok {
-		limit, err := strconv.Atoi(overallValue)
-		if err != nil {
-			return err
-		}
+// Check that we have not exceeded the maximum total allotted number of instances for both containers and vms.
+func checkTotalInstanceCountLimit(info *projectInfo) error {
+	count, limit, err := getTotalInstanceCountLimit(info)
+	if err != nil {
+		return err
+	}
 
-		if totalInstanceCount >= limit {
-			return fmt.Errorf(
-				"Reached maximum number of instances in project %q", project.Name)
-		}
+	if limit >= 0 && count >= limit {
+		return fmt.Errorf("Reached maximum number of instances in project %q", info.Project.Name)
 	}
 
 	return nil
 }
 
-// Check that we have not reached the maximum number of instances for
-// this type.
-func checkInstanceCountLimit(project *api.Project, instanceCount int, instanceType instancetype.Type) error {
+func getTotalInstanceCountLimit(info *projectInfo) (int, int, error) {
+	overallValue, ok := info.Project.Config["limits.instances"]
+	if ok {
+		limit, err := strconv.Atoi(overallValue)
+		if err != nil {
+			return -1, -1, err
+		}
+
+		return len(info.Instances), limit, nil
+	}
+
+	return len(info.Instances), -1, nil
+}
+
+// Check that we have not reached the maximum number of instances for this type.
+func checkInstanceCountLimit(info *projectInfo, instanceType instancetype.Type) error {
+	count, limit, err := getInstanceCountLimit(info, instanceType)
+	if err != nil {
+		return err
+	}
+
+	if limit >= 0 && count >= limit {
+		return fmt.Errorf("Reached maximum number of instances of type %q in project %q", instanceType, info.Project.Name)
+	}
+
+	return nil
+}
+
+func getInstanceCountLimit(info *projectInfo, instanceType instancetype.Type) (int, int, error) {
 	var key string
 	switch instanceType {
 	case instancetype.Container:
@@ -114,28 +134,31 @@ func checkInstanceCountLimit(project *api.Project, instanceCount int, instanceTy
 	case instancetype.VM:
 		key = "limits.virtual-machines"
 	default:
-		return fmt.Errorf("Unexpected instance type %q", instanceType)
+		return -1, -1, fmt.Errorf("Unexpected instance type %q", instanceType)
 	}
 
-	value, ok := project.Config[key]
+	instanceCount := 0
+	for _, inst := range info.Instances {
+		if inst.Type == instanceType {
+			instanceCount++
+		}
+	}
+
+	value, ok := info.Project.Config[key]
 	if ok {
 		limit, err := strconv.Atoi(value)
 		if err != nil || limit < 0 {
-			return fmt.Errorf("Unexpected %q value: %q", key, value)
+			return -1, -1, fmt.Errorf("Unexpected %q value: %q", key, value)
 		}
 
-		if instanceCount >= limit {
-			return fmt.Errorf(
-				"Reached maximum number of instances of type %q in project %q",
-				instanceType, project.Name)
-		}
+		return instanceCount, limit, nil
 	}
 
-	return nil
+	return instanceCount, -1, nil
 }
 
 // Check restrictions on setting volatile.* keys.
-func checkRestrictionsOnVolatileConfig(project *api.Project, instanceType instancetype.Type, instanceName string, config, currentConfig map[string]string) error {
+func checkRestrictionsOnVolatileConfig(project *api.Project, instanceType instancetype.Type, instanceName string, config, currentConfig map[string]string, strip bool) error {
 	if project.Config["restrict"] == "false" {
 		return nil
 	}
@@ -152,8 +175,37 @@ func checkRestrictionsOnVolatileConfig(project *api.Project, instanceType instan
 		return nil
 	}
 
+	// Checker for safe volatile keys.
+	isSafeKey := func(key string) bool {
+		if shared.StringInSlice(key, []string{"volatile.apply_template", "volatile.base_image", "volatile.last_state.power"}) {
+			return true
+		}
+
+		if strings.HasPrefix(key, shared.ConfigVolatilePrefix) {
+			if strings.HasSuffix(key, ".apply_quota") {
+				return true
+			}
+
+			if strings.HasSuffix(key, ".hwaddr") {
+				return true
+			}
+		}
+
+		return false
+	}
+
 	for key, value := range config {
 		if !strings.HasPrefix(key, shared.ConfigVolatilePrefix) {
+			continue
+		}
+
+		// Allow given safe volatile keys to be set
+		if isSafeKey(key) {
+			continue
+		}
+
+		if strip {
+			delete(config, key)
 			continue
 		}
 
@@ -237,7 +289,7 @@ func GetImageSpaceBudget(tx *db.ClusterTx, projectName string) (int64, error) {
 
 	info.Instances = expandInstancesConfigAndDevices(info.Instances, info.Profiles)
 
-	totals, err := getTotalsAcrossProjectEntities(info, []string{"limits.disk"})
+	totals, err := getTotalsAcrossProjectEntities(info, []string{"limits.disk"}, false)
 	if err != nil {
 		return -1, err
 	}
@@ -289,12 +341,45 @@ func checkRestrictionsAndAggregateLimits(tx *db.ClusterTx, info *projectInfo) er
 	return nil
 }
 
+func getAggregateLimits(info *projectInfo, aggregateKeys []string) (map[string]api.ProjectStateResource, error) {
+	result := map[string]api.ProjectStateResource{}
+
+	if len(aggregateKeys) == 0 {
+		return result, nil
+	}
+
+	totals, err := getTotalsAcrossProjectEntities(info, aggregateKeys, true)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, key := range aggregateKeys {
+		max := int64(-1)
+		limit := info.Project.Config[key]
+		if limit != "" {
+			parser := aggregateLimitConfigValueParsers[key]
+			max, err = parser(info.Project.Config[key])
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		resource := api.ProjectStateResource{
+			Usage: totals[key],
+			Limit: max,
+		}
+		result[key] = resource
+	}
+
+	return result, nil
+}
+
 func checkAggregateLimits(info *projectInfo, aggregateKeys []string) error {
 	if len(aggregateKeys) == 0 {
 		return nil
 	}
 
-	totals, err := getTotalsAcrossProjectEntities(info, aggregateKeys)
+	totals, err := getTotalsAcrossProjectEntities(info, aggregateKeys, false)
 	if err != nil {
 		return err
 	}
@@ -545,6 +630,8 @@ var allAggregateLimits = []string{
 
 // AllRestrictions lists all available 'restrict.*' config keys.
 var AllRestrictions = []string{
+	"restricted.backups",
+	"restricted.cluster.target",
 	"restricted.containers.nesting",
 	"restricted.containers.lowlevel",
 	"restricted.containers.privilege",
@@ -557,9 +644,12 @@ var AllRestrictions = []string{
 	"restricted.devices.usb",
 	"restricted.devices.nic",
 	"restricted.devices.disk",
+	"restricted.snapshots",
 }
 
 var defaultRestrictionsValues = map[string]string{
+	"restricted.backups":                   "block",
+	"restricted.cluster.target":            "block",
 	"restricted.containers.nesting":        "block",
 	"restricted.containers.lowlevel":       "block",
 	"restricted.containers.privilege":      "unprivileged",
@@ -572,11 +662,12 @@ var defaultRestrictionsValues = map[string]string{
 	"restricted.devices.usb":               "block",
 	"restricted.devices.nic":               "managed",
 	"restricted.devices.disk":              "managed",
+	"restricted.snapshots":                 "block",
 }
 
 // Return true if a low-level container option is forbidden.
 func isContainerLowLevelOptionForbidden(key string) bool {
-	if strings.HasPrefix(key, "security.syscalls") {
+	if strings.HasPrefix(key, "security.syscalls.intercept") {
 		return true
 	}
 
@@ -636,7 +727,7 @@ func AllowInstanceUpdate(tx *db.ClusterTx, projectName, instanceName string, req
 	// Special case restriction checks on volatile.* keys, since we want to
 	// detect if they were changed or added.
 	err = checkRestrictionsOnVolatileConfig(
-		info.Project, updatedInstance.Type, updatedInstance.Name, req.Config, currentConfig)
+		info.Project, updatedInstance.Type, updatedInstance.Name, req.Config, currentConfig, false)
 	if err != nil {
 		return err
 	}
@@ -766,7 +857,7 @@ func AllowProjectUpdate(tx *db.ClusterTx, projectName string, config map[string]
 	}
 
 	if len(aggregateKeys) > 0 {
-		totals, err := getTotalsAcrossProjectEntities(info, aggregateKeys)
+		totals, err := getTotalsAcrossProjectEntities(info, aggregateKeys, false)
 		if err != nil {
 			return err
 		}
@@ -972,7 +1063,7 @@ func expandInstancesConfigAndDevices(instances []db.Instance, profiles []db.Prof
 
 // Sum of the effective values for the given limits across all project
 // enties (instances and custom volumes).
-func getTotalsAcrossProjectEntities(info *projectInfo, keys []string) (map[string]int64, error) {
+func getTotalsAcrossProjectEntities(info *projectInfo, keys []string, skipUnset bool) (map[string]int64, error) {
 	totals := map[string]int64{}
 
 	for _, key := range keys {
@@ -981,6 +1072,10 @@ func getTotalsAcrossProjectEntities(info *projectInfo, keys []string) (map[strin
 			for _, volume := range info.Volumes {
 				value, ok := volume.Config["size"]
 				if !ok {
+					if skipUnset {
+						continue
+					}
+
 					return nil, fmt.Errorf(
 						"Custom volume %s in project %s has no 'size' config set",
 						volume.Name, info.Project.Name)
@@ -998,7 +1093,7 @@ func getTotalsAcrossProjectEntities(info *projectInfo, keys []string) (map[strin
 	}
 
 	for _, instance := range info.Instances {
-		limits, err := getInstanceLimits(instance, keys)
+		limits, err := getInstanceLimits(instance, keys, skipUnset)
 		if err != nil {
 			return nil, err
 		}
@@ -1011,9 +1106,8 @@ func getTotalsAcrossProjectEntities(info *projectInfo, keys []string) (map[strin
 	return totals, nil
 }
 
-// Return the effective instance-level values for the limits with the given
-// keys.
-func getInstanceLimits(instance db.Instance, keys []string) (map[string]int64, error) {
+// Return the effective instance-level values for the limits with the given keys.
+func getInstanceLimits(instance db.Instance, keys []string, skipUnset bool) (map[string]int64, error) {
 	limits := map[string]int64{}
 
 	for _, key := range keys {
@@ -1029,6 +1123,10 @@ func getInstanceLimits(instance db.Instance, keys []string) (map[string]int64, e
 
 			value, ok = device["size"]
 			if !ok || value == "" {
+				if skipUnset {
+					continue
+				}
+
 				return nil, fmt.Errorf(
 					"Instance %s in project %s has no 'size' config set on the root device, "+
 						"either directly or via a profile",
@@ -1037,6 +1135,10 @@ func getInstanceLimits(instance db.Instance, keys []string) (map[string]int64, e
 		} else {
 			value, ok = instance.Config[key]
 			if !ok || value == "" {
+				if skipUnset {
+					continue
+				}
+
 				return nil, fmt.Errorf(
 					"Instance %s in project %s has no '%s' config, "+
 						"either directly or via a profile",
@@ -1047,6 +1149,10 @@ func getInstanceLimits(instance db.Instance, keys []string) (map[string]int64, e
 		parser := aggregateLimitConfigValueParsers[key]
 		limit, err := parser(value)
 		if err != nil {
+			if skipUnset {
+				continue
+			}
+
 			return nil, errors.Wrapf(
 				err, "Parse '%s' for instance %s in project %s",
 				key, instance.Name, instance.Project)
@@ -1137,4 +1243,80 @@ func FilterUsedBy(r *http.Request, entries []string) []string {
 	}
 
 	return usedBy
+}
+
+// CheckClusterTargetRestriction check if user is allowed to use cluster member targeting
+func CheckClusterTargetRestriction(tx *db.ClusterTx, r *http.Request, projectName string, targetFlag string) error {
+	// Allow server administrators to move instances around even when restricted (node evacuation, ...)
+	if rbac.UserIsAdmin(r) {
+		return nil
+	}
+
+	project, err := tx.GetProject(projectName)
+	if err != nil {
+		return fmt.Errorf("Fetch project database object")
+	}
+
+	if !projectHasLimitsOrRestrictions(project) {
+		return nil
+	}
+
+	key := "restricted.cluster.target"
+	restrictionValue, ok := project.Config[key]
+	if !ok {
+		restrictionValue = defaultRestrictionsValues[key]
+	}
+
+	if restrictionValue == "block" && targetFlag != "" {
+		return fmt.Errorf("This project doesn't allow cluster member targeting")
+	}
+
+	return nil
+}
+
+// Return true if particular restriction in project is violated
+func projectHasRestriction(project *api.Project, restrictionKey string, blockValue string) bool {
+	restricted := project.Config["restricted"]
+	if !shared.IsTrue(restricted) {
+		return false
+	}
+
+	restrictionValue, ok := project.Config[restrictionKey]
+	if !ok {
+		restrictionValue = defaultRestrictionsValues[restrictionKey]
+	}
+
+	if restrictionValue == blockValue {
+		return true
+	}
+
+	return false
+}
+
+// AllowBackupCreation returns an error if any project-specific restriction is violated
+// when creating a new backup in a project.
+func AllowBackupCreation(tx *db.ClusterTx, projectName string) error {
+	project, err := tx.GetProject(projectName)
+	if err != nil {
+		return err
+	}
+
+	if projectHasRestriction(project, "restricted.backups", "block") {
+		return fmt.Errorf("Project %s doesn't allow for backup creation", projectName)
+	}
+	return nil
+}
+
+// AllowSnapshotCreation returns an error if any project-specific restriction is violated
+// when creating a new snapshot in a project.
+func AllowSnapshotCreation(tx *db.ClusterTx, projectName string) error {
+	project, err := tx.GetProject(projectName)
+	if err != nil {
+		return err
+	}
+
+	if projectHasRestriction(project, "restricted.snapshots", "block") {
+		return fmt.Errorf("Project %s doesn't allow for snapshot creation", projectName)
+	}
+	return nil
 }

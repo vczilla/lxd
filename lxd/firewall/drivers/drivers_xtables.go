@@ -10,12 +10,21 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pkg/errors"
+
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/revert"
+	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
 )
+
+// iptablesChainNICFilterPrefix chain prefix used for NIC specific filtering rules.
+const iptablesChainNICFilterPrefix = "lxd_nic"
+
+// iptablesChainACLFilterPrefix chain used for ACL specific filtering rules.
+const iptablesChainACLFilterPrefix = "lxd_acl"
 
 // Xtables is an implmentation of LXD firewall using {ip, ip6, eb}tables
 type Xtables struct{}
@@ -142,8 +151,160 @@ func (d Xtables) networkIPTablesComment(networkName string) string {
 	return fmt.Sprintf("LXD network %s", networkName)
 }
 
-// NetworkSetupForwardingPolicy allows forwarding dependent on boolean argument
-func (d Xtables) NetworkSetupForwardingPolicy(networkName string, ipVersion uint, allow bool) error {
+// networkSetupNICFilteringChain creates the NIC filtering chain if it doesn't exist, and adds the jump rules to
+// the INPUT and FORWARD filter chains. Must be called after networkSetupForwardingPolicy so that the rules are
+// prepended before the default fowarding policy rules.
+func (d Xtables) networkSetupNICFilteringChain(networkName string, ipVersion uint) error {
+	chain := fmt.Sprintf("%s_%s", iptablesChainNICFilterPrefix, networkName)
+
+	// Create the NIC filter chain if it doesn't exist.
+	exists, _, err := d.iptablesChainExists(ipVersion, "filter", chain)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		err = d.iptablesChainCreate(ipVersion, "filter", chain)
+		if err != nil {
+			return err
+		}
+	}
+
+	comment := d.networkIPTablesComment(networkName)
+	err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-j", chain)
+	if err != nil {
+		return err
+	}
+
+	err = d.iptablesPrepend(ipVersion, comment, "filter", "FORWARD", "-i", networkName, "-j", chain)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// networkSetupACLFilteringChains creates any missing ACL chains and adds jump rules.
+func (d Xtables) networkSetupACLFilteringChains(networkName string) error {
+	chain := fmt.Sprintf("%s_%s", iptablesChainACLFilterPrefix, networkName)
+
+	for _, ipVersion := range []uint{4, 6} {
+		// Create the ACL filter chain if it doesn't exist.
+		exists, _, err := d.iptablesChainExists(ipVersion, "filter", chain)
+		if err != nil {
+			return err
+		}
+
+		if !exists {
+			err = d.iptablesChainCreate(ipVersion, "filter", chain)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Prepend jump rules for ACL candidate traffic.
+		comment := d.networkIPTablesComment(networkName)
+		err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-j", chain)
+		if err != nil {
+			return err
+		}
+
+		err = d.iptablesPrepend(ipVersion, comment, "filter", "OUTPUT", "-o", networkName, "-j", chain)
+		if err != nil {
+			return err
+		}
+
+		// Prepend baseline services rules for network.
+		// Unlike OVN networks, we add the rules first before the ACL candidate rules, aa we can't
+		// indentify "INPUT" and "OUTPUT" chain traffic once we have jumped into the ACL chain. At this
+		// point it becomes indistinguishable from FORWARD traffic. So unlike OVN an ACL rule cannot be
+		// used to block baseline service traffic.
+
+		// Allow DNS to LXD host.
+		err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
+		if err != nil {
+			return err
+		}
+
+		err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+		if err != nil {
+			return err
+		}
+
+		if ipVersion == 4 {
+			// Allow DHCPv4 to/from LXD host.
+			err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT")
+			if err != nil {
+				return err
+			}
+
+			err = d.iptablesPrepend(ipVersion, comment, "filter", "OUTPUT", "-o", networkName, "-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT")
+			if err != nil {
+				return err
+			}
+
+			// Allow core ICMPv4 to/from LXD host.
+			for _, icmpType := range []int{3, 11, 12} {
+				err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-p", "icmp", "-m", "icmp", "--icmp-type", fmt.Sprintf("%d", icmpType), "-j", "ACCEPT")
+				if err != nil {
+					return err
+				}
+
+				err = d.iptablesPrepend(ipVersion, comment, "filter", "OUTPUT", "-o", networkName, "-p", "icmp", "-m", "icmp", "--icmp-type", fmt.Sprintf("%d", icmpType), "-j", "ACCEPT")
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		if ipVersion == 6 {
+			// Allow DHCPv6 to/from LXD host.
+			err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-p", "udp", "--sport", "546", "--dport", "547", "-j", "ACCEPT")
+			if err != nil {
+				return err
+			}
+
+			err = d.iptablesPrepend(ipVersion, comment, "filter", "OUTPUT", "-o", networkName, "-p", "udp", "--sport", "547", "--dport", "546", "-j", "ACCEPT")
+			if err != nil {
+				return err
+			}
+
+			// Allow core ICMPv6 to/from LXD host.
+			for _, icmpType := range []int{1, 2, 3, 4, 133, 135, 136, 143} {
+				err = d.iptablesPrepend(ipVersion, comment, "filter", "INPUT", "-i", networkName, "-p", "icmpv6", "-m", "icmp6", "--icmpv6-type", fmt.Sprintf("%d", icmpType), "-j", "ACCEPT")
+				if err != nil {
+					return err
+				}
+			}
+
+			// Allow ICMPv6 ping from host into network as dnsmasq uses this to probe IP allocations.
+			for _, icmpType := range []int{1, 2, 3, 4, 128, 134, 135, 136, 143} {
+				err = d.iptablesPrepend(ipVersion, comment, "filter", "OUTPUT", "-o", networkName, "-p", "icmpv6", "-m", "icmp6", "--icmpv6-type", fmt.Sprintf("%d", icmpType), "-j", "ACCEPT")
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		// Only consider traffic forwarding through the host, as opposed to traffic forwarding through the
+		// bridge when br_netfilter is enabled. In this case the input/output interface is the same.
+		err = d.iptablesPrepend(ipVersion, comment, "filter", "FORWARD", "-i", networkName, "!", "-o", networkName, "-j", chain)
+		if err != nil {
+			return err
+		}
+
+		err = d.iptablesPrepend(ipVersion, comment, "filter", "FORWARD", "-o", networkName, "!", "-i", networkName, "-j", chain)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// networkSetupForwardingPolicy allows forwarding dependent on boolean argument. Must be called before
+// networkSetupNICFilteringChains so the default forwarding policy rules are processed after NIC filtering rules.
+func (d Xtables) networkSetupForwardingPolicy(networkName string, ipVersion uint, allow bool) error {
 	forwardType := "REJECT"
 	if allow {
 		forwardType = "ACCEPT"
@@ -164,9 +325,9 @@ func (d Xtables) NetworkSetupForwardingPolicy(networkName string, ipVersion uint
 	return nil
 }
 
-// NetworkSetupOutboundNAT configures outbound NAT.
+// networkSetupOutboundNAT configures outbound NAT.
 // If srcIP is non-nil then SNAT is used with the specified address, otherwise MASQUERADE mode is used.
-func (d Xtables) NetworkSetupOutboundNAT(networkName string, subnet *net.IPNet, srcIP net.IP, appendRule bool) error {
+func (d Xtables) networkSetupOutboundNAT(networkName string, subnet *net.IPNet, srcIP net.IP, appendRule bool) error {
 	family := uint(4)
 	if subnet.IP.To4() == nil {
 		family = 6
@@ -202,8 +363,8 @@ func (d Xtables) NetworkSetupOutboundNAT(networkName string, subnet *net.IPNet, 
 	return nil
 }
 
-// NetworkSetupDHCPDNSAccess sets up basic iptables overrides for DHCP/DNS.
-func (d Xtables) NetworkSetupDHCPDNSAccess(networkName string, ipVersion uint) error {
+// networkSetupDHCPDNSAccess sets up basic iptables overrides for DHCP/DNS.
+func (d Xtables) networkSetupDHCPDNSAccess(networkName string, ipVersion uint) error {
 	var rules [][]string
 	if ipVersion == 4 {
 		rules = [][]string{
@@ -242,17 +403,361 @@ func (d Xtables) NetworkSetupDHCPDNSAccess(networkName string, ipVersion uint) e
 	return nil
 }
 
-// NetworkSetupDHCPv4Checksum attempts a workaround for broken DHCP clients.
-func (d Xtables) NetworkSetupDHCPv4Checksum(networkName string) error {
+// networkSetupDHCPv4Checksum attempts a workaround for broken DHCP clients.
+func (d Xtables) networkSetupDHCPv4Checksum(networkName string) error {
 	comment := d.networkIPTablesComment(networkName)
 	return d.iptablesPrepend(4, comment, "mangle", "POSTROUTING", "-o", networkName, "-p", "udp", "--dport", "68", "-j", "CHECKSUM", "--checksum-fill")
 }
 
+// NetworkSetup configure network firewall.
+func (d Xtables) NetworkSetup(networkName string, opts Opts) error {
+	if opts.SNATV4 != nil {
+		err := d.networkSetupOutboundNAT(networkName, opts.SNATV4.Subnet, opts.SNATV4.SNATAddress, opts.SNATV4.Append)
+		if err != nil {
+			return err
+		}
+	}
+
+	if opts.SNATV6 != nil {
+		err := d.networkSetupOutboundNAT(networkName, opts.SNATV6.Subnet, opts.SNATV6.SNATAddress, opts.SNATV6.Append)
+		if err != nil {
+			return err
+		}
+	}
+
+	if opts.FeaturesV4 != nil {
+		if opts.FeaturesV4.DHCPDNSAccess {
+			err := d.networkSetupDHCPDNSAccess(networkName, 4)
+			if err != nil {
+				return err
+			}
+
+			err = d.networkSetupDHCPv4Checksum(networkName)
+			if err != nil {
+				return err
+			}
+		}
+
+		err := d.networkSetupForwardingPolicy(networkName, 4, opts.FeaturesV4.ForwardingAllow)
+		if err != nil {
+			return err
+		}
+	}
+
+	if opts.FeaturesV6 != nil {
+		if opts.FeaturesV6.DHCPDNSAccess {
+			err := d.networkSetupDHCPDNSAccess(networkName, 6)
+			if err != nil {
+				return err
+			}
+		}
+
+		err := d.networkSetupForwardingPolicy(networkName, 6, opts.FeaturesV6.ForwardingAllow)
+		if err != nil {
+			return err
+		}
+	}
+
+	if opts.ACL {
+		// Needs to be after networkSetupForwardingPolicy but before networkSetupNICFilteringChain.
+		err := d.networkSetupACLFilteringChains(networkName)
+		if err != nil {
+			return err
+		}
+	}
+
+	if opts.FeaturesV6 != nil {
+		// Setup NIC filtering chain. This must come after networkSetupForwardingPolicy so that the jump
+		// rules prepended to the INPUT and FORWARD chains are processed before the default forwarding
+		// policy rules.
+		err := d.networkSetupNICFilteringChain(networkName, 6)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// NetworkApplyACLRules applies ACL rules to the existing firewall chains.
+func (d Xtables) NetworkApplyACLRules(networkName string, rules []ACLRule) error {
+	chain := fmt.Sprintf("%s_%s", iptablesChainACLFilterPrefix, networkName)
+
+	// Parse rules for both IP families before applying either family of rules.
+	iptCmdRules := make(map[string][][]string)
+	for _, ipVersion := range []uint{4, 6} {
+		cmd := "iptables"
+		if ipVersion == 6 {
+			cmd = "ip6tables"
+		}
+
+		iptRules := make([][]string, 0)
+		for _, rule := range rules {
+			actionArgs, logArgs, err := d.aclRuleCriteriaToArgs(networkName, ipVersion, &rule)
+			if err != nil {
+				return err
+			}
+
+			if actionArgs == nil {
+				continue // Rule is not appropriate for ipVersion.
+			}
+
+			if logArgs != nil {
+				iptRules = append(iptRules, logArgs)
+			}
+
+			iptRules = append(iptRules, actionArgs)
+		}
+
+		iptCmdRules[cmd] = iptRules
+	}
+
+	applyACLRules := func(cmd string, iptRules [][]string) error {
+		// Attempt to flush chain in table.
+		_, err := shared.RunCommand(cmd, "-t", "filter", "-F", chain)
+		if err != nil {
+			return errors.Wrapf(err, "Failed flushing %q chain %q in table %q", cmd, chain, "filter")
+		}
+
+		// Allow connection tracking.
+		_, err = shared.RunCommand(cmd, "-t", "filter", "-A", chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+		if err != nil {
+			return errors.Wrapf(err, "Failed adding connection tracking rules to %q chain %q in table %q", cmd, chain, "filter")
+		}
+
+		// Add rules to chain in table.
+		for _, iptRule := range iptRules {
+			_, err := shared.RunCommand(cmd, append([]string{"-t", "filter", "-A", chain}, iptRule...)...)
+			if err != nil {
+				return errors.Wrapf(err, "Failed adding rule to %q chain %q in table %q", cmd, chain, "filter")
+			}
+		}
+
+		return nil
+	}
+
+	// Apply each family of rules.
+	for cmd, rules := range iptCmdRules {
+		err := applyACLRules(cmd, rules)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// aclRuleCriteriaToArgs converts an ACL rule into an set of arguments for an xtables rule.
+// Returns the arguments to use for the action command and separately the arguments for logging if enabled.
+// Returns nil arguments if the rule is not appropriate for the ipVersion.
+func (d Xtables) aclRuleCriteriaToArgs(networkName string, ipVersion uint, rule *ACLRule) ([]string, []string, error) {
+	var args []string
+
+	if rule.Direction == "ingress" {
+		args = append(args, "-o", networkName) // Coming from host into network's interface.
+	} else {
+		args = append(args, "-i", networkName) // Coming from network's interface into host.
+	}
+
+	// Add subject filters.
+	if rule.Source != "" {
+		matchArgs, err := d.aclRuleSubjectToACLMatch("source", ipVersion, util.SplitNTrimSpace(rule.Source, ",", -1, false)...)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if matchArgs == nil {
+			return nil, nil, nil // Rule is not appropriate for ipVersion.
+		}
+
+		args = append(args, matchArgs...)
+	}
+
+	if rule.Destination != "" {
+		matchArgs, err := d.aclRuleSubjectToACLMatch("destination", ipVersion, util.SplitNTrimSpace(rule.Destination, ",", -1, false)...)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if matchArgs == nil {
+			return nil, nil, nil // Rule is not appropriate for ipVersion.
+		}
+
+		args = append(args, matchArgs...)
+	}
+
+	// Add protocol filters.
+	if shared.StringInSlice(rule.Protocol, []string{"tcp", "udp"}) {
+		args = append(args, "-p", rule.Protocol)
+
+		if rule.SourcePort != "" {
+			args = append(args, d.aclRulePortToACLMatch("sports", util.SplitNTrimSpace(rule.SourcePort, ",", -1, false)...)...)
+		}
+
+		if rule.DestinationPort != "" {
+			args = append(args, d.aclRulePortToACLMatch("dports", util.SplitNTrimSpace(rule.DestinationPort, ",", -1, false)...)...)
+		}
+	} else if shared.StringInSlice(rule.Protocol, []string{"icmp4", "icmp6"}) {
+		var icmpIPVersion uint
+		var protoName string
+		var extName string
+
+		switch rule.Protocol {
+		case "icmp4":
+			protoName = "icmp"
+			extName = "icmp"
+			icmpIPVersion = 4
+		case "icmp6":
+			protoName = "icmpv6"
+			extName = "icmp6"
+			icmpIPVersion = 6
+		}
+
+		if ipVersion != icmpIPVersion {
+			// If we got this far it means that source/destination are either empty or are filled
+			// with at least some subjects in the same family as ipVersion. So if the icmpIPVersion
+			// doesn't match the ipVersion then it means the rule contains mixed-version subjects
+			// which is invalid when using an IP version specific ICMP protocol.
+			if rule.Source != "" || rule.Destination != "" {
+				return nil, nil, fmt.Errorf("Invalid use of %q protocol with non-IPv%d source/destination criteria", rule.Protocol, ipVersion)
+			}
+
+			// Otherwise it means this is just a blanket ICMP rule and is only appropriate for use
+			// with the corresponding ipVersion xtables command.
+			return nil, nil, nil // Rule is not appropriate for ipVersion.
+		}
+
+		if rule.ICMPCode != "" && rule.ICMPType == "" {
+			return nil, nil, fmt.Errorf("Invalid use of ICMP code without ICMP type")
+		}
+
+		args = append(args, "-p", protoName)
+
+		if rule.ICMPType != "" {
+			args = append(args, "-m", extName)
+
+			if rule.ICMPCode == "" {
+				args = append(args, fmt.Sprintf("--%s-type", protoName), rule.ICMPType)
+			} else {
+				args = append(args, fmt.Sprintf("--%s-type", protoName), fmt.Sprintf("%s/%s", rule.ICMPType, rule.ICMPCode))
+			}
+		}
+	}
+
+	// Handle action.
+	action := rule.Action
+	if action == "allow" {
+		action = "accept"
+	}
+
+	actionArgs := append(args, "-j", strings.ToUpper(action))
+
+	// Handle logging.
+	var logArgs []string
+	if rule.Log {
+		logArgs = append(args, "-j", "LOG")
+
+		if rule.LogName != "" {
+			// Add a trailing space to prefix for readability in logs.
+			logArgs = append(logArgs, "--log-prefix", fmt.Sprintf("%s ", rule.LogName))
+		}
+	}
+
+	return actionArgs, logArgs, nil
+}
+
+// aclRuleSubjectToACLMatch converts direction (source/destination) and subject criteria list into xtables args.
+// Returns nil if none of the subjects are appropriate for the ipVersion.
+func (d Xtables) aclRuleSubjectToACLMatch(direction string, ipVersion uint, subjectCriteria ...string) ([]string, error) {
+	fieldParts := make([]string, 0, len(subjectCriteria))
+
+	// For each criterion check if value looks like IP CIDR.
+	for _, subjectCriterion := range subjectCriteria {
+		ip := net.ParseIP(subjectCriterion)
+		if ip == nil {
+			ip, _, _ = net.ParseCIDR(subjectCriterion)
+		}
+
+		if ip != nil {
+			var subjectIPVersion uint = 4
+			if ip.To4() == nil {
+				subjectIPVersion = 6
+			}
+
+			if ipVersion != subjectIPVersion {
+				continue // Skip subjects that not for the xtables tool we are using.
+			}
+
+			fieldParts = append(fieldParts, subjectCriterion)
+		} else {
+			return nil, fmt.Errorf("Unsupported xtables subject %q", subjectCriterion)
+		}
+	}
+
+	if len(fieldParts) > 0 {
+		return []string{fmt.Sprintf("--%s", direction), strings.Join(fieldParts, ",")}, nil
+	}
+
+	return nil, nil // No subjects suitable for ipVersion.
+}
+
+// aclRulePortToACLMatch converts protocol (tcp/udp), direction (sports/dports) and port criteria list into
+// xtables args.
+func (d Xtables) aclRulePortToACLMatch(direction string, portCriteria ...string) []string {
+	fieldParts := make([]string, 0, len(portCriteria))
+
+	for _, portCriterion := range portCriteria {
+		criterionParts := strings.SplitN(portCriterion, "-", 2)
+		if len(criterionParts) > 1 {
+			fieldParts = append(fieldParts, fmt.Sprintf("%s:%s", criterionParts[0], criterionParts[1]))
+		} else {
+			fieldParts = append(fieldParts, fmt.Sprintf("%s", criterionParts[0]))
+		}
+	}
+
+	return []string{"-m", "multiport", fmt.Sprintf("--%s", direction), strings.Join(fieldParts, ",")}
+}
+
 // NetworkClear removes network rules from filter, mangle and nat tables.
-func (d Xtables) NetworkClear(networkName string, ipVersion uint) error {
-	err := d.iptablesClear(ipVersion, d.networkIPTablesComment(networkName), "filter", "mangle", "nat")
-	if err != nil {
-		return err
+// If delete is true then network-specific chains are also removed.
+func (d Xtables) NetworkClear(networkName string, delete bool, ipVersions []uint) error {
+	for _, ipVersion := range ipVersions {
+		// Clear any rules associated to the network.
+		err := d.iptablesClear(ipVersion, d.networkIPTablesComment(networkName), "filter", "mangle", "nat")
+		if err != nil {
+			return err
+		}
+
+		// Remove ACL chain and rules.
+		aclFilterChain := fmt.Sprintf("%s_%s", iptablesChainACLFilterPrefix, networkName)
+		exists, hasRules, err := d.iptablesChainExists(ipVersion, "filter", aclFilterChain)
+		if err != nil {
+			return err
+		}
+
+		if exists {
+			err = d.iptablesChainDelete(ipVersion, "filter", aclFilterChain, hasRules)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Remove network specific chains (and any rules in them) if deleting.
+		if delete {
+			// Remove the NIC filter chain if it exists.
+			nicFilterChain := fmt.Sprintf("%s_%s", iptablesChainNICFilterPrefix, networkName)
+			exists, hasRules, err := d.iptablesChainExists(ipVersion, "filter", nicFilterChain)
+			if err != nil {
+				return err
+			}
+
+			if exists {
+				err = d.iptablesChainDelete(ipVersion, "filter", nicFilterChain, hasRules)
+				if err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	return nil
@@ -275,7 +780,7 @@ func (d Xtables) InstanceSetupBridgeFilter(projectName string, instanceName stri
 		}
 	}
 
-	rules, err := d.generateFilterIptablesRules(projectName, instanceName, parentName, hostName, hwAddr, IPv4, IPv6)
+	rules, err := d.generateFilterIptablesRules(parentName, hostName, hwAddr, IPv6)
 	if err != nil {
 		return err
 	}
@@ -302,7 +807,7 @@ func (d Xtables) InstanceClearBridgeFilter(projectName string, instanceName stri
 	// Get a current list of rules active on the host.
 	out, err := shared.RunCommand("ebtables", "--concurrent", "-L", "--Lmac2", "--Lx")
 	if err != nil {
-		return fmt.Errorf("Failed to get a list of network filters to for %q: %v", deviceName, err)
+		return errors.Wrapf(err, "Failed to get a list of network filters to for %q", deviceName)
 	}
 
 	// Get a list of rules that we would have applied on instance start.
@@ -407,11 +912,13 @@ func (d Xtables) InstanceSetupProxyNAT(projectName string, instanceName string, 
 			return err
 		}
 
-		// instance <-> instance.
-		// Requires instance's bridge port has hairpin mode enabled when br_netfilter is loaded.
-		err = d.iptablesPrepend(ipVersion, comment, "nat", "POSTROUTING", "-p", listen.ConnType, "--source", connectHost, "--destination", connectHost, "--dport", connectPort, "-j", "MASQUERADE")
-		if err != nil {
-			return err
+		if connectIndex == i {
+			// instance <-> instance.
+			// Requires instance's bridge port has hairpin mode enabled when br_netfilter is loaded.
+			err = d.iptablesPrepend(ipVersion, comment, "nat", "POSTROUTING", "-p", listen.ConnType, "--source", connectHost, "--destination", connectHost, "--dport", connectPort, "-j", "MASQUERADE")
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -512,7 +1019,7 @@ func (d Xtables) generateFilterEbtablesRules(hostName string, hwAddr string, IPv
 }
 
 // generateFilterIptablesRules returns a customised set of iptables filter rules based on the device.
-func (d Xtables) generateFilterIptablesRules(projectName string, instanceName string, parentName string, hostName string, hwAddr string, _ net.IP, IPv6 net.IP) (rules [][]string, err error) {
+func (d Xtables) generateFilterIptablesRules(parentName string, hostName string, hwAddr string, IPv6 net.IP) (rules [][]string, err error) {
 	mac, err := net.ParseMAC(hwAddr)
 	if err != nil {
 		return
@@ -529,14 +1036,14 @@ func (d Xtables) generateFilterIptablesRules(projectName string, instanceName st
 	// correct source address and MAC at the IP & ethernet layers, but a fraudulent IP or MAC
 	// inside the ICMPv6 NDP packet.
 	if IPv6 != nil {
+		chain := fmt.Sprintf("%s_%s", iptablesChainNICFilterPrefix, parentName)
+
 		ipv6Hex := hex.EncodeToString(IPv6)
 		rules = append(rules,
 			// Prevent Neighbor Advertisement IP spoofing (prevents the instance redirecting traffic for IPs that are not its own).
-			[]string{"6", "INPUT", "-i", parentName, "-p", "ipv6-icmp", "-m", "physdev", "--physdev-in", hostName, "-m", "icmp6", "--icmpv6-type", "136", "-m", "string", "!", "--hex-string", fmt.Sprintf("|%s|", ipv6Hex), "--algo", "bm", "--from", "48", "--to", "64", "-j", "DROP"},
-			[]string{"6", "FORWARD", "-i", parentName, "-p", "ipv6-icmp", "-m", "physdev", "--physdev-in", hostName, "-m", "icmp6", "--icmpv6-type", "136", "-m", "string", "!", "--hex-string", fmt.Sprintf("|%s|", ipv6Hex), "--algo", "bm", "--from", "48", "--to", "64", "-j", "DROP"},
+			[]string{"6", chain, "-i", parentName, "-p", "ipv6-icmp", "-m", "physdev", "--physdev-in", hostName, "-m", "icmp6", "--icmpv6-type", "136", "-m", "string", "!", "--hex-string", fmt.Sprintf("|%s|", ipv6Hex), "--algo", "bm", "--from", "48", "--to", "64", "-j", "DROP"},
 			// Prevent Neighbor Advertisement MAC spoofing (prevents the instance poisoning the NDP cache of its neighbours with a MAC address that isn't its own).
-			[]string{"6", "INPUT", "-i", parentName, "-p", "ipv6-icmp", "-m", "physdev", "--physdev-in", hostName, "-m", "icmp6", "--icmpv6-type", "136", "-m", "string", "!", "--hex-string", fmt.Sprintf("|%s|", macHex), "--algo", "bm", "--from", "66", "--to", "72", "-j", "DROP"},
-			[]string{"6", "FORWARD", "-i", parentName, "-p", "ipv6-icmp", "-m", "physdev", "--physdev-in", hostName, "-m", "icmp6", "--icmpv6-type", "136", "-m", "string", "!", "--hex-string", fmt.Sprintf("|%s|", macHex), "--algo", "bm", "--from", "66", "--to", "72", "-j", "DROP"},
+			[]string{"6", chain, "-i", parentName, "-p", "ipv6-icmp", "-m", "physdev", "--physdev-in", hostName, "-m", "icmp6", "--icmpv6-type", "136", "-m", "string", "!", "--hex-string", fmt.Sprintf("|%s|", macHex), "--algo", "bm", "--from", "66", "--to", "72", "-j", "DROP"},
 		)
 	}
 
@@ -590,16 +1097,7 @@ func (d Xtables) iptablesAdd(ipVersion uint, comment string, table string, metho
 
 	baseArgs := []string{"-w", "-t", table}
 
-	// Check for an existing entry
-	args := append(baseArgs, []string{"-C", chain}...)
-	args = append(args, rule...)
-	args = append(args, "-m", "comment", "--comment", fmt.Sprintf("generated for %s", comment))
-	_, err = shared.RunCommand(cmd, args...)
-	if err == nil {
-		return nil
-	}
-
-	args = append(baseArgs, []string{method, chain}...)
+	args := append(baseArgs, []string{method, chain}...)
 	args = append(args, rule...)
 	args = append(args, "-m", "comment", "--comment", fmt.Sprintf("generated for %s", comment))
 
@@ -736,6 +1234,85 @@ func (d Xtables) InstanceClearRPFilter(projectName string, instanceName string, 
 
 	if len(errs) > 0 {
 		return fmt.Errorf("Failed to remove reverse path filter rules for %q: %v", deviceName, errs)
+	}
+
+	return nil
+}
+
+// iptablesChainExists checks whether a chain exists in a table, and whether it has any rules.
+func (d Xtables) iptablesChainExists(ipVersion uint, table string, chain string) (bool, bool, error) {
+	var cmd string
+	if ipVersion == 4 {
+		cmd = "iptables"
+	} else if ipVersion == 6 {
+		cmd = "ip6tables"
+	} else {
+		return false, false, fmt.Errorf("Invalid IP version")
+	}
+
+	_, err := exec.LookPath(cmd)
+	if err != nil {
+		return false, false, errors.Wrapf(err, "Failed checking %q chain %q exists in table %q", cmd, chain, table)
+	}
+
+	// Attempt to dump the rules of the chain, if this fails then chain doesn't exist.
+	rules, err := shared.RunCommand(cmd, "-t", table, "-S", chain)
+	if err != nil {
+		return false, false, nil
+	}
+
+	for _, rule := range util.SplitNTrimSpace(strings.TrimSpace(rules), "\n", -1, true) {
+		if strings.HasPrefix(rule, "-A") {
+			return true, true, nil
+		}
+	}
+
+	return true, false, nil
+}
+
+// iptablesChainCreate creates a chain in a table.
+func (d Xtables) iptablesChainCreate(ipVersion uint, table string, chain string) error {
+	var cmd string
+	if ipVersion == 4 {
+		cmd = "iptables"
+	} else if ipVersion == 6 {
+		cmd = "ip6tables"
+	} else {
+		return fmt.Errorf("Invalid IP version")
+	}
+
+	// Attempt to create chain in table.
+	_, err := shared.RunCommand(cmd, "-t", table, "-N", chain)
+	if err != nil {
+		return errors.Wrapf(err, "Failed creating %q chain %q in table %q", cmd, chain, table)
+	}
+
+	return nil
+}
+
+// iptablesChainDelete deletes a chain in a table.
+func (d Xtables) iptablesChainDelete(ipVersion uint, table string, chain string, flushFirst bool) error {
+	var cmd string
+	if ipVersion == 4 {
+		cmd = "iptables"
+	} else if ipVersion == 6 {
+		cmd = "ip6tables"
+	} else {
+		return fmt.Errorf("Invalid IP version")
+	}
+
+	// Attempt to flush rules from chain in table.
+	if flushFirst {
+		_, err := shared.RunCommand(cmd, "-t", table, "-F", chain)
+		if err != nil {
+			return errors.Wrapf(err, "Failed flushing %q chain %q in table %q", cmd, chain, table)
+		}
+	}
+
+	// Attempt to delete chain in table.
+	_, err := shared.RunCommand(cmd, "-t", table, "-X", chain)
+	if err != nil {
+		return errors.Wrapf(err, "Failed deleting %q chain %q in table %q", cmd, chain, table)
 	}
 
 	return nil

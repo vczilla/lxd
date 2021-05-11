@@ -1,18 +1,24 @@
 package device
 
 import (
+	"fmt"
+
+	"github.com/lxc/lxd/lxd/instance"
+	"github.com/lxc/lxd/lxd/network/acl"
+	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/validate"
 )
 
 // nicValidationRules returns config validation rules for nic devices.
-func nicValidationRules(requiredFields []string, optionalFields []string) map[string]func(value string) error {
+func nicValidationRules(requiredFields []string, optionalFields []string, instConf instance.ConfigReader) map[string]func(value string) error {
 	// Define a set of default validators for each field name.
 	defaultValidators := map[string]func(value string) error{
-		"name":                    validate.IsAny,
+		"name":                    validate.Optional(validate.IsInterfaceName, func(_ string) error { return nicCheckNamesUnique(instConf) }),
 		"parent":                  validate.IsAny,
 		"network":                 validate.IsAny,
 		"mtu":                     validate.Optional(validate.IsNetworkMTU),
 		"vlan":                    validate.IsNetworkVLAN,
+		"gvrp":                    validate.Optional(validate.IsBool),
 		"hwaddr":                  validate.IsNetworkMAC,
 		"host_name":               validate.IsAny,
 		"limits.ingress":          validate.IsAny,
@@ -37,6 +43,15 @@ func nicValidationRules(requiredFields []string, optionalFields []string) map[st
 		"ipv6.host_table":         validate.Optional(validate.IsUint32),
 		"ipv4.routes.external":    validate.Optional(validate.IsNetworkV4List),
 		"ipv6.routes.external":    validate.Optional(validate.IsNetworkV6List),
+		"security.acls":           validate.IsAny,
+		"security.acls.default.ingress.action": validate.Optional(func(value string) error {
+			return validate.IsOneOf(value, acl.ValidActions)
+		}),
+		"security.acls.default.egress.action": validate.Optional(func(value string) error {
+			return validate.IsOneOf(value, acl.ValidActions)
+		}),
+		"security.acls.default.ingress.logged": validate.Optional(validate.IsBool),
+		"security.acls.default.egress.logged":  validate.Optional(validate.IsBool),
 	}
 
 	validators := map[string]func(value string) error{}
@@ -91,4 +106,23 @@ func nicHasAutoGateway(value string) bool {
 	}
 
 	return false
+}
+
+// nicCheckNamesUnique checks that all the NICs in the instConf's expanded devices have a unique (or unset) name.
+func nicCheckNamesUnique(instConf instance.ConfigReader) error {
+	seenNICNames := []string{}
+
+	for _, devConfig := range instConf.ExpandedDevices() {
+		if devConfig["type"] != "nic" || devConfig["name"] == "" {
+			continue
+		}
+
+		if shared.StringInSlice(devConfig["name"], seenNICNames) {
+			return fmt.Errorf("Duplicate NIC name detected %q", devConfig["name"])
+		}
+
+		seenNICNames = append(seenNICNames, devConfig["name"])
+	}
+
+	return nil
 }

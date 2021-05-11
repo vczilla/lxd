@@ -11,6 +11,7 @@ import (
 	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -22,14 +23,14 @@ var listenersLock sync.Mutex
 // get notified about events.
 //
 // Whenever an event is received the given callback is invoked.
-func Events(endpoints *endpoints.Endpoints, cluster *db.Cluster, f func(int64, api.Event)) (task.Func, task.Schedule) {
+func Events(endpoints *endpoints.Endpoints, cluster *db.Cluster, serverCert func() *shared.CertInfo, f func(int64, api.Event)) (task.Func, task.Schedule) {
 	// Update our pool of event listeners. Since database queries are
 	// blocking, we spawn the actual logic in a goroutine, to abort
 	// immediately when we receive the stop signal.
 	update := func(ctx context.Context) {
 		ch := make(chan struct{})
 		go func() {
-			eventsUpdateListeners(endpoints, cluster, f)
+			eventsUpdateListeners(endpoints, cluster, serverCert, f)
 			ch <- struct{}{}
 		}()
 		select {
@@ -43,7 +44,7 @@ func Events(endpoints *endpoints.Endpoints, cluster *db.Cluster, f func(int64, a
 	return update, schedule
 }
 
-func eventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, f func(int64, api.Event)) {
+func eventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, serverCert func() *shared.CertInfo, f func(int64, api.Event)) {
 	// Get the current cluster nodes.
 	var nodes []db.NodeInfo
 	var offlineThreshold time.Duration
@@ -64,7 +65,7 @@ func eventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, 
 		return nil
 	})
 	if err != nil {
-		logger.Warnf("Failed to get current cluster nodes: %v", err)
+		logger.Warn("Failed to get current cluster members", log.Ctx{"err": err})
 		return
 	}
 	if len(nodes) == 1 {
@@ -99,12 +100,12 @@ func eventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, 
 		}
 		listenersLock.Unlock()
 
-		listener, err := eventsConnect(node.Address, endpoints.NetworkCert())
+		listener, err := eventsConnect(node.Address, endpoints.NetworkCert(), serverCert())
 		if err != nil {
-			logger.Warnf("Failed to get events from node %s: %v", node.Address, err)
+			logger.Warn("Failed to get events from member", log.Ctx{"address": node.Address, "err": err})
 			continue
 		}
-		logger.Debugf("Listening for events on node %s", node.Address)
+		logger.Debug("Listening for events on member", log.Ctx{"address": node.Address})
 		listener.AddHandler(nil, func(event api.Event) { f(node.ID, event) })
 
 		listenersLock.Lock()
@@ -123,8 +124,8 @@ func eventsUpdateListeners(endpoints *endpoints.Endpoints, cluster *db.Cluster, 
 }
 
 // Establish a client connection to get events from the given node.
-func eventsConnect(address string, cert *shared.CertInfo) (*lxd.EventListener, error) {
-	client, err := Connect(address, cert, true)
+func eventsConnect(address string, networkCert *shared.CertInfo, serverCert *shared.CertInfo) (*lxd.EventListener, error) {
+	client, err := Connect(address, networkCert, serverCert, true)
 	if err != nil {
 		return nil, err
 	}

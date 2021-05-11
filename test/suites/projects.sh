@@ -674,7 +674,7 @@ test_projects_limits() {
   ! lxc storage volume create "${pool}" v2 || false
 
   # Disk limits can be updated if they stay within limits.
-  lxc project set p1 limits.disk 200800kB
+  lxc project set p1 limits.disk 200100kB
   lxc profile device set default root size=90MB
   lxc config device set c2 root size 60MB
 
@@ -762,7 +762,7 @@ test_projects_restrictions() {
   # It's not possible to use forbidden low-level options
   ! lxc profile set default "raw.idmap=both 0 0" || false
   ! lxc init testimage c1 -c "raw.idmap=both 0 0" || false
-  ! lxc init testimage c1 -c volatile.apply_template="foo" || false
+  ! lxc init testimage c1 -c volatile.uuid="foo" || false
 
   # It's not possible to create privileged containers.
   ! lxc profile set default security.privileged=true || false
@@ -773,7 +773,7 @@ test_projects_restrictions() {
 
   # It's not possible to change low-level options
   ! lxc config set c1 "raw.idmap=both 0 0" || false
-  ! lxc config set c1 volatile.apply_template="foo" || false
+  ! lxc config set c1 volatile.uuid="foo" || false
 
   # It's not possible to attach character devices.
   ! lxc profile device add default tty unix-char path=/dev/ttyS0 || false
@@ -858,4 +858,41 @@ test_projects_restrictions() {
 
   lxc network delete "n-proj$$"
   lxc storage volume delete "${pool}" "v-proj$$"
+}
+
+# Test project state api
+test_projects_usage() {
+  # Set configuration on the default project
+  lxc project create test-usage \
+    -c limits.cpu=5 \
+    -c limits.memory=1GiB \
+    -c limits.disk=10GiB \
+    -c limits.networks=3 \
+    -c limits.processes=40
+
+  # Create a profile defining resource allocations
+  lxc profile show default --project default | lxc profile edit default --project test-usage
+  lxc profile set default --project test-usage \
+    limits.cpu=1 \
+    limits.memory=512MiB \
+    limits.processes=20
+  lxc profile device set default root size=3GiB --project test-usage
+
+  # Spin up a container
+  deps/import-busybox --project test-usage --alias testimage
+  lxc init testimage c1 --project test-usage
+  lxc project info test-usage
+
+  lxc project info test-usage --format csv | grep -q "CONTAINERS,UNLIMITED,1"
+  lxc project info test-usage --format csv | grep -q "CPU,5,1"
+  lxc project info test-usage --format csv | grep -q "DISK,10.00GiB,3.00GiB"
+  lxc project info test-usage --format csv | grep -q "INSTANCES,UNLIMITED,1"
+  lxc project info test-usage --format csv | grep -q "MEMORY,1.00GiB,512.00MiB"
+  lxc project info test-usage --format csv | grep -q "NETWORKS,3,0"
+  lxc project info test-usage --format csv | grep -q "PROCESSES,40,20"
+  lxc project info test-usage --format csv | grep -q "VIRTUAL-MACHINES,UNLIMITED,0"
+
+  lxc delete c1 --project test-usage
+  lxc image delete testimage --project test-usage
+  lxc project delete test-usage
 }

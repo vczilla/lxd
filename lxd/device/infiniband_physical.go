@@ -28,7 +28,7 @@ func (d *infinibandPhysical) validateConfig(instConf instance.ConfigReader) erro
 		"hwaddr",
 	}
 
-	rules := nicValidationRules(requiredFields, optionalFields)
+	rules := nicValidationRules(requiredFields, optionalFields, instConf)
 	rules["hwaddr"] = func(value string) error {
 		if value == "" {
 			return nil
@@ -118,8 +118,8 @@ func (d *infinibandPhysical) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	runConf.NetworkInterface = []deviceConfig.RunConfigItem{
-		{Key: "name", Value: d.config["name"]},
 		{Key: "type", Value: "phys"},
+		{Key: "name", Value: d.config["name"]},
 		{Key: "flags", Value: "up"},
 		{Key: "link", Value: saveData["host_name"]},
 	}

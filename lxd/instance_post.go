@@ -32,13 +32,50 @@ var internalClusterContainerMovedCmd = APIEndpoint{
 	Post: APIEndpointAction{Handler: internalClusterContainerMovedPost},
 }
 
-func containerPost(d *Daemon, r *http.Request) response.Response {
+// swagger:operation POST /1.0/instances/{name} instances instance_post
+//
+// Rename or move/migrate an instance
+//
+// Renames, moves an instance between pools or migrates an instance to another server.
+//
+// The returned operation metadata will vary based on what's requested.
+// For rename or move within the same server, this is a simple background operation with progress data.
+// For migration, in the push case, this will similarly be a background
+// operation with progress data, for the pull case, it will be a websocket
+// operation with a number of secrets to be passed to the target server.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+//   - in: body
+//     name: migration
+//     description: Migration request
+//     schema:
+//       $ref: "#/definitions/InstancePost"
+// responses:
+//   "200":
+//     $ref: "#/responses/Operation"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instancePost(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 
 	name := mux.Vars(r)["name"]
 	targetNode := queryParam(r, "target")
@@ -73,6 +110,12 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 				return errors.Wrap(err, "Failed to load LXD config")
 			}
 
+			// Check if user is allowed to use cluster member targeting
+			err = project.CheckClusterTargetRestriction(tx, r, projectName, targetNode)
+			if err != nil {
+				return err
+			}
+
 			// Load target node.
 			node, err := tx.GetNodeByName(targetNode)
 			if err != nil {
@@ -81,7 +124,7 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 			targetNodeOffline = node.IsOffline(config.OfflineThreshold())
 
 			// Load source node.
-			address, err := tx.GetNodeAddressOfInstance(project, name, instanceType)
+			address, err := tx.GetNodeAddressOfInstance(projectName, name, instanceType)
 			if err != nil {
 				return errors.Wrap(err, "Failed to get address of instance's node")
 			}
@@ -130,7 +173,7 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 	// and we'll either forward the request or load the container.
 	if targetNode == "" || !sourceNodeOffline {
 		// Handle requests targeted to a container on a different node.
-		resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, name, instanceType)
+		resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -166,15 +209,32 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 		stateful = req.Live
 	}
 
-	inst, err := instance.LoadByProjectAndName(d.State(), project, name)
+	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	if req.Migration {
+		// Server-side pool migration.
+		if req.Pool != "" {
+			// Setup the instance move operation.
+			run := func(op *operations.Operation) error {
+				return instancePostPoolMigration(d, inst, req.Name, req.InstanceOnly, req.Pool, op)
+			}
+
+			resources := map[string][]string{}
+			resources["instances"] = []string{name}
+			op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil)
+			if err != nil {
+				return response.InternalError(err)
+			}
+
+			return operations.OperationResponse(op)
+		}
+
 		if targetNode != "" {
 			// Check if instance has backups.
-			backups, err := d.cluster.GetInstanceBackups(project, name)
+			backups, err := d.cluster.GetInstanceBackups(projectName, name)
 			if err != nil {
 				err = errors.Wrap(err, "Failed to fetch instance's backups")
 				return response.SmartError(err)
@@ -183,13 +243,13 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 				return response.BadRequest(fmt.Errorf("Instance has backups"))
 			}
 
-			// Check whether the container is running.
+			// Check whether the instance is running.
 			if !sourceNodeOffline && inst.IsRunning() {
-				return response.BadRequest(fmt.Errorf("Container is running"))
+				return response.BadRequest(fmt.Errorf("Instance is running"))
 			}
 
 			// Check if we are migrating a ceph-based container.
-			poolName, err := d.cluster.GetInstancePool(project, name)
+			poolName, err := d.cluster.GetInstancePool(projectName, name)
 			if err != nil {
 				err = errors.Wrap(err, "Failed to fetch instance's pool name")
 				return response.SmartError(err)
@@ -200,7 +260,7 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 				return response.SmartError(err)
 			}
 			if pool.Driver == "ceph" {
-				return containerPostClusteringMigrateWithCeph(d, inst, project, name, req.Name, targetNode, instanceType)
+				return instancePostClusteringMigrateWithCeph(d, inst, projectName, name, req.Name, targetNode, instanceType)
 			}
 
 			// If this is not a ceph-based container, make sure
@@ -212,7 +272,7 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 				return response.SmartError(err)
 			}
 
-			return containerPostClusteringMigrate(d, inst, name, req.Name, targetNode)
+			return instancePostClusteringMigrate(d, inst, name, req.Name, targetNode)
 		}
 
 		instanceOnly := req.InstanceOnly || req.ContainerOnly
@@ -223,7 +283,10 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 
 		resources := map[string][]string{}
 		resources["instances"] = []string{name}
-		resources["containers"] = resources["instances"]
+
+		if inst.Type() == instancetype.Container {
+			resources["containers"] = resources["instances"]
+		}
 
 		run := func(op *operations.Operation) error {
 			return ws.Do(d.State(), op)
@@ -241,7 +304,7 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 				return response.InternalError(err)
 			}
 
-			op, err := operations.OperationCreate(d.State(), project, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil)
+			op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil)
 			if err != nil {
 				return response.InternalError(err)
 			}
@@ -250,7 +313,7 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Pull mode.
-		op, err := operations.OperationCreate(d.State(), project, operations.OperationClassWebsocket, db.OperationInstanceMigrate, resources, ws.Metadata(), run, cancel, ws.Connect)
+		op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, db.OperationInstanceMigrate, resources, ws.Metadata(), run, cancel, ws.Connect)
 		if err != nil {
 			return response.InternalError(err)
 		}
@@ -259,20 +322,23 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Check that the name isn't already in use.
-	id, _ := d.cluster.GetInstanceID(project, req.Name)
+	id, _ := d.cluster.GetInstanceID(projectName, req.Name)
 	if id > 0 {
 		return response.Conflict(fmt.Errorf("Name '%s' already in use", req.Name))
 	}
 
 	run := func(*operations.Operation) error {
-		return inst.Rename(req.Name)
+		return inst.Rename(req.Name, true)
 	}
 
 	resources := map[string][]string{}
 	resources["instances"] = []string{name}
-	resources["containers"] = resources["instances"]
 
-	op, err := operations.OperationCreate(d.State(), project, operations.OperationClassTask, db.OperationInstanceRename, resources, nil, run, nil, nil)
+	if inst.Type() == instancetype.Container {
+		resources["containers"] = resources["instances"]
+	}
+
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceRename, resources, nil, run, nil, nil)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -280,16 +346,91 @@ func containerPost(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
-// Move a non-ceph container to another cluster node.
-func containerPostClusteringMigrate(d *Daemon, c instance.Instance, oldName, newName, newNode string) response.Response {
-	cert := d.endpoints.NetworkCert()
+// Move an instance to another pool.
+func instancePostPoolMigration(d *Daemon, inst instance.Instance, newName string, instanceOnly bool, newPool string, op *operations.Operation) error {
+	if inst.IsRunning() {
+		return fmt.Errorf("Instance must not be running to move between pools")
+	}
 
+	if inst.IsSnapshot() {
+		return fmt.Errorf("Instance snapshots cannot be moved between pools")
+	}
+
+	// Copy config from instance to avoid modifying it.
+	localConfig := make(map[string]string)
+	for k, v := range inst.LocalConfig() {
+		localConfig[k] = v
+	}
+
+	// Load source root disk from expanded devices (in case instance doesn't have its own root disk).
+	rootDevKey, rootDev, err := shared.GetRootDiskDevice(inst.ExpandedDevices().CloneNative())
+	if err != nil {
+		return err
+	}
+
+	// Copy device config from instance, and update target instance root disk device with the new pool name.
+	localDevices := inst.LocalDevices().Clone()
+	rootDev["pool"] = newPool
+	localDevices[rootDevKey] = rootDev
+
+	// Specify the target instance config with the new name and modified root disk config.
+	args := db.InstanceArgs{
+		Name:         newName,
+		BaseImage:    localConfig["volatile.base_image"],
+		Config:       localConfig,
+		Devices:      localDevices,
+		Project:      inst.Project(),
+		Type:         inst.Type(),
+		Architecture: inst.Architecture(),
+		Description:  inst.Description(),
+		Ephemeral:    inst.IsEphemeral(),
+		Profiles:     inst.Profiles(),
+		Stateful:     inst.IsStateful(),
+	}
+
+	// If we are moving the instance to a new name, then we need to create the copy of the instance on the new
+	// pool with a temporary name that is different from the source to avoid conflicts. Then after the source
+	// instance has been deleted we will rename the new instance back to the original name.
+	if newName == inst.Name() {
+		args.Name = fmt.Sprintf("lxd-copy-of-%d", inst.ID())
+	}
+
+	// Copy instance to new target instance.
+	targetInst, err := instanceCreateAsCopy(d.State(), instanceCreateAsCopyOpts{
+		sourceInstance:       inst,
+		targetInstance:       args,
+		instanceOnly:         instanceOnly,
+		applyTemplateTrigger: false, // Don't apply templates when moving.
+	}, op)
+	if err != nil {
+		return err
+	}
+
+	// Delete original instance.
+	err = inst.Delete(true)
+	if err != nil {
+		return err
+	}
+
+	// Rename copy from temporary name to original name if needed.
+	if newName == inst.Name() {
+		err = targetInst.Rename(newName, false) // Don't apply templates when moving.
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Move a non-ceph container to another cluster node.
+func instancePostClusteringMigrate(d *Daemon, inst instance.Instance, oldName, newName, newNode string) response.Response {
 	var sourceAddress string
 	var targetAddress string
 
 	// Save the original value of the "volatile.apply_template" config key,
 	// since we'll want to preserve it in the copied container.
-	origVolatileApplyTemplate := c.LocalConfig()["volatile.apply_template"]
+	origVolatileApplyTemplate := inst.LocalConfig()["volatile.apply_template"]
 
 	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
@@ -311,19 +452,20 @@ func containerPostClusteringMigrate(d *Daemon, c instance.Instance, oldName, new
 		return response.SmartError(err)
 	}
 
-	run := func(*operations.Operation) error {
-		// Connect to the source host, i.e. ourselves (the node the container is running on).
-		source, err := cluster.Connect(sourceAddress, cert, true)
+	run := func(op *operations.Operation) error {
+		// Connect to the source host, i.e. ourselves (the node the instance is running on).
+		source, err := cluster.Connect(sourceAddress, d.endpoints.NetworkCert(), d.serverCert(), true)
 		if err != nil {
 			return errors.Wrap(err, "Failed to connect to source server")
 		}
+		source = source.UseProject(inst.Project())
 
 		// Connect to the destination host, i.e. the node to migrate the container to.
-		dest, err := cluster.Connect(targetAddress, cert, false)
+		dest, err := cluster.Connect(targetAddress, d.endpoints.NetworkCert(), d.serverCert(), false)
 		if err != nil {
 			return errors.Wrap(err, "Failed to connect to destination server")
 		}
-		dest = dest.UseTarget(newNode)
+		dest = dest.UseTarget(newNode).UseProject(inst.Project())
 
 		destName := newName
 		isSameName := false
@@ -350,6 +492,15 @@ func containerPostClusteringMigrate(d *Daemon, c instance.Instance, oldName, new
 		copyOp, err := dest.CopyInstance(source, *entry, &args)
 		if err != nil {
 			return errors.Wrap(err, "Failed to issue copy instance API request")
+		}
+
+		handler := func(newOp api.Operation) {
+			op.UpdateMetadata(newOp.Metadata)
+		}
+
+		_, err = copyOp.AddHandler(handler)
+		if err != nil {
+			return err
 		}
 
 		err = copyOp.Wait()
@@ -388,7 +539,7 @@ func containerPostClusteringMigrate(d *Daemon, c instance.Instance, oldName, new
 		}
 
 		// Restore the original value of "volatile.apply_template"
-		project := c.Project()
+		project := inst.Project()
 		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
 			id, err := tx.GetInstanceID(project, destName)
 			if err != nil {
@@ -419,8 +570,13 @@ func containerPostClusteringMigrate(d *Daemon, c instance.Instance, oldName, new
 	}
 
 	resources := map[string][]string{}
-	resources["containers"] = []string{oldName}
-	op, err := operations.OperationCreate(d.State(), c.Project(), operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil)
+	resources["instances"] = []string{oldName}
+
+	if inst.Type() == instancetype.Container {
+		resources["containers"] = resources["instances"]
+	}
+
+	op, err := operations.OperationCreate(d.State(), inst.Project(), operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -429,12 +585,12 @@ func containerPostClusteringMigrate(d *Daemon, c instance.Instance, oldName, new
 }
 
 // Special case migrating a container backed by ceph across two cluster nodes.
-func containerPostClusteringMigrateWithCeph(d *Daemon, c instance.Instance, projectName, oldName, newName, newNode string, instanceType instancetype.Type) response.Response {
-	run := func(*operations.Operation) error {
+func instancePostClusteringMigrateWithCeph(d *Daemon, inst instance.Instance, projectName, oldName, newName, newNode string, instanceType instancetype.Type) response.Response {
+	run := func(op *operations.Operation) error {
 		// If source node is online (i.e. we're serving the request on
 		// it, and c != nil), let's unmap the RBD volume locally
-		logger.Debugf(`Renaming RBD storage volume for source container "%s" from "%s" to "%s"`, c.Name(), c.Name(), newName)
-		poolName, err := c.StoragePool()
+		logger.Debugf(`Renaming RBD storage volume for source container "%s" from "%s" to "%s"`, inst.Name(), inst.Name(), newName)
+		poolName, err := inst.StoragePool()
 		if err != nil {
 			return errors.Wrap(err, "Failed to get source instance's storage pool name")
 		}
@@ -453,7 +609,7 @@ func containerPostClusteringMigrateWithCeph(d *Daemon, c instance.Instance, proj
 		}
 
 		// Trigger a rename in the Ceph driver.
-		err = pool.MigrateInstance(c, nil, &args, nil)
+		err = pool.MigrateInstance(inst, nil, &args, op)
 		if err != nil {
 			return errors.Wrap(err, "Failed to rename ceph RBD volume")
 		}
@@ -473,13 +629,12 @@ func containerPostClusteringMigrateWithCeph(d *Daemon, c instance.Instance, proj
 		}
 
 		// Create the container mount point on the target node
-		cert := d.endpoints.NetworkCert()
-		client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, projectName, newName, cert, instanceType)
+		client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, projectName, newName, d.endpoints.NetworkCert(), d.serverCert(), instanceType)
 		if err != nil {
 			return errors.Wrap(err, "Failed to connect to target node")
 		}
 		if client == nil {
-			err := containerPostCreateContainerMountPoint(d, projectName, newName)
+			err := instancePostCreateContainerMountPoint(d, projectName, newName)
 			if err != nil {
 				return errors.Wrap(err, "Failed to create mount point on target node")
 			}
@@ -498,7 +653,12 @@ func containerPostClusteringMigrateWithCeph(d *Daemon, c instance.Instance, proj
 	}
 
 	resources := map[string][]string{}
-	resources["containers"] = []string{oldName}
+	resources["instances"] = []string{oldName}
+
+	if inst.Type() == instancetype.Container {
+		resources["containers"] = resources["instances"]
+	}
+
 	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil)
 	if err != nil {
 		return response.InternalError(err)
@@ -512,9 +672,9 @@ func containerPostClusteringMigrateWithCeph(d *Daemon, c instance.Instance, proj
 // At the moment it's used for ceph-based containers, where the target node needs
 // to create the appropriate mount points.
 func internalClusterContainerMovedPost(d *Daemon, r *http.Request) response.Response {
-	project := projectParam(r)
+	projectName := projectParam(r)
 	containerName := mux.Vars(r)["name"]
-	err := containerPostCreateContainerMountPoint(d, project, containerName)
+	err := instancePostCreateContainerMountPoint(d, projectName, containerName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -523,7 +683,7 @@ func internalClusterContainerMovedPost(d *Daemon, r *http.Request) response.Resp
 
 // Used after to create the appropriate mounts point after a container has been
 // moved.
-func containerPostCreateContainerMountPoint(d *Daemon, project, containerName string) error {
+func instancePostCreateContainerMountPoint(d *Daemon, project, containerName string) error {
 	c, err := instance.LoadByProjectAndName(d.State(), project, containerName)
 	if err != nil {
 		return errors.Wrap(err, "Failed to load moved instance on target node")

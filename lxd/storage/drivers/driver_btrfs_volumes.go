@@ -68,16 +68,16 @@ func (d *btrfs) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Op
 			return err
 		}
 
-		// Allow unsafe resize of image volumes as filler won't have been able to resize the volume to the
-		// target size as volume file didn't exist then (and we can't create in advance because qemu-img
-		// truncates the file to image size).
-		if vol.volType == VolumeTypeImage {
-			vol.allowUnsafeResize = true
-		}
-
+		// Normally we pass VolumeTypeImage to unsupportedResizeTypes to ensureVolumeBlockFile as block
+		// image volumes cannot be resized because they have a readonly snapshot which the instances are
+		// created from, and that doesn't get updated when the original volumes size is changed.
+		// However during initial volume fill we allow growing of image volumes because the snapshot hasn't
+		// been taken yet. This is why no unsupported volume types are passed to ensureVolumeBlockFile.
+		// This is important, as combined with not setting allowUnsafeResize on the volume it still
+		// prevents us from accidentally shrinking the filled volume if it is larger than vol.ConfigSize().
+		// In that situation ensureVolumeBlockFile returns ErrCannotBeShrunk, but we ignore it as this just
+		// means the filler has needed to increase the volume size beyond the default block volume size.
 		_, err = ensureVolumeBlockFile(vol, rootBlockPath, sizeBytes)
-
-		// Ignore ErrCannotBeShrunk as this just means the filler has needed to increase the volume size.
 		if err != nil && errors.Cause(err) != ErrCannotBeShrunk {
 			return err
 		}
@@ -222,7 +222,7 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 		return "", fmt.Errorf("Could not find %q", srcFile)
 	}
 
-	// unpackVolume unpacks all subvolumes in an LXD volume from a backup tarball file.
+	// unpackVolume unpacks all subvolumes in a LXD volume from a backup tarball file.
 	unpackVolume := func(v Volume, srcFilePrefix string) error {
 		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(v.name)
 
@@ -404,7 +404,7 @@ func (d *btrfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bo
 			srcSnapshot := GetVolumeMountPath(d.name, srcVol.volType, GetSnapshotVolumeName(srcVol.name, snapName))
 			dstSnapshot := GetVolumeMountPath(d.name, vol.volType, GetSnapshotVolumeName(vol.name, snapName))
 
-			err = d.snapshotSubvolume(srcSnapshot, dstSnapshot, false)
+			err = d.snapshotSubvolume(srcSnapshot, dstSnapshot, true)
 			if err != nil {
 				return err
 			}
@@ -466,7 +466,7 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 		})
 	}
 
-	// receiveVolume receives all subvolumes in an LXD volume from the source.
+	// receiveVolume receives all subvolumes in a LXD volume from the source.
 	receiveVolume := func(v Volume, receivePath string) error {
 		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(v.name)
 
@@ -665,7 +665,12 @@ func (d *btrfs) SetVolumeQuota(vol Volume, size string, op *operations.Operation
 			return err
 		}
 
-		resized, err := ensureVolumeBlockFile(vol, rootBlockPath, sizeBytes)
+		// Pass VolumeTypeImage as unsupported resize type, as if the image volume doesn't match the
+		// requested size and vol.allowUnsafeResize=false, this needs to be rejected back to caller as
+		// ErrNotSupported so that the caller can take the appropriate action. In the case of optimized
+		// image volumes, this will cause the image volume to be deleted and regenerated with the new size.
+		// In other cases this is probably a bug and the operation should fail anyway.
+		resized, err := ensureVolumeBlockFile(vol, rootBlockPath, sizeBytes, VolumeTypeImage)
 		if err != nil {
 			return err
 		}
@@ -746,6 +751,18 @@ func (d *btrfs) SetVolumeQuota(vol Volume, size string, op *operations.Operation
 
 	// Modify the limit.
 	if sizeBytes > 0 {
+		// Custom handling for filesystem volume associated with a VM.
+		if vol.volType == VolumeTypeVM && shared.PathExists(filepath.Join(volPath, genericVolumeDiskFile)) {
+			// Get the size of the VM image.
+			blockSize, err := BlockDiskSizeBytes(filepath.Join(volPath, genericVolumeDiskFile))
+			if err != nil {
+				return err
+			}
+
+			// Add that to the requested filesystem size (to ignore it from the quota).
+			sizeBytes += blockSize
+		}
+
 		// Apply the limit.
 		_, err := shared.RunCommand("btrfs", "qgroup", "limit", fmt.Sprintf("%d", sizeBytes), volPath)
 		if err != nil {
@@ -961,7 +978,7 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 
 // BackupVolume copies a volume (and optionally its snapshots) to a specified target path.
 // This driver does not support optimized backups.
-func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWriter, optimized bool, snapshots bool, op *operations.Operation) error {
+func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWriter, optimized bool, snapshots []string, op *operations.Operation) error {
 	// Handle the non-optimized tarballs through the generic packer.
 	if !optimized {
 		// Because the generic backup method will not take a consistent backup if files are being modified
@@ -1005,19 +1022,17 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 	}
 
 	// Optimized backup.
-	var err error
-	var volSnapshots []string
 
-	// Retrieve the snapshots if requested.
-	if snapshots {
-		volSnapshots, err = d.VolumeSnapshots(vol, op)
+	if len(snapshots) > 0 {
+		// Check requested snapshot match those in storage.
+		err := vol.SnapshotsMatch(snapshots, op)
 		if err != nil {
 			return err
 		}
 	}
 
 	// Generate driver restoration header.
-	optimizedHeader, err := d.restorationHeader(vol, volSnapshots)
+	optimizedHeader, err := d.restorationHeader(vol, snapshots)
 	if err != nil {
 		return err
 	}
@@ -1153,7 +1168,7 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 
 	// Backup snapshots if populated.
 	lastVolPath := "" // Used as parent for differential exports.
-	for _, snapName := range volSnapshots {
+	for _, snapName := range snapshots {
 		snapVol, _ := vol.NewSnapshot(snapName)
 
 		// Make a binary btrfs backup.
@@ -1321,7 +1336,7 @@ func (d *btrfs) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) 
 	return forceUnmount(snapPath)
 }
 
-// VolumeSnapshots returns a list of snapshots for the volume.
+// VolumeSnapshots returns a list of snapshots for the volume (in no particular order).
 func (d *btrfs) VolumeSnapshots(vol Volume, op *operations.Operation) ([]string, error) {
 	return genericVFSVolumeSnapshots(d, vol, op)
 }

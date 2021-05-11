@@ -1,3 +1,4 @@
+//go:build linux && cgo && !agent
 // +build linux,cgo,!agent
 
 package db
@@ -5,8 +6,9 @@ package db
 import (
 	"fmt"
 
-	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/pkg/errors"
+
+	"github.com/lxc/lxd/lxd/db/query"
 )
 
 // Operation holds information about a single LXD operation running on a node
@@ -42,6 +44,56 @@ SELECT DISTINCT nodes.address
 	return query.SelectStrings(c.tx, stmt, project)
 }
 
+// GetOperationsOfType returns a list operations that belong to the specified project and have the desired type.
+func (c *ClusterTx) GetOperationsOfType(projectName string, opType OperationType) ([]Operation, error) {
+	var ops []Operation
+
+	stmt := `
+SELECT operations.id, operations.uuid, operations.type, nodes.address
+  FROM operations
+  LEFT JOIN projects on projects.id = operations.project_id
+  JOIN nodes on nodes.id = operations.node_id
+WHERE (projects.name = ? OR operations.project_id IS NULL) and operations.type = ?
+`
+	rows, err := c.tx.Query(stmt, projectName, opType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var op Operation
+		err := rows.Scan(&op.ID, &op.UUID, &op.Type, &op.NodeAddress)
+		if err != nil {
+			return nil, err
+		}
+
+		ops = append(ops, op)
+	}
+	if rows.Err() != nil {
+		return nil, err
+	}
+
+	return ops, nil
+}
+
+// GetOperationWithID returns the operation with the given ID.
+func (c *ClusterTx) GetOperationWithID(opID int) (Operation, error) {
+	null := Operation{}
+	operations, err := c.operations("id=?", opID)
+	if err != nil {
+		return null, err
+	}
+	switch len(operations) {
+	case 0:
+		return null, ErrNoSuchObject
+	case 1:
+		return operations[0], nil
+	default:
+		return null, fmt.Errorf("More than one operation matches")
+	}
+}
+
 // GetOperationByUUID returns the operation with the given UUID.
 func (c *ClusterTx) GetOperationByUUID(uuid string) (Operation, error) {
 	null := Operation{}
@@ -55,7 +107,7 @@ func (c *ClusterTx) GetOperationByUUID(uuid string) (Operation, error) {
 	case 1:
 		return operations[0], nil
 	default:
-		return null, fmt.Errorf("more than one node matches")
+		return null, fmt.Errorf("More than one operation matches")
 	}
 }
 

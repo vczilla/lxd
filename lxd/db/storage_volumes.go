@@ -1,3 +1,4 @@
+//go:build linux && cgo && !agent
 // +build linux,cgo,!agent
 
 package db
@@ -39,13 +40,14 @@ func (c *Cluster) GetStoragePoolVolumesNames(poolID int64) ([]string, error) {
 // GetStoragePoolVolumesWithType return a list of all volumes of the given type.
 func (c *Cluster) GetStoragePoolVolumesWithType(volumeType int) ([]StorageVolumeArgs, error) {
 	var id int64
+	var nodeID int64
 	var name string
 	var description string
 	var poolName string
 	var projectName string
 
 	stmt := `
-SELECT storage_volumes.id, storage_volumes.name, storage_volumes.description, storage_pools.name, projects.name
+SELECT storage_volumes.id, storage_volumes.name, storage_volumes.description, storage_pools.name, projects.name, IFNULL(storage_volumes.node_id, -1)
 FROM storage_volumes
 JOIN storage_pools ON storage_pools.id = storage_volumes.storage_pool_id
 JOIN projects ON projects.id = storage_volumes.project_id
@@ -53,7 +55,7 @@ WHERE storage_volumes.type = ?
 `
 
 	inargs := []interface{}{volumeType}
-	outargs := []interface{}{id, name, description, poolName, projectName}
+	outargs := []interface{}{id, name, description, poolName, projectName, nodeID}
 
 	result, err := queryScan(c, stmt, inargs, outargs)
 	if err != nil {
@@ -69,6 +71,7 @@ WHERE storage_volumes.type = ?
 			Description: r[2].(string),
 			PoolName:    r[3].(string),
 			ProjectName: r[4].(string),
+			NodeID:      r[5].(int64),
 		}
 
 		args.Config, err = c.storageVolumeConfigGet(args.ID, false)
@@ -78,6 +81,40 @@ WHERE storage_volumes.type = ?
 
 		response = append(response, args)
 	}
+
+	return response, nil
+}
+
+// GetStoragePoolVolumeWithID returns the volume with the given ID.
+func (c *Cluster) GetStoragePoolVolumeWithID(volumeID int) (StorageVolumeArgs, error) {
+	var response StorageVolumeArgs
+
+	stmt := `
+SELECT storage_volumes.id, storage_volumes.name, storage_volumes.description, storage_pools.name, storage_pools.type, projects.name
+FROM storage_volumes
+JOIN storage_pools ON storage_pools.id = storage_volumes.storage_pool_id
+JOIN projects ON projects.id = storage_volumes.project_id
+WHERE storage_volumes.id = ?
+`
+
+	inargs := []interface{}{volumeID}
+	outargs := []interface{}{&response.ID, &response.Name, &response.Description, &response.PoolName, &response.Type, &response.ProjectName}
+
+	err := dbQueryRowScan(c, stmt, inargs, outargs)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return StorageVolumeArgs{}, ErrNoSuchObject
+		}
+
+		return StorageVolumeArgs{}, err
+	}
+
+	response.Config, err = c.storageVolumeConfigGet(response.ID, false)
+	if err != nil {
+		return StorageVolumeArgs{}, err
+	}
+
+	response.TypeName = StoragePoolVolumeTypeNames[response.Type]
 
 	return response, nil
 }
@@ -129,7 +166,7 @@ SELECT DISTINCT node_id
 		volumes = append(volumes, nodeVolumes...)
 	}
 
-	isRemoteStorage, err := c.isRemoteStorage(poolID)
+	isRemoteStorage, err := c.IsRemoteStorage(poolID)
 	if err != nil {
 		return nil, err
 	}
@@ -257,6 +294,7 @@ SELECT storage_volumes_snapshots.name, storage_volumes_snapshots.description FRO
 			Name:        volumeName + shared.SnapshotDelimiter + r[0].(string),
 			Description: r[1].(string),
 			Snapshot:    true,
+			ProjectName: projectName,
 		}
 		result = append(result, row)
 	}
@@ -280,7 +318,7 @@ func (c *Cluster) storagePoolVolumeGetType(project string, volumeName string, vo
 		return -1, nil, err
 	}
 
-	isRemoteStorage, err := c.isRemoteStorage(poolID)
+	isRemoteStorage, err := c.IsRemoteStorage(poolID)
 	if err != nil {
 		return -1, nil, err
 	}
@@ -581,6 +619,14 @@ const (
 	StoragePoolVolumeTypeNameCustom    string = "custom"
 )
 
+// StoragePoolVolumeTypeNames represents a map of storage volume types and their names.
+var StoragePoolVolumeTypeNames = map[int]string{
+	StoragePoolVolumeTypeContainer: "container",
+	StoragePoolVolumeTypeImage:     "image",
+	StoragePoolVolumeTypeCustom:    "custom",
+	StoragePoolVolumeTypeVM:        "virtual-machine",
+}
+
 // Content types.
 const (
 	StoragePoolVolumeContentTypeFS = iota
@@ -619,6 +665,8 @@ type StorageVolumeArgs struct {
 	ProjectName string
 
 	ContentType string
+
+	NodeID int64
 }
 
 // GetStorageVolumeNodes returns the node info of all nodes on which the volume with the given name is defined.
@@ -785,6 +833,8 @@ func (c *Cluster) getStorageVolumeContentType(volumeID int64) (int, error) {
 // Note, the code below doesn't deal with snapshots of snapshots.
 // To do that, we'll need to weed out based on # slashes in names
 func (c *Cluster) GetNextStorageVolumeSnapshotIndex(pool, name string, typ int, pattern string) int {
+	remoteDrivers := StorageRemoteDriverNames()
+
 	q := fmt.Sprintf(`
 SELECT storage_volumes_snapshots.name FROM storage_volumes_snapshots
   JOIN storage_volumes ON storage_volumes_snapshots.storage_volume_id=storage_volumes.id
@@ -792,10 +842,16 @@ SELECT storage_volumes_snapshots.name FROM storage_volumes_snapshots
  WHERE storage_volumes.type=?
    AND storage_volumes.name=?
    AND storage_pools.name=?
-`)
+   AND (storage_volumes.node_id=? OR storage_volumes.node_id IS NULL AND storage_pools.driver IN %s)
+`, query.Params(len(remoteDrivers)))
 	var numstr string
-	inargs := []interface{}{typ, name, pool}
+	inargs := []interface{}{typ, name, pool, c.nodeID}
 	outfmt := []interface{}{numstr}
+
+	for _, driver := range remoteDrivers {
+		inargs = append(inargs, driver)
+	}
+
 	results, err := queryScan(c, q, inargs, outfmt)
 	if err != nil {
 		return 0

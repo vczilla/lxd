@@ -6,8 +6,10 @@ import (
 	"github.com/pkg/errors"
 
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
+	pcidev "github.com/lxc/lxd/lxd/device/pci"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/ip"
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/util"
@@ -30,13 +32,14 @@ func (d *nicPhysical) validateConfig(instConf instance.ConfigReader) error {
 		"maas.subnet.ipv4",
 		"maas.subnet.ipv6",
 		"boot.priority",
+		"gvrp",
 	}
 
-	if instConf.Type() == instancetype.Container {
+	if instConf.Type() == instancetype.Container || instConf.Type() == instancetype.Any {
 		optionalFields = append(optionalFields, "mtu", "hwaddr", "vlan")
 	}
 
-	err := d.config.Validate(nicValidationRules(requiredFields, optionalFields))
+	err := d.config.Validate(nicValidationRules(requiredFields, optionalFields, instConf))
 	if err != nil {
 		return err
 	}
@@ -46,6 +49,10 @@ func (d *nicPhysical) validateConfig(instConf instance.ConfigReader) error {
 
 // validateEnvironment checks the runtime environment for correctness.
 func (d *nicPhysical) validateEnvironment() error {
+	if d.inst.Type() == instancetype.VM && shared.IsTrue(d.inst.ExpandedConfig()["migration.stateful"]) {
+		return fmt.Errorf("Network physical devices cannot be used when migration.stateful is enabled")
+	}
+
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
 		return fmt.Errorf("Requires name property to start")
 	}
@@ -88,7 +95,7 @@ func (d *nicPhysical) Start() (*deviceConfig.RunConfig, error) {
 	saveData["host_name"] = network.GetHostDevice(d.config["parent"], d.config["vlan"])
 
 	if d.inst.Type() == instancetype.Container {
-		statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], saveData["host_name"], d.config["vlan"])
+		statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], saveData["host_name"], d.config["vlan"], shared.IsTrue(d.config["gvrp"]))
 		if err != nil {
 			return nil, err
 		}
@@ -113,7 +120,8 @@ func (d *nicPhysical) Start() (*deviceConfig.RunConfig, error) {
 
 		// Set the MAC address.
 		if d.config["hwaddr"] != "" {
-			_, err := shared.RunCommand("ip", "link", "set", "dev", saveData["host_name"], "address", d.config["hwaddr"])
+			link := &ip.Link{Name: saveData["host_name"]}
+			err := link.SetAddress(d.config["hwaddr"])
 			if err != nil {
 				return nil, fmt.Errorf("Failed to set the MAC address: %s", err)
 			}
@@ -129,7 +137,7 @@ func (d *nicPhysical) Start() (*deviceConfig.RunConfig, error) {
 	} else if d.inst.Type() == instancetype.VM {
 		// Get PCI information about the network interface.
 		ueventPath := fmt.Sprintf("/sys/class/net/%s/device/uevent", saveData["host_name"])
-		pciDev, err := pciParseUeventFile(ueventPath)
+		pciDev, err := pcidev.ParseUeventFile(ueventPath)
 		if err != nil {
 			return nil, errors.Wrapf(err, "Failed to get PCI device info for %q", saveData["host_name"])
 		}
@@ -137,7 +145,7 @@ func (d *nicPhysical) Start() (*deviceConfig.RunConfig, error) {
 		saveData["last_state.pci.slot.name"] = pciDev.SlotName
 		saveData["last_state.pci.driver"] = pciDev.Driver
 
-		err = pciDeviceDriverOverride(pciDev, "vfio-pci")
+		err = pcidev.DeviceDriverOverride(pciDev, "vfio-pci")
 		if err != nil {
 			return nil, err
 		}
@@ -152,8 +160,8 @@ func (d *nicPhysical) Start() (*deviceConfig.RunConfig, error) {
 
 	runConf := deviceConfig.RunConfig{}
 	runConf.NetworkInterface = []deviceConfig.RunConfigItem{
-		{Key: "name", Value: d.config["name"]},
 		{Key: "type", Value: "phys"},
+		{Key: "name", Value: d.config["name"]},
 		{Key: "flags", Value: "up"},
 		{Key: "link", Value: saveData["host_name"]},
 	}
@@ -198,12 +206,12 @@ func (d *nicPhysical) postStop() error {
 
 	// If VM physical pass through, unbind from vfio-pci and bind back to host driver.
 	if d.inst.Type() == instancetype.VM && v["last_state.pci.slot.name"] != "" {
-		vfioDev := pciDevice{
+		vfioDev := pcidev.Device{
 			Driver:   "vfio-pci",
 			SlotName: v["last_state.pci.slot.name"],
 		}
 
-		err := pciDeviceDriverOverride(vfioDev, v["last_state.pci.driver"])
+		err := pcidev.DeviceDriverOverride(vfioDev, v["last_state.pci.driver"])
 		if err != nil {
 			return err
 		}

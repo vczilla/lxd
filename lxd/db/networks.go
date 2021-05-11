@@ -1,3 +1,4 @@
+//go:build linux && cgo && !agent
 // +build linux,cgo,!agent
 
 package db
@@ -160,6 +161,28 @@ func (c *ClusterTx) GetNetworkID(projectName string, name string) (int64, error)
 	default:
 		return -1, fmt.Errorf("More than one network has the given name")
 	}
+}
+
+// GetNetworkNameAndProjectWithID returns the network name and project name for the given ID.
+func (c *Cluster) GetNetworkNameAndProjectWithID(networkID int) (string, string, error) {
+	var networkName string
+	var projectName string
+
+	q := `SELECT networks.name, projects.name FROM networks JOIN projects ON projects.id=networks.project_id WHERE networks.id=?`
+
+	inargs := []interface{}{networkID}
+	outargs := []interface{}{&networkName, &projectName}
+
+	err := dbQueryRowScan(c, q, inargs, outargs)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", "", ErrNoSuchObject
+		}
+
+		return "", "", err
+	}
+
+	return networkName, projectName, nil
 }
 
 // CreateNetworkConfig adds a new entry in the networks_config table

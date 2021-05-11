@@ -43,12 +43,6 @@ strict = "on"
 # Console
 [chardev "console"]
 backend = "pty"
-
-# Graphical console
-[spice]
-unix = "on"
-addr = "{{.spicePath}}"
-disable-ticketing = "on"
 `))
 
 var qemuMemory = template.Must(template.New("qemuMemory").Parse(`
@@ -259,7 +253,7 @@ mem-path = "{{$hugepages}}"
 prealloc = "on"
 discard-data = "on"
 {{- else}}
-qom-type = "memory-backend-ram"
+qom-type = "memory-backend-memfd"
 {{- end }}
 size = "{{$memory}}M"
 host-nodes = "{{$element}}"
@@ -438,12 +432,17 @@ if = "none"
 cache = "{{.cacheMode}}"
 aio = "{{.aioMode}}"
 discard = "on"
+media = "{{.media}}"
 {{if .shared -}}
 file.locking = "off"
 {{- end }}
 
 [device "dev-lxd_{{.devName}}"]
+{{- if eq .media "disk" }}
 driver = "scsi-hd"
+{{- else}}
+driver = "scsi-cd"
+{{- end }}
 bus = "qemu_scsi.0"
 channel = "0"
 scsi-id = "{{.bootIndex}}"
@@ -470,7 +469,9 @@ netdev = "lxd_{{.devName}}"
 mac = "{{.devHwaddr}}"
 {{ if ne .vectors 0 -}}
 mq = "on"
+{{- if eq .bus "pci" "pcie"}}
 vectors = "{{.vectors}}"
+{{- end}}
 {{- end}}
 bootindex = "{{.bootIndex}}"
 {{if .multifunction -}}
@@ -504,7 +505,7 @@ fd = "{{.tapFD}}"
 `))
 
 // Devices use "lxd_" prefix indicating that this is a user named device.
-var qemuNetDevPhysical = template.Must(template.New("qemuNetDevPhysical").Parse(`
+var qemuPCIPhysical = template.Must(template.New("qemuPCIPhysical").Parse(`
 # Network card ("{{.devName}}" device)
 [device "dev-lxd_{{.devName}}"]
 {{- if eq .bus "pci" "pcie"}}
@@ -516,7 +517,9 @@ addr = "{{.devAddr}}"
 driver = "vfio-ccw"
 {{- end}}
 host = "{{.pciSlotName}}"
+{{if .bootIndex -}}
 bootindex = "{{.bootIndex}}"
+{{- end }}
 {{if .multifunction -}}
 multifunction = "on"
 {{- end }}

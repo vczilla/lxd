@@ -29,7 +29,7 @@ func (d *infinibandSRIOV) validateConfig(instConf instance.ConfigReader) error {
 		"hwaddr",
 	}
 
-	rules := nicValidationRules(requiredFields, optionalFields)
+	rules := nicValidationRules(requiredFields, optionalFields, instConf)
 	rules["hwaddr"] = func(value string) error {
 		if value == "" {
 			return nil
@@ -81,7 +81,7 @@ func (d *infinibandSRIOV) Start() (*deviceConfig.RunConfig, error) {
 	delete(ibDevs, d.config["parent"])
 
 	// Load any interfaces already allocated to other devices.
-	reservedDevices, err := instanceGetReservedDevices(d.state, d.config)
+	reservedDevices, err := network.SRIOVGetHostDevicesInUse(d.state)
 	if err != nil {
 		return nil, err
 	}
@@ -140,8 +140,8 @@ func (d *infinibandSRIOV) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	runConf.NetworkInterface = []deviceConfig.RunConfigItem{
-		{Key: "name", Value: d.config["name"]},
 		{Key: "type", Value: "phys"},
+		{Key: "name", Value: d.config["name"]},
 		{Key: "flags", Value: "up"},
 		{Key: "link", Value: saveData["host_name"]},
 	}

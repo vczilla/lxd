@@ -1,13 +1,9 @@
 package network
 
 import (
-	"bufio"
 	"encoding/binary"
 	"fmt"
-	"hash/fnv"
-	"io"
 	"io/ioutil"
-	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -25,6 +21,9 @@ import (
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/dnsmasq"
 	"github.com/lxc/lxd/lxd/dnsmasq/dhcpalloc"
+	firewallDrivers "github.com/lxc/lxd/lxd/firewall/drivers"
+	"github.com/lxc/lxd/lxd/ip"
+	"github.com/lxc/lxd/lxd/network/acl"
 	"github.com/lxc/lxd/lxd/network/openvswitch"
 	"github.com/lxc/lxd/lxd/node"
 	"github.com/lxc/lxd/lxd/revert"
@@ -61,7 +60,7 @@ func (n *bridge) DBType() db.NetworkType {
 }
 
 // checkClusterWideMACSafe returns whether it is safe to use the same MAC address for the bridge interface on all
-// cluster nodes. It is not suitable to use a static MAC address when "bridge.external_interfaces" is non-empty an
+// cluster nodes. It is not suitable to use a static MAC address when "bridge.external_interfaces" is non-empty and
 // the bridge interface has no IPv4 or IPv6 address set. This is because in a clustered environment the same bridge
 // config is applied to all nodes, and if the bridge is being used to connect multiple nodes to the same network
 // segment it would cause MAC conflicts to use the the same MAC on all nodes. If an IP address is specified then
@@ -170,7 +169,7 @@ func (n *bridge) populateAutoConfig(config map[string]string) error {
 
 // ValidateName validates network name.
 func (n *bridge) ValidateName(name string) error {
-	err := validInterfaceName(name)
+	err := validate.IsInterfaceName(name)
 	if err != nil {
 		return err
 	}
@@ -189,7 +188,7 @@ func (n *bridge) Validate(config map[string]string) error {
 		"bridge.external_interfaces": validate.Optional(func(value string) error {
 			for _, entry := range strings.Split(value, ",") {
 				entry = strings.TrimSpace(entry)
-				if err := validInterfaceName(entry); err != nil {
+				if err := validate.IsInterfaceName(entry); err != nil {
 					return errors.Wrapf(err, "Invalid interface name %q", entry)
 				}
 			}
@@ -255,17 +254,23 @@ func (n *bridge) Validate(config map[string]string) error {
 		"ipv6.routes":        validate.Optional(validate.IsNetworkV6List),
 		"ipv6.routing":       validate.Optional(validate.IsBool),
 		"ipv6.ovn.ranges":    validate.Optional(validate.IsNetworkRangeV6List),
-
-		"dns.domain": validate.IsAny,
-		"dns.search": validate.IsAny,
+		"dns.domain":         validate.IsAny,
+		"dns.search":         validate.IsAny,
 		"dns.mode": func(value string) error {
 			return validate.IsOneOf(value, []string{"dynamic", "managed", "none"})
 		},
-
-		"raw.dnsmasq": validate.IsAny,
-
+		"raw.dnsmasq":      validate.IsAny,
 		"maas.subnet.ipv4": validate.IsAny,
 		"maas.subnet.ipv6": validate.IsAny,
+		"security.acls":    validate.IsAny,
+		"security.acls.default.ingress.action": validate.Optional(func(value string) error {
+			return validate.IsOneOf(value, acl.ValidActions)
+		}),
+		"security.acls.default.egress.action": validate.Optional(func(value string) error {
+			return validate.IsOneOf(value, acl.ValidActions)
+		}),
+		"security.acls.default.ingress.logged": validate.Optional(validate.IsBool),
+		"security.acls.default.egress.logged":  validate.Optional(validate.IsBool),
 	}
 
 	// Add dynamic validation rules.
@@ -301,7 +306,7 @@ func (n *bridge) Validate(config map[string]string) error {
 			case "id":
 				rules[k] = validate.Optional(validate.IsInt64)
 			case "inteface":
-				rules[k] = validInterfaceName
+				rules[k] = validate.IsInterfaceName
 			case "ttl":
 				rules[k] = validate.Optional(validate.IsUint8)
 			}
@@ -388,10 +393,24 @@ func (n *bridge) Validate(config map[string]string) error {
 			allowedNets = append(allowedNets, dhcpSubnet)
 		}
 
-		_, err := parseIPRanges(config["ipv4.ovn.ranges"], allowedNets...)
+		ovnRanges, err := parseIPRanges(config["ipv4.ovn.ranges"], allowedNets...)
 		if err != nil {
 			return errors.Wrapf(err, "Failed parsing ipv4.ovn.ranges")
 		}
+
+		dhcpRanges, err := parseIPRanges(config["ipv4.dhcp.ranges"], allowedNets...)
+		if err != nil {
+			return errors.Wrapf(err, "Failed parsing ipv4.dhcp.ranges")
+		}
+
+		for _, ovnRange := range ovnRanges {
+			for _, dhcpRange := range dhcpRanges {
+				if IPRangesOverlap(ovnRange, dhcpRange) {
+					return fmt.Errorf(`The range specified in "ipv4.ovn.ranges" (%q) cannot overlap with "ipv4.dhcp.ranges"`, ovnRange)
+				}
+			}
+		}
+
 	}
 
 	// Check IPv6 OVN ranges.
@@ -407,9 +426,34 @@ func (n *bridge) Validate(config map[string]string) error {
 			allowedNets = append(allowedNets, dhcpSubnet)
 		}
 
-		_, err := parseIPRanges(config["ipv6.ovn.ranges"], allowedNets...)
+		ovnRanges, err := parseIPRanges(config["ipv6.ovn.ranges"], allowedNets...)
 		if err != nil {
 			return errors.Wrapf(err, "Failed parsing ipv6.ovn.ranges")
+		}
+
+		// If stateful DHCPv6 is enabled, check OVN ranges don't overlap with DHCPv6 stateful ranges.
+		// Otherwise SLAAC will be being used to generate client IPs and predefined ranges aren't used.
+		if dhcpSubnet != nil && shared.IsTrue(config["ipv6.dhcp.stateful"]) {
+			dhcpRanges, err := parseIPRanges(config["ipv6.dhcp.ranges"], allowedNets...)
+			if err != nil {
+				return errors.Wrapf(err, "Failed parsing ipv6.dhcp.ranges")
+			}
+
+			for _, ovnRange := range ovnRanges {
+				for _, dhcpRange := range dhcpRanges {
+					if IPRangesOverlap(ovnRange, dhcpRange) {
+						return fmt.Errorf(`The range specified in "ipv6.ovn.ranges" (%q) cannot overlap with "ipv6.dhcp.ranges"`, ovnRange)
+					}
+				}
+			}
+		}
+	}
+
+	// Check Security ACLs are supported and exist.
+	if config["security.acls"] != "" {
+		err = acl.Exists(n.state, n.Project(), util.SplitNTrimSpace(config["security.acls"], ",", -1, true)...)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -533,11 +577,15 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			}
 			revert.Add(func() { ovs.BridgeDelete(n.name) })
 		} else {
-			_, err := shared.RunCommand("ip", "link", "add", "dev", n.name, "type", "bridge")
+
+			bridge := &ip.Bridge{
+				Link: ip.Link{Name: n.name},
+			}
+			err := bridge.Add()
 			if err != nil {
 				return err
 			}
-			revert.Add(func() { shared.RunCommand("ip", "link", "delete", "dev", n.name) })
+			revert.Add(func() { bridge.Delete() })
 		}
 	}
 
@@ -570,7 +618,8 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	// Cleanup any existing tunnel device.
 	for _, iface := range ifaces {
 		if strings.HasPrefix(iface.Name, fmt.Sprintf("%s-", n.name)) {
-			_, err = shared.RunCommand("ip", "link", "del", "dev", iface.Name)
+			link := &ip.Link{Name: iface.Name}
+			err = link.Delete()
 			if err != nil {
 				return err
 			}
@@ -593,10 +642,13 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 
 	// Attempt to add a dummy device to the bridge to force the MTU.
 	if mtu != "" && n.config["bridge.driver"] != "openvswitch" {
-		_, err = shared.RunCommand("ip", "link", "add", "dev", fmt.Sprintf("%s-mtu", n.name), "mtu", mtu, "type", "dummy")
+		dummy := &ip.Dummy{
+			Link: ip.Link{Name: fmt.Sprintf("%s-mtu", n.name), Mtu: mtu},
+		}
+		err = dummy.Add()
 		if err == nil {
-			revert.Add(func() { shared.RunCommand("ip", "link", "delete", "dev", fmt.Sprintf("%s-mtu", n.name)) })
-			_, err = shared.RunCommand("ip", "link", "set", "dev", fmt.Sprintf("%s-mtu", n.name), "up")
+			revert.Add(func() { dummy.Delete() })
+			err = dummy.SetUp()
 			if err == nil {
 				AttachInterface(n.name, fmt.Sprintf("%s-mtu", n.name))
 			}
@@ -608,7 +660,8 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		mtu = "1500"
 	}
 
-	_, err = shared.RunCommand("ip", "link", "set", "dev", n.name, "mtu", mtu)
+	link := &ip.Link{Name: n.name}
+	err = link.SetMtu(mtu)
 	if err != nil {
 		return err
 	}
@@ -621,12 +674,12 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		var seedNodeID int64
 
 		if n.checkClusterWideMACSafe(n.config) != nil {
-			// Use cluster node's ID to g enerate a stable per-node & network derived random MAC in fan
-			// mode or when cluster-wide MAC addresses are unsafe.
+			// If not safe to use a cluster wide MAC or in in fan mode, then use cluster node's ID to
+			// generate a stable per-node & network derived random MAC.
 			seedNodeID = n.state.Cluster.GetNodeID()
 		} else {
-			// Use a static cluster node of 0 to generate a stable per-network derived random MAC if
-			// safe to do so.
+			// If safe to use a cluster wide MAC, then use a static cluster node of 0 to generate a
+			// stable per-network derived random MAC.
 			seedNodeID = 0
 		}
 
@@ -637,28 +690,23 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		// Generate the random seed, this uses the server certificate fingerprint (to ensure that multiple
-		// standalone nodes on the same external network don't generate the same MAC for their networks).
-		// It relies on the certificate being the same for all nodes in a cluster to allow the same MAC to
-		// be generated on each bridge interface in the network (if safe to do so).
+		// standalone nodes with the same network ID connected to the same external network don't generate
+		// the same MAC for their networks). It relies on the certificate being the same for all nodes in a
+		// cluster to allow the same MAC to be generated on each bridge interface in the network when
+		// seedNodeID is 0 (when safe to do so).
 		seed := fmt.Sprintf("%s.%d.%d", cert.Fingerprint(), seedNodeID, n.ID())
-
-		// Generate a hash from the randSourceNodeID and network ID to use as seed for random MAC.
-		// Use the FNV-1a hash algorithm to convert our seed string into an int64 for use as seed.
-		hash := fnv.New64a()
-		_, err = io.WriteString(hash, seed)
+		r, err := util.GetStableRandomGenerator(seed)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed generating stable random bridge MAC")
 		}
 
-		// Initialise a non-cryptographic random number generator using the stable seed.
-		r := rand.New(rand.NewSource(int64(hash.Sum64())))
 		hwAddr = randomHwaddr(r)
 		n.logger.Debug("Stable MAC generated", log.Ctx{"seed": seed, "hwAddr": hwAddr})
 	}
 
 	// Set the MAC address on the bridge interface if specified.
 	if hwAddr != "" {
-		_, err = shared.RunCommand("ip", "link", "set", "dev", n.name, "address", hwAddr)
+		err = link.SetAddress(hwAddr)
 		if err != nil {
 			return err
 		}
@@ -679,7 +727,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	}
 
 	// Bring it up.
-	_, err = shared.RunCommand("ip", "link", "set", "dev", n.name, "up")
+	err = link.SetUp()
 	if err != nil {
 		return err
 	}
@@ -717,12 +765,38 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 	}
 
-	// Remove any existing IPv4 firewall rules.
+	// Remove any existing firewall rules.
+	fwClearIPVersions := []uint{}
+
 	if usesIPv4Firewall(n.config) || usesIPv4Firewall(oldConfig) {
-		err = n.state.Firewall.NetworkClear(n.name, 4)
+		fwClearIPVersions = append(fwClearIPVersions, 4)
+	}
+
+	if usesIPv6Firewall(n.config) || usesIPv6Firewall(oldConfig) {
+		fwClearIPVersions = append(fwClearIPVersions, 6)
+	}
+
+	if len(fwClearIPVersions) > 0 {
+		n.logger.Debug("Clearing firewall")
+		err = n.state.Firewall.NetworkClear(n.name, false, fwClearIPVersions)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed clearing firewall")
 		}
+	}
+
+	// Initialise a new firewall option set.
+	fwOpts := firewallDrivers.Opts{}
+
+	if n.hasIPv4Firewall() {
+		fwOpts.FeaturesV4 = &firewallDrivers.FeatureOpts{}
+	}
+
+	if n.hasIPv6Firewall() {
+		fwOpts.FeaturesV6 = &firewallDrivers.FeatureOpts{}
+	}
+
+	if n.config["security.acls"] != "" {
+		fwOpts.ACL = true
 	}
 
 	// Snapshot container specific IPv4 routes (added with boot proto) before removing IPv4 addresses.
@@ -733,32 +807,30 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	}
 
 	// Flush all IPv4 addresses and routes.
-	_, err = shared.RunCommand("ip", "-4", "addr", "flush", "dev", n.name, "scope", "global")
+	addr := &ip.Addr{
+		DevName: n.name,
+		Scope:   "global",
+		Family:  ip.FamilyV4,
+	}
+	err = addr.Flush()
 	if err != nil {
 		return err
 	}
 
-	_, err = shared.RunCommand("ip", "-4", "route", "flush", "dev", n.name, "proto", "static")
+	r := &ip.Route{
+		DevName: n.name,
+		Proto:   "static",
+		Family:  ip.FamilyV4,
+	}
+	err = r.Flush()
 	if err != nil {
 		return err
 	}
 
 	// Configure IPv4 firewall (includes fan).
 	if n.config["bridge.mode"] == "fan" || !shared.StringInSlice(n.config["ipv4.address"], []string{"", "none"}) {
-		if n.DHCPv4Subnet() != nil && n.hasIPv4Firewall() {
-			// Setup basic iptables overrides for DHCP/DNS.
-			err = n.state.Firewall.NetworkSetupDHCPDNSAccess(n.name, 4)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Attempt a workaround for broken DHCP clients.
-		if n.hasIPv4Firewall() {
-			err = n.state.Firewall.NetworkSetupDHCPv4Checksum(n.name)
-			if err != nil {
-				return err
-			}
+		if n.hasDHCPv4() && n.hasIPv4Firewall() {
+			fwOpts.FeaturesV4.DHCPDNSAccess = true
 		}
 
 		// Allow forwarding.
@@ -769,17 +841,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			}
 
 			if n.hasIPv4Firewall() {
-				err = n.state.Firewall.NetworkSetupForwardingPolicy(n.name, 4, true)
-				if err != nil {
-					return err
-				}
-			}
-		} else {
-			if n.hasIPv4Firewall() {
-				err = n.state.Firewall.NetworkSetupForwardingPolicy(n.name, 4, false)
-				if err != nil {
-					return err
-				}
+				fwOpts.FeaturesV4.ForwardingAllow = true
 			}
 		}
 	}
@@ -815,13 +877,13 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	// Configure IPv4.
 	if !shared.StringInSlice(n.config["ipv4.address"], []string{"", "none"}) {
 		// Parse the subnet.
-		ip, subnet, err := net.ParseCIDR(n.config["ipv4.address"])
+		ipAddress, subnet, err := net.ParseCIDR(n.config["ipv4.address"])
 		if err != nil {
 			return errors.Wrapf(err, "Failed parsing ipv4.address")
 		}
 
 		// Update the dnsmasq config.
-		dnsmasqCmd = append(dnsmasqCmd, fmt.Sprintf("--listen-address=%s", ip.String()))
+		dnsmasqCmd = append(dnsmasqCmd, fmt.Sprintf("--listen-address=%s", ipAddress.String()))
 		if n.DHCPv4Subnet() != nil {
 			if !shared.StringInSlice("--dhcp-no-override", dnsmasqCmd) {
 				dnsmasqCmd = append(dnsmasqCmd, []string{"--dhcp-no-override", "--dhcp-authoritative", fmt.Sprintf("--dhcp-leasefile=%s", shared.VarPath("networks", n.name, "dnsmasq.leases")), fmt.Sprintf("--dhcp-hostsfile=%s", shared.VarPath("networks", n.name, "dnsmasq.hosts"))}...)
@@ -856,12 +918,17 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		// Add the address.
-		_, err = shared.RunCommand("ip", "-4", "addr", "add", "dev", n.name, n.config["ipv4.address"])
+		addr := &ip.Addr{
+			DevName: n.name,
+			Address: n.config["ipv4.address"],
+			Family:  ip.FamilyV4,
+		}
+		err = addr.Add()
 		if err != nil {
 			return err
 		}
 
-		// Configure NAT
+		// Configure NAT.
 		if shared.IsTrue(n.config["ipv4.nat"]) {
 			//If a SNAT source address is specified, use that, otherwise default to MASQUERADE mode.
 			var srcIP net.IP
@@ -869,16 +936,13 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 				srcIP = net.ParseIP(n.config["ipv4.nat.address"])
 			}
 
+			fwOpts.SNATV4 = &firewallDrivers.SNATOpts{
+				SNATAddress: srcIP,
+				Subnet:      subnet,
+			}
+
 			if n.config["ipv4.nat.order"] == "after" {
-				err = n.state.Firewall.NetworkSetupOutboundNAT(n.name, subnet, srcIP, true)
-				if err != nil {
-					return err
-				}
-			} else {
-				err = n.state.Firewall.NetworkSetupOutboundNAT(n.name, subnet, srcIP, false)
-				if err != nil {
-					return err
-				}
+				fwOpts.SNATV4.Append = true
 			}
 		}
 
@@ -886,7 +950,13 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		if n.config["ipv4.routes"] != "" {
 			for _, route := range strings.Split(n.config["ipv4.routes"], ",") {
 				route = strings.TrimSpace(route)
-				_, err = shared.RunCommand("ip", "-4", "route", "add", "dev", n.name, route, "proto", "static")
+				r := &ip.Route{
+					DevName: n.name,
+					Route:   route,
+					Proto:   "static",
+					Family:  ip.FamilyV4,
+				}
+				err = r.Add()
 				if err != nil {
 					return err
 				}
@@ -897,14 +967,6 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		n.applyBootRoutesV4(ctRoutes)
 	}
 
-	// Remove any existing IPv6 firewall rules.
-	if usesIPv6Firewall(n.config) || usesIPv6Firewall(oldConfig) {
-		err = n.state.Firewall.NetworkClear(n.name, 6)
-		if err != nil {
-			return err
-		}
-	}
-
 	// Snapshot container specific IPv6 routes (added with boot proto) before removing IPv6 addresses.
 	// This is because the kernel removes any static routes on an interface when all addresses removed.
 	ctRoutes, err = n.bootRoutesV6()
@@ -913,12 +975,22 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	}
 
 	// Flush all IPv6 addresses and routes.
-	_, err = shared.RunCommand("ip", "-6", "addr", "flush", "dev", n.name, "scope", "global")
+	addr = &ip.Addr{
+		DevName: n.name,
+		Scope:   "global",
+		Family:  ip.FamilyV6,
+	}
+	err = addr.Flush()
 	if err != nil {
 		return err
 	}
 
-	_, err = shared.RunCommand("ip", "-6", "route", "flush", "dev", n.name, "proto", "static")
+	r = &ip.Route{
+		DevName: n.name,
+		Proto:   "static",
+		Family:  ip.FamilyV6,
+	}
+	err = r.Flush()
 	if err != nil {
 		return err
 	}
@@ -932,7 +1004,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		// Parse the subnet.
-		ip, subnet, err := net.ParseCIDR(n.config["ipv6.address"])
+		ipAddress, subnet, err := net.ParseCIDR(n.config["ipv6.address"])
 		if err != nil {
 			return errors.Wrapf(err, "Failed parsing ipv6.address")
 		}
@@ -943,14 +1015,10 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		// Update the dnsmasq config.
-		dnsmasqCmd = append(dnsmasqCmd, []string{fmt.Sprintf("--listen-address=%s", ip.String()), "--enable-ra"}...)
+		dnsmasqCmd = append(dnsmasqCmd, []string{fmt.Sprintf("--listen-address=%s", ipAddress.String()), "--enable-ra"}...)
 		if n.DHCPv6Subnet() != nil {
-			if n.config["ipv6.firewall"] == "" || shared.IsTrue(n.config["ipv6.firewall"]) {
-				// Setup basic iptables overrides for DHCP/DNS.
-				err = n.state.Firewall.NetworkSetupDHCPDNSAccess(n.name, 6)
-				if err != nil {
-					return err
-				}
+			if n.hasIPv6Firewall() {
+				fwOpts.FeaturesV6.DHCPDNSAccess = true
 			}
 
 			// Build DHCP configuration.
@@ -1008,44 +1076,37 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 				}
 			}
 
-			if n.config["ipv6.firewall"] == "" || shared.IsTrue(n.config["ipv6.firewall"]) {
-				err = n.state.Firewall.NetworkSetupForwardingPolicy(n.name, 6, true)
-				if err != nil {
-					return err
-				}
-			}
-		} else {
-			if n.config["ipv6.firewall"] == "" || shared.IsTrue(n.config["ipv6.firewall"]) {
-				err = n.state.Firewall.NetworkSetupForwardingPolicy(n.name, 6, false)
-				if err != nil {
-					return err
-				}
+			if n.hasIPv6Firewall() {
+				fwOpts.FeaturesV6.ForwardingAllow = true
 			}
 		}
 
 		// Add the address.
-		_, err = shared.RunCommand("ip", "-6", "addr", "add", "dev", n.name, n.config["ipv6.address"])
+		addr := &ip.Addr{
+			DevName: n.name,
+			Address: n.config["ipv6.address"],
+			Family:  ip.FamilyV6,
+		}
+		err = addr.Add()
 		if err != nil {
 			return err
 		}
 
 		// Configure NAT.
 		if shared.IsTrue(n.config["ipv6.nat"]) {
+			//If a SNAT source address is specified, use that, otherwise default to MASQUERADE mode.
 			var srcIP net.IP
 			if n.config["ipv6.nat.address"] != "" {
 				srcIP = net.ParseIP(n.config["ipv6.nat.address"])
 			}
 
+			fwOpts.SNATV6 = &firewallDrivers.SNATOpts{
+				SNATAddress: srcIP,
+				Subnet:      subnet,
+			}
+
 			if n.config["ipv6.nat.order"] == "after" {
-				err = n.state.Firewall.NetworkSetupOutboundNAT(n.name, subnet, srcIP, true)
-				if err != nil {
-					return err
-				}
-			} else {
-				err = n.state.Firewall.NetworkSetupOutboundNAT(n.name, subnet, srcIP, false)
-				if err != nil {
-					return err
-				}
+				fwOpts.SNATV6.Append = true
 			}
 		}
 
@@ -1053,7 +1114,13 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		if n.config["ipv6.routes"] != "" {
 			for _, route := range strings.Split(n.config["ipv6.routes"], ",") {
 				route = strings.TrimSpace(route)
-				_, err = shared.RunCommand("ip", "-6", "route", "add", "dev", n.name, route, "proto", "static")
+				r := &ip.Route{
+					DevName: n.name,
+					Route:   route,
+					Proto:   "static",
+					Family:  ip.FamilyV6,
+				}
+				err = r.Add()
 				if err != nil {
 					return err
 				}
@@ -1115,13 +1182,14 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			if fanMtu != mtu {
 				mtu = fanMtu
 				if n.config["bridge.driver"] != "openvswitch" {
-					_, err = shared.RunCommand("ip", "link", "set", "dev", fmt.Sprintf("%s-mtu", n.name), "mtu", mtu)
+					link := &ip.Link{Name: fmt.Sprintf("%s-mtu", n.name)}
+					err = link.SetMtu(mtu)
 					if err != nil {
 						return err
 					}
 				}
-
-				_, err = shared.RunCommand("ip", "link", "set", "dev", n.name, "mtu", mtu)
+				link := &ip.Link{Name: n.name}
+				err = link.SetMtu(mtu)
 				if err != nil {
 					return err
 				}
@@ -1135,7 +1203,12 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		// Add the address.
-		_, err = shared.RunCommand("ip", "-4", "addr", "add", "dev", n.name, fanAddress)
+		ipAddr := &ip.Addr{
+			DevName: n.name,
+			Address: fanAddress,
+			Family:  ip.FamilyV4,
+		}
+		err = ipAddr.Add()
 		if err != nil {
 			return err
 		}
@@ -1155,27 +1228,45 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 
 		// Setup the tunnel.
 		if n.config["fan.type"] == "ipip" {
-			_, err = shared.RunCommand("ip", "-4", "route", "flush", "dev", "tunl0")
+			r := &ip.Route{
+				DevName: "tunl0",
+				Family:  ip.FamilyV4,
+			}
+			err = r.Flush()
 			if err != nil {
 				return err
 			}
 
-			_, err = shared.RunCommand("ip", "link", "set", "dev", "tunl0", "up")
+			link := &ip.Link{Name: "tunl0"}
+			err = link.SetUp()
 			if err != nil {
 				return err
 			}
 
 			// Fails if the map is already set.
-			shared.RunCommand("ip", "link", "change", "dev", "tunl0", "type", "ipip", "fan-map", fmt.Sprintf("%s:%s", overlay, underlay))
+			link.Change("ipip", fmt.Sprintf("%s:%s", overlay, underlay))
 
-			_, err = shared.RunCommand("ip", "route", "add", overlay, "dev", "tunl0", "src", addr[0])
+			r = &ip.Route{
+				DevName: "tunl0",
+				Route:   overlay,
+				Src:     addr[0],
+				Proto:   "static",
+			}
+			err = r.Add()
 			if err != nil {
 				return err
 			}
 		} else {
 			vxlanID := fmt.Sprintf("%d", binary.BigEndian.Uint32(overlaySubnet.IP.To4())>>8)
-
-			_, err = shared.RunCommand("ip", "link", "add", tunName, "type", "vxlan", "id", vxlanID, "dev", devName, "dstport", "0", "local", devAddr, "fan-map", fmt.Sprintf("%s:%s", overlay, underlay))
+			vxlan := &ip.Vxlan{
+				Link:    ip.Link{Name: tunName},
+				VxlanID: vxlanID,
+				DevName: devName,
+				DstPort: "0",
+				Local:   devAddr,
+				FanMap:  fmt.Sprintf("%s:%s", overlay, underlay),
+			}
+			err = vxlan.Add()
 			if err != nil {
 				return err
 			}
@@ -1185,12 +1276,18 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 				return err
 			}
 
-			_, err = shared.RunCommand("ip", "link", "set", "dev", tunName, "mtu", mtu, "up")
+			err = vxlan.SetMtu(mtu)
 			if err != nil {
 				return err
 			}
 
-			_, err = shared.RunCommand("ip", "link", "set", "dev", n.name, "up")
+			err = vxlan.SetUp()
+			if err != nil {
+				return err
+			}
+
+			link := &ip.Link{Name: n.name}
+			err = link.SetUp()
 			if err != nil {
 				return err
 			}
@@ -1198,16 +1295,14 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 
 		// Configure NAT.
 		if shared.IsTrue(n.config["ipv4.nat"]) {
+			fwOpts.SNATV4 = &firewallDrivers.SNATOpts{
+				SNATAddress: nil, // Use MASQUERADE mode.
+				Subnet:      overlaySubnet,
+			}
+
 			if n.config["ipv4.nat.order"] == "after" {
-				err = n.state.Firewall.NetworkSetupOutboundNAT(n.name, overlaySubnet, nil, true)
-				if err != nil {
-					return err
-				}
-			} else {
-				err = n.state.Firewall.NetworkSetupOutboundNAT(n.name, overlaySubnet, nil, false)
-				if err != nil {
-					return err
-				}
+				fwOpts.SNATV4.Append = true
+
 			}
 		}
 
@@ -1240,14 +1335,21 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		tunName := fmt.Sprintf("%s-%s", n.name, tunnel)
 
 		// Configure the tunnel.
-		cmd := []string{"ip", "link", "add", "dev", tunName}
 		if tunProtocol == "gre" {
 			// Skip partial configs.
 			if tunProtocol == "" || tunLocal == "" || tunRemote == "" {
 				continue
 			}
 
-			cmd = append(cmd, []string{"type", "gretap", "local", tunLocal, "remote", tunRemote}...)
+			gretapLink := &ip.Gretap{
+				Link:   ip.Link{Name: tunName},
+				Local:  tunLocal,
+				Remote: tunRemote,
+			}
+			err := gretapLink.Add()
+			if err != nil {
+				return err
+			}
 		} else if tunProtocol == "vxlan" {
 			tunGroup := getConfig("group")
 			tunInterface := getConfig("interface")
@@ -1257,10 +1359,12 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 				continue
 			}
 
-			cmd = append(cmd, []string{"type", "vxlan"}...)
-
+			vxlanLink := &ip.Vxlan{
+				Link: ip.Link{Name: tunName},
+			}
 			if tunLocal != "" && tunRemote != "" {
-				cmd = append(cmd, []string{"local", tunLocal, "remote", tunRemote}...)
+				vxlanLink.Local = tunLocal
+				vxlanLink.Remote = tunRemote
 			} else {
 				if tunGroup == "" {
 					tunGroup = "239.0.0.1"
@@ -1274,32 +1378,32 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 					}
 				}
 
-				cmd = append(cmd, []string{"group", tunGroup, "dev", devName}...)
+				vxlanLink.Group = tunGroup
+				vxlanLink.DevName = devName
 			}
 
 			tunPort := getConfig("port")
 			if tunPort == "" {
 				tunPort = "0"
 			}
-			cmd = append(cmd, []string{"dstport", tunPort}...)
+			vxlanLink.DstPort = tunPort
 
 			tunID := getConfig("id")
 			if tunID == "" {
 				tunID = "1"
 			}
-			cmd = append(cmd, []string{"id", tunID}...)
+			vxlanLink.VxlanID = tunID
 
 			tunTTL := getConfig("ttl")
 			if tunTTL == "" {
 				tunTTL = "1"
 			}
-			cmd = append(cmd, []string{"ttl", tunTTL}...)
-		}
+			vxlanLink.TTL = tunTTL
 
-		// Create the interface.
-		_, err = shared.RunCommand(cmd[0], cmd[1:]...)
-		if err != nil {
-			return err
+			err := vxlanLink.Add()
+			if err != nil {
+				return err
+			}
 		}
 
 		// Bridge it and bring up.
@@ -1308,12 +1412,14 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 			return err
 		}
 
-		_, err = shared.RunCommand("ip", "link", "set", "dev", tunName, "mtu", mtu, "up")
+		link := &ip.Link{Name: tunName}
+		err = link.SetMtu(mtu)
 		if err != nil {
 			return err
 		}
 
-		_, err = shared.RunCommand("ip", "link", "set", "dev", n.name, "up")
+		link = &ip.Link{Name: n.name}
+		err = link.SetUp()
 		if err != nil {
 			return err
 		}
@@ -1447,7 +1553,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		if shared.PathExists(leasesPath) {
 			err := os.Remove(leasesPath)
 			if err != nil {
-				return errors.Wrapf(err, "Failed to remove old dnsmasq leases file '%s'", leasesPath)
+				return errors.Wrapf(err, "Failed to remove old dnsmasq leases file %q", leasesPath)
 			}
 		}
 
@@ -1456,8 +1562,30 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		if shared.PathExists(pidPath) {
 			err := os.Remove(pidPath)
 			if err != nil {
-				return errors.Wrapf(err, "Failed to remove old dnsmasq pid file '%s'", pidPath)
+				return errors.Wrapf(err, "Failed to remove old dnsmasq pid file %q", pidPath)
 			}
+		}
+	}
+
+	// Setup firewall.
+	n.logger.Debug("Setting up firewall")
+	err = n.state.Firewall.NetworkSetup(n.name, fwOpts)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to setup firewall")
+	}
+
+	if fwOpts.ACL {
+		aclNet := acl.NetworkACLUsage{
+			Name:   n.Name(),
+			Type:   n.Type(),
+			ID:     n.ID(),
+			Config: n.Config(),
+		}
+
+		n.logger.Debug("Applying up firewall ACLs")
+		err = acl.FirewallApplyACLRules(n.state, n.logger, n.Project(), aclNet)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -1481,24 +1609,29 @@ func (n *bridge) Stop() error {
 			return err
 		}
 	} else {
-		_, err := shared.RunCommand("ip", "link", "del", "dev", n.name)
+		link := &ip.Link{Name: n.name}
+		err := link.Delete()
 		if err != nil {
 			return err
 		}
 	}
 
-	// Cleanup firewall rules.
+	// Fully clear firewall setup.
+	fwClearIPVersions := []uint{}
+
 	if usesIPv4Firewall(n.config) {
-		err := n.state.Firewall.NetworkClear(n.name, 4)
-		if err != nil {
-			return err
-		}
+		fwClearIPVersions = append(fwClearIPVersions, 4)
 	}
 
 	if usesIPv6Firewall(n.config) {
-		err := n.state.Firewall.NetworkClear(n.name, 6)
+		fwClearIPVersions = append(fwClearIPVersions, 6)
+	}
+
+	if len(fwClearIPVersions) > 0 {
+		n.logger.Debug("Deleting firewall")
+		err := n.state.Firewall.NetworkClear(n.name, true, fwClearIPVersions)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "Failed deleting firewall")
 		}
 	}
 
@@ -1522,7 +1655,8 @@ func (n *bridge) Stop() error {
 	// Cleanup any existing tunnel device
 	for _, iface := range ifaces {
 		if strings.HasPrefix(iface.Name, fmt.Sprintf("%s-", n.name)) {
-			_, err = shared.RunCommand("ip", "link", "del", "dev", iface.Name)
+			link := &ip.Link{Name: iface.Name}
+			err = link.Delete()
 			if err != nil {
 				return err
 			}
@@ -1685,14 +1819,14 @@ func (n *bridge) HandleHeartbeat(heartbeatData *cluster.APIHeartbeat) error {
 
 	n.logger.Info("Refreshing forkdns peers")
 
-	cert := n.state.Endpoints.NetworkCert()
+	networkCert := n.state.Endpoints.NetworkCert()
 	for _, node := range heartbeatData.Members {
 		if node.Address == localAddress {
 			// No need to query ourselves.
 			continue
 		}
 
-		client, err := cluster.Connect(node.Address, cert, true)
+		client, err := cluster.Connect(node.Address, networkCert, n.state.ServerCert(), true)
 		if err != nil {
 			return err
 		}
@@ -1753,46 +1887,41 @@ func (n *bridge) getTunnels() []string {
 
 // bootRoutesV4 returns a list of IPv4 boot routes on the network's device.
 func (n *bridge) bootRoutesV4() ([]string, error) {
-	routes := []string{}
-	cmd := exec.Command("ip", "-4", "route", "show", "dev", n.name, "proto", "boot")
-	ipOut, err := cmd.StdoutPipe()
+	r := &ip.Route{
+		DevName: n.name,
+		Proto:   "boot",
+		Family:  ip.FamilyV4,
+	}
+	routes, err := r.Show()
 	if err != nil {
-		return routes, err
+		return nil, err
 	}
-	cmd.Start()
-	scanner := bufio.NewScanner(ipOut)
-	for scanner.Scan() {
-		route := strings.Replace(scanner.Text(), "linkdown", "", -1)
-		routes = append(routes, route)
-	}
-	cmd.Wait()
 	return routes, nil
 }
 
 // bootRoutesV6 returns a list of IPv6 boot routes on the network's device.
 func (n *bridge) bootRoutesV6() ([]string, error) {
-	routes := []string{}
-	cmd := exec.Command("ip", "-6", "route", "show", "dev", n.name, "proto", "boot")
-	ipOut, err := cmd.StdoutPipe()
+	r := &ip.Route{
+		DevName: n.name,
+		Proto:   "boot",
+		Family:  ip.FamilyV6,
+	}
+	routes, err := r.Show()
 	if err != nil {
-		return routes, err
+		return nil, err
 	}
-	cmd.Start()
-	scanner := bufio.NewScanner(ipOut)
-	for scanner.Scan() {
-		route := strings.Replace(scanner.Text(), "linkdown", "", -1)
-		routes = append(routes, route)
-	}
-	cmd.Wait()
 	return routes, nil
 }
 
 // applyBootRoutesV4 applies a list of IPv4 boot routes to the network's device.
 func (n *bridge) applyBootRoutesV4(routes []string) {
 	for _, route := range routes {
-		cmd := []string{"-4", "route", "replace", "dev", n.name, "proto", "boot"}
-		cmd = append(cmd, strings.Fields(route)...)
-		_, err := shared.RunCommand("ip", cmd...)
+		r := &ip.Route{
+			DevName: n.name,
+			Proto:   "boot",
+			Family:  ip.FamilyV4,
+		}
+		err := r.Replace(strings.Fields(route))
 		if err != nil {
 			// If it fails, then we can't stop as the route has already gone, so just log and continue.
 			n.logger.Error("Failed to restore route", log.Ctx{"err": err})
@@ -1803,9 +1932,12 @@ func (n *bridge) applyBootRoutesV4(routes []string) {
 // applyBootRoutesV6 applies a list of IPv6 boot routes to the network's device.
 func (n *bridge) applyBootRoutesV6(routes []string) {
 	for _, route := range routes {
-		cmd := []string{"-6", "route", "replace", "dev", n.name, "proto", "boot"}
-		cmd = append(cmd, strings.Fields(route)...)
-		_, err := shared.RunCommand("ip", cmd...)
+		r := &ip.Route{
+			DevName: n.name,
+			Proto:   "boot",
+			Family:  ip.FamilyV6,
+		}
+		err := r.Replace(strings.Fields(route))
 		if err != nil {
 			// If it fails, then we can't stop as the route has already gone, so just log and continue.
 			n.logger.Error("Failed to restore route", log.Ctx{"err": err})
@@ -1952,7 +2084,9 @@ func (n *bridge) updateForkdnsServersFile(addresses []string) error {
 
 // hasIPv4Firewall indicates whether the network has IPv4 firewall enabled.
 func (n *bridge) hasIPv4Firewall() bool {
-	if n.config["ipv4.firewall"] == "" || shared.IsTrue(n.config["ipv4.firewall"]) {
+	// IPv4 firewall is only enabled if there is a bridge ipv4.address or fan mode, and ipv4.firewall enabled.
+	// When using fan bridge.mode, there can be an empty ipv4.address, so we assume it is active.
+	if (n.config["bridge.mode"] == "fan" || !shared.StringInSlice(n.config["ipv4.address"], []string{"", "none"})) && (n.config["ipv4.firewall"] == "" || shared.IsTrue(n.config["ipv4.firewall"])) {
 		return true
 	}
 
@@ -1961,7 +2095,28 @@ func (n *bridge) hasIPv4Firewall() bool {
 
 // hasIPv6Firewall indicates whether the network has IPv6 firewall enabled.
 func (n *bridge) hasIPv6Firewall() bool {
-	if n.config["ipv6.firewall"] == "" || shared.IsTrue(n.config["ipv6.firewall"]) {
+	// IPv6 firewall is only enabled if there is a bridge ipv6.address and ipv6.firewall enabled.
+	if !shared.StringInSlice(n.config["ipv6.address"], []string{"", "none"}) && (n.config["ipv6.firewall"] == "" || shared.IsTrue(n.config["ipv6.firewall"])) {
+		return true
+	}
+
+	return false
+}
+
+// hasDHCPv4 indicates whether the network has DHCPv4 enabled.
+// An empty ipv4.dhcp setting indicates enabled by default.
+func (n *bridge) hasDHCPv4() bool {
+	if n.config["ipv4.dhcp"] == "" || shared.IsTrue(n.config["ipv4.dhcp"]) {
+		return true
+	}
+
+	return false
+}
+
+// hasDHCPv6 indicates whether the network has DHCPv6 enabled.
+// An empty ipv6.dhcp setting indicates enabled by default.
+func (n *bridge) hasDHCPv6() bool {
+	if n.config["ipv6.dhcp"] == "" || shared.IsTrue(n.config["ipv6.dhcp"]) {
 		return true
 	}
 
@@ -1970,11 +2125,39 @@ func (n *bridge) hasIPv6Firewall() bool {
 
 // DHCPv4Subnet returns the DHCPv4 subnet (if DHCP is enabled on network).
 func (n *bridge) DHCPv4Subnet() *net.IPNet {
-	// DHCP is disabled on this network (an empty ipv4.dhcp setting indicates enabled by default).
-	if n.config["ipv4.dhcp"] != "" && !shared.IsTrue(n.config["ipv4.dhcp"]) {
+	// DHCP is disabled on this network.
+	if !n.hasDHCPv4() {
 		return nil
 	}
 
+	// Fan mode. Extract DHCP subnet from fan bridge address. Only detectable once network has started.
+	// But if there is no address on the fan bridge then DHCP won't work anyway.
+	if n.config["bridge.mode"] == "fan" {
+		iface, err := net.InterfaceByName(n.name)
+		if err != nil {
+			return nil
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil
+		}
+
+		for _, addr := range addrs {
+			ip, subnet, err := net.ParseCIDR(addr.String())
+			if err != nil {
+				continue
+			}
+
+			if ip != nil && err == nil && ip.To4() != nil && ip.IsGlobalUnicast() {
+				return subnet // Use first IPv4 unicast address on host for DHCP subnet.
+			}
+		}
+
+		return nil // No addresses found, means DHCP must be disabled.
+	}
+
+	// Non-fan mode. Return configured bridge subnet directly.
 	_, subnet, err := net.ParseCIDR(n.config["ipv4.address"])
 	if err != nil {
 		return nil
@@ -1985,8 +2168,8 @@ func (n *bridge) DHCPv4Subnet() *net.IPNet {
 
 // DHCPv6Subnet returns the DHCPv6 subnet (if DHCP or SLAAC is enabled on network).
 func (n *bridge) DHCPv6Subnet() *net.IPNet {
-	// DHCP is disabled on this network (an empty ipv6.dhcp setting indicates enabled by default).
-	if n.config["ipv6.dhcp"] != "" && !shared.IsTrue(n.config["ipv6.dhcp"]) {
+	// DHCP is disabled on this network.
+	if !n.hasDHCPv6() {
 		return nil
 	}
 

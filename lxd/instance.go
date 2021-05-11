@@ -3,23 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
-	cron "gopkg.in/robfig/cron.v2"
 
-	"github.com/flosch/pongo2"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
-	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/drivers"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
@@ -32,7 +25,6 @@ import (
 	"github.com/lxc/lxd/shared"
 	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/osarch"
 )
 
 // Helper functions
@@ -40,28 +32,23 @@ import (
 // instanceCreateAsEmpty creates an empty instance.
 func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, error) {
 	// Create the instance record.
-	inst, err := instanceCreateInternal(d.State(), args)
+	inst, err := instance.CreateInternal(d.State(), args)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed creating instance record")
 	}
 
-	revert := true
-	defer func() {
-		if !revert {
-			return
-		}
-
-		inst.Delete(true)
-	}()
+	revert := revert.New()
+	defer revert.Fail()
+	revert.Add(func() { inst.Delete(true) })
 
 	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
 	if err != nil {
-		return nil, errors.Wrap(err, "Load instance storage pool")
+		return nil, errors.Wrap(err, "Failed loading instance storage pool")
 	}
 
 	err = pool.CreateInstance(inst, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "Create instance")
+		return nil, errors.Wrap(err, "Failed creating instance")
 	}
 
 	err = inst.UpdateBackupFile()
@@ -69,14 +56,14 @@ func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, 
 		return nil, err
 	}
 
-	revert = false
+	revert.Success()
 	return inst, nil
 }
 
 // instanceImageTransfer transfers an image from another cluster node.
 func instanceImageTransfer(d *Daemon, projectName string, hash string, nodeAddress string) error {
 	logger.Debugf("Transferring image %q from node %q", hash, nodeAddress)
-	client, err := cluster.Connect(nodeAddress, d.endpoints.NetworkCert(), false)
+	client, err := cluster.Connect(nodeAddress, d.endpoints.NetworkCert(), d.serverCert(), false)
 	if err != nil {
 		return err
 	}
@@ -123,17 +110,24 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 	}
 
 	if nodeAddress != "" {
+		// Ensure we are the only ones operating on this image.
+		unlock := d.imageDownloadLock(img.Fingerprint)
+
 		// The image is available from another node, let's try to import it.
 		err = instanceImageTransfer(d, args.Project, img.Fingerprint, nodeAddress)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Failed transferring image")
+			unlock()
+			return nil, errors.Wrapf(err, "Failed transferring image %q from %q", img.Fingerprint, nodeAddress)
 		}
 
 		// As the image record already exists in the project, just add the node ID to the image.
 		err = d.cluster.AddImageToLocalNode(args.Project, img.Fingerprint)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Failed adding image to local node")
+			unlock()
+			return nil, errors.Wrapf(err, "Failed adding transferred image %q to local cluster member", img.Fingerprint)
 		}
+
+		unlock()
 	}
 
 	// Set the "image.*" keys.
@@ -147,7 +141,7 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 	args.BaseImage = hash
 
 	// Create the instance.
-	inst, err := instanceCreateInternal(s, args)
+	inst, err := instance.CreateInternal(s, args)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed creating instance record")
 	}
@@ -163,12 +157,12 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 
 	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
 	if err != nil {
-		return nil, errors.Wrap(err, "Load instance storage pool")
+		return nil, errors.Wrap(err, "Failed loading instance storage pool")
 	}
 
 	err = pool.CreateInstanceFromImage(inst, hash, op)
 	if err != nil {
-		return nil, errors.Wrap(err, "Create instance from image")
+		return nil, errors.Wrap(err, "Failed creating instance from image")
 	}
 
 	err = inst.UpdateBackupFile()
@@ -180,18 +174,28 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 	return inst, nil
 }
 
-func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst instance.Instance, instanceOnly bool, refresh bool, op *operations.Operation) (instance.Instance, error) {
+// instanceCreateAsCopyOpts options for copying an instance.
+type instanceCreateAsCopyOpts struct {
+	sourceInstance       instance.Instance // Source instance.
+	targetInstance       db.InstanceArgs   // Configuration for new instance.
+	instanceOnly         bool              // Only copy the instance and not it's snapshots.
+	refresh              bool              // Refresh an existing target instance.
+	applyTemplateTrigger bool              // Apply deferred TemplateTriggerCopy.
+}
+
+// instanceCreateAsCopy create a new instance by copying from an existing instance.
+func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *operations.Operation) (instance.Instance, error) {
 	var inst instance.Instance
 	var err error
 
 	revert := revert.New()
 	defer revert.Fail()
 
-	if refresh {
+	if opts.refresh {
 		// Load the target instance.
-		inst, err = instance.LoadByProjectAndName(s, args.Project, args.Name)
+		inst, err = instance.LoadByProjectAndName(s, opts.targetInstance.Project, opts.targetInstance.Name)
 		if err != nil {
-			refresh = false // Instance doesn't exist, so switch to copy mode.
+			opts.refresh = false // Instance doesn't exist, so switch to copy mode.
 		}
 
 		if inst.IsRunning() {
@@ -200,9 +204,9 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 	}
 
 	// If we are not in refresh mode, then create a new instance as we are in copy mode.
-	if !refresh {
+	if !opts.refresh {
 		// Create the instance.
-		inst, err = instanceCreateInternal(s, args)
+		inst, err = instance.CreateInternal(s, opts.targetInstance)
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed creating instance record")
 		}
@@ -210,22 +214,20 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 		revert.Add(func() { inst.Delete(true) })
 	}
 
-	// At this point we have already figured out the parent container's root disk device so we
-	// can simply retrieve it from the expanded devices.
-	parentStoragePool := ""
-	parentExpandedDevices := inst.ExpandedDevices()
-	parentLocalRootDiskDeviceKey, parentLocalRootDiskDevice, _ := shared.GetRootDiskDevice(parentExpandedDevices.CloneNative())
-	if parentLocalRootDiskDeviceKey != "" {
-		parentStoragePool = parentLocalRootDiskDevice["pool"]
+	// At this point we have already figured out the instance's root disk device so we can simply retrieve it
+	// from the expanded devices.
+	instRootDiskDeviceKey, instRootDiskDevice, err := shared.GetRootDiskDevice(inst.ExpandedDevices().CloneNative())
+	if err != nil {
+		return nil, err
 	}
 
 	snapList := []*instance.Instance{}
 	var snapshots []instance.Instance
 
-	if !instanceOnly {
-		if refresh {
+	if !opts.instanceOnly {
+		if opts.refresh {
 			// Compare snapshots.
-			syncSnapshots, deleteSnapshots, err := instance.CompareSnapshots(sourceInst, inst)
+			syncSnapshots, deleteSnapshots, err := instance.CompareSnapshots(opts.sourceInstance, inst)
 			if err != nil {
 				return nil, err
 			}
@@ -242,51 +244,66 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 			snapshots = syncSnapshots
 		} else {
 			// Get snapshots of source instance.
-			snapshots, err = sourceInst.Snapshots()
+			snapshots, err = opts.sourceInstance.Snapshots()
 			if err != nil {
 				return nil, err
 			}
 		}
 
 		for _, srcSnap := range snapshots {
-			fields := strings.SplitN(srcSnap.Name(), shared.SnapshotDelimiter, 2)
+			snapLocalDevices := srcSnap.LocalDevices().Clone()
 
-			// Ensure that snapshot and parent instance have the
-			// same storage pool in their local root disk device.
-			// If the root disk device for the snapshot comes from a
-			// profile on the new instance as well we don't need to
-			// do anything.
-			snapDevices := srcSnap.LocalDevices()
-			if snapDevices != nil {
-				snapLocalRootDiskDeviceKey, _, _ := shared.GetRootDiskDevice(snapDevices.CloneNative())
-				if snapLocalRootDiskDeviceKey != "" {
-					snapDevices[snapLocalRootDiskDeviceKey]["pool"] = parentStoragePool
-				} else {
-					snapDevices["root"] = map[string]string{
-						"type": "disk",
-						"path": "/",
-						"pool": parentStoragePool,
+			// Load snap root disk from expanded devices (in case it doesn't have its own root disk).
+			snapExpandedRootDiskDevKey, snapExpandedRootDiskDev, err := shared.GetRootDiskDevice(srcSnap.ExpandedDevices().CloneNative())
+			if err == nil {
+				// If the expanded devices has a root disk, but its pool doesn't match our new
+				// parent instance's pool, then either modify the device if it is local or add a
+				// new one to local devices if its coming from the profiles.
+				if snapExpandedRootDiskDev["pool"] != instRootDiskDevice["pool"] {
+					if localRootDiskDev, found := snapLocalDevices[snapExpandedRootDiskDevKey]; found {
+						// Modify exist local device's pool.
+						localRootDiskDev["pool"] = instRootDiskDevice["pool"]
+						snapLocalDevices[snapExpandedRootDiskDevKey] = localRootDiskDev
+					} else {
+						// Add a new local device using parent instance's pool.
+						snapLocalDevices[instRootDiskDeviceKey] = map[string]string{
+							"type": "disk",
+							"path": "/",
+							"pool": instRootDiskDevice["pool"],
+						}
 					}
 				}
+			} else if errors.Cause(err) == shared.ErrNoRootDisk {
+				// If no root disk defined in either local devices or profiles, then add one to the
+				// snapshot local devices using the same device name from the parent instance.
+				snapLocalDevices[instRootDiskDeviceKey] = map[string]string{
+					"type": "disk",
+					"path": "/",
+					"pool": instRootDiskDevice["pool"],
+				}
+			} else {
+				// Snapshot has multiple root disk devices, we can't automatically fix this so
+				// leave alone so we don't prevent copy.
 			}
 
+			fields := strings.SplitN(srcSnap.Name(), shared.SnapshotDelimiter, 2)
 			newSnapName := fmt.Sprintf("%s/%s", inst.Name(), fields[1])
 			snapInstArgs := db.InstanceArgs{
 				Architecture: srcSnap.Architecture(),
 				Config:       srcSnap.LocalConfig(),
-				Type:         sourceInst.Type(),
+				Type:         opts.sourceInstance.Type(),
 				Snapshot:     true,
-				Devices:      snapDevices,
+				Devices:      snapLocalDevices,
 				Description:  srcSnap.Description(),
 				Ephemeral:    srcSnap.IsEphemeral(),
 				Name:         newSnapName,
 				Profiles:     srcSnap.Profiles(),
-				Project:      args.Project,
+				Project:      opts.targetInstance.Project,
 				ExpiryDate:   srcSnap.ExpiryDate(),
 			}
 
 			// Create the snapshots.
-			snapInst, err := instanceCreateInternal(s, snapInstArgs)
+			snapInst, err := instance.CreateInternal(s, snapInstArgs)
 			if err != nil {
 				return nil, errors.Wrapf(err, "Failed creating instance snapshot record %q", newSnapName)
 			}
@@ -303,18 +320,26 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 
 	pool, err := storagePools.GetPoolByInstance(s, inst)
 	if err != nil {
-		return nil, errors.Wrap(err, "Load instance storage pool")
+		return nil, errors.Wrap(err, "Failed loading instance storage pool")
 	}
 
-	if refresh {
-		err = pool.RefreshInstance(inst, sourceInst, snapshots, op)
+	if opts.refresh {
+		err = pool.RefreshInstance(inst, opts.sourceInstance, snapshots, op)
 		if err != nil {
 			return nil, errors.Wrap(err, "Refresh instance")
 		}
 	} else {
-		err = pool.CreateInstanceFromCopy(inst, sourceInst, !instanceOnly, op)
+		err = pool.CreateInstanceFromCopy(inst, opts.sourceInstance, !opts.instanceOnly, op)
 		if err != nil {
 			return nil, errors.Wrap(err, "Create instance from copy")
+		}
+
+		if opts.applyTemplateTrigger {
+			// Trigger the templates on next start.
+			err = inst.DeferTemplateApply(instance.TemplateTriggerCopy)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -324,307 +349,6 @@ func instanceCreateAsCopy(s *state.State, args db.InstanceArgs, sourceInst insta
 	}
 
 	revert.Success()
-	return inst, nil
-}
-
-func instanceCreateAsSnapshot(s *state.State, args db.InstanceArgs, sourceInstance instance.Instance, op *operations.Operation) (instance.Instance, error) {
-	if sourceInstance.Type() != args.Type {
-		return nil, fmt.Errorf("Source instance and snapshot instance types do not match")
-	}
-
-	// Deal with state.
-	if args.Stateful {
-		if !sourceInstance.IsRunning() {
-			return nil, fmt.Errorf("Unable to create a stateful snapshot. The instance isn't running")
-		}
-
-		_, err := exec.LookPath("criu")
-		if err != nil {
-			return nil, fmt.Errorf("Unable to create a stateful snapshot. CRIU isn't installed")
-		}
-
-		stateDir := sourceInstance.StatePath()
-		err = os.MkdirAll(stateDir, 0700)
-		if err != nil {
-			return nil, err
-		}
-
-		/* TODO: ideally we would freeze here and unfreeze below after
-		 * we've copied the filesystem, to make sure there are no
-		 * changes by the container while snapshotting. Unfortunately
-		 * there is abug in CRIU where it doesn't leave the container
-		 * in the same state it found it w.r.t. freezing, i.e. CRIU
-		 * freezes too, and then /always/ thaws, even if the container
-		 * was frozen. Until that's fixed, all calls to Unfreeze()
-		 * after snapshotting will fail.
-		 */
-
-		criuMigrationArgs := instance.CriuMigrationArgs{
-			Cmd:          liblxc.MIGRATE_DUMP,
-			StateDir:     stateDir,
-			Function:     "snapshot",
-			Stop:         false,
-			ActionScript: false,
-			DumpDir:      "",
-			PreDumpDir:   "",
-		}
-
-		err = sourceInstance.Migrate(&criuMigrationArgs)
-		if err != nil {
-			os.RemoveAll(sourceInstance.StatePath())
-			return nil, err
-		}
-	}
-
-	revert := revert.New()
-	defer revert.Fail()
-
-	// Create the snapshot.
-	inst, err := instanceCreateInternal(s, args)
-	if err != nil {
-		return nil, errors.Wrapf(err, "Failed creating instance snapshot record %q", args.Name)
-	}
-	revert.Add(func() { inst.Delete(true) })
-
-	pool, err := storagePools.GetPoolByInstance(s, inst)
-	if err != nil {
-		return nil, err
-	}
-
-	err = pool.CreateInstanceSnapshot(inst, sourceInstance, op)
-	if err != nil {
-		return nil, errors.Wrap(err, "Create instance snapshot")
-	}
-
-	// Mount volume for backup.yaml writing.
-	_, err = pool.MountInstance(sourceInstance, op)
-	if err != nil {
-		return nil, errors.Wrap(err, "Create instance snapshot (mount source)")
-	}
-	defer pool.UnmountInstance(sourceInstance, op)
-
-	// Attempt to update backup.yaml for instance.
-	err = sourceInstance.UpdateBackupFile()
-	if err != nil {
-		return nil, err
-	}
-
-	// Once we're done, remove the state directory.
-	if args.Stateful {
-		os.RemoveAll(sourceInstance.StatePath())
-	}
-
-	revert.Success()
-	return inst, nil
-}
-
-// instanceCreateInternal creates an instance record and storage volume record in the database.
-func instanceCreateInternal(s *state.State, args db.InstanceArgs) (instance.Instance, error) {
-	// Set default values.
-	if args.Project == "" {
-		args.Project = project.Default
-	}
-
-	if args.Profiles == nil {
-		args.Profiles = []string{"default"}
-	}
-
-	if args.Config == nil {
-		args.Config = map[string]string{}
-	}
-
-	if args.BaseImage != "" {
-		args.Config["volatile.base_image"] = args.BaseImage
-	}
-
-	if args.Devices == nil {
-		args.Devices = deviceConfig.Devices{}
-	}
-
-	if args.Architecture == 0 {
-		args.Architecture = s.OS.Architectures[0]
-	}
-
-	err := instance.ValidName(args.Name, args.Snapshot)
-	if err != nil {
-		return nil, err
-	}
-
-	if !args.Snapshot {
-		// Unset expiry date since instances don't expire.
-		args.ExpiryDate = time.Time{}
-	}
-
-	// Validate container config.
-	err = instance.ValidConfig(s.OS, args.Config, false, false)
-	if err != nil {
-		return nil, err
-	}
-
-	// Validate container devices with the supplied container name and devices.
-	err = instance.ValidDevices(s, s.Cluster, args.Project, args.Type, args.Devices, false)
-	if err != nil {
-		return nil, errors.Wrap(err, "Invalid devices")
-	}
-
-	// Validate architecture.
-	_, err = osarch.ArchitectureName(args.Architecture)
-	if err != nil {
-		return nil, err
-	}
-
-	if !shared.IntInSlice(args.Architecture, s.OS.Architectures) {
-		return nil, fmt.Errorf("Requested architecture isn't supported by this host")
-	}
-
-	// Validate profiles.
-	profiles, err := s.Cluster.GetProfileNames(args.Project)
-	if err != nil {
-		return nil, err
-	}
-
-	checkedProfiles := []string{}
-	for _, profile := range args.Profiles {
-		if !shared.StringInSlice(profile, profiles) {
-			return nil, fmt.Errorf("Requested profile %q doesn't exist", profile)
-		}
-
-		if shared.StringInSlice(profile, checkedProfiles) {
-			return nil, fmt.Errorf("Duplicate profile found in request")
-		}
-
-		checkedProfiles = append(checkedProfiles, profile)
-	}
-
-	if args.CreationDate.IsZero() {
-		args.CreationDate = time.Now().UTC()
-	}
-
-	if args.LastUsedDate.IsZero() {
-		args.LastUsedDate = time.Unix(0, 0).UTC()
-	}
-
-	var dbInst db.Instance
-
-	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		node, err := tx.GetLocalNodeName()
-		if err != nil {
-			return err
-		}
-
-		// TODO: this check should probably be performed by the db package itself.
-		exists, err := tx.ProjectExists(args.Project)
-		if err != nil {
-			return errors.Wrapf(err, "Check if project %q exists", args.Project)
-		}
-		if !exists {
-			return fmt.Errorf("Project %q does not exist", args.Project)
-		}
-
-		if args.Snapshot {
-			parts := strings.SplitN(args.Name, shared.SnapshotDelimiter, 2)
-			instanceName := parts[0]
-			snapshotName := parts[1]
-			instance, err := tx.GetInstance(args.Project, instanceName)
-			if err != nil {
-				return fmt.Errorf("Get instance %q in project %q", instanceName, args.Project)
-			}
-			snapshot := db.InstanceSnapshot{
-				Project:      args.Project,
-				Instance:     instanceName,
-				Name:         snapshotName,
-				CreationDate: args.CreationDate,
-				Stateful:     args.Stateful,
-				Description:  args.Description,
-				Config:       args.Config,
-				Devices:      args.Devices.CloneNative(),
-				ExpiryDate:   args.ExpiryDate,
-			}
-			_, err = tx.CreateInstanceSnapshot(snapshot)
-			if err != nil {
-				return errors.Wrap(err, "Add snapshot info to the database")
-			}
-
-			// Read back the snapshot, to get ID and creation time.
-			s, err := tx.GetInstanceSnapshot(args.Project, instanceName, snapshotName)
-			if err != nil {
-				return errors.Wrap(err, "Fetch created snapshot from the database")
-			}
-
-			dbInst = db.InstanceSnapshotToInstance(instance, s)
-
-			return nil
-		}
-
-		// Create the instance entry.
-		dbInst = db.Instance{
-			Project:      args.Project,
-			Name:         args.Name,
-			Node:         node,
-			Type:         args.Type,
-			Snapshot:     args.Snapshot,
-			Architecture: args.Architecture,
-			Ephemeral:    args.Ephemeral,
-			CreationDate: args.CreationDate,
-			Stateful:     args.Stateful,
-			LastUseDate:  args.LastUsedDate,
-			Description:  args.Description,
-			Config:       args.Config,
-			Devices:      args.Devices.CloneNative(),
-			Profiles:     args.Profiles,
-			ExpiryDate:   args.ExpiryDate,
-		}
-
-		_, err = tx.CreateInstance(dbInst)
-		if err != nil {
-			return errors.Wrap(err, "Add instance info to the database")
-		}
-
-		// Read back the instance, to get ID and creation time.
-		dbRow, err := tx.GetInstance(args.Project, args.Name)
-		if err != nil {
-			return errors.Wrap(err, "Fetch created instance from the database")
-		}
-
-		dbInst = *dbRow
-
-		if dbInst.ID < 1 {
-			return errors.Wrapf(err, "Unexpected instance database ID %d", dbInst.ID)
-		}
-
-		return nil
-	})
-	if err != nil {
-		if err == db.ErrAlreadyDefined {
-			thing := "Instance"
-			if shared.IsSnapshot(args.Name) {
-				thing = "Snapshot"
-			}
-			return nil, fmt.Errorf("%s %q already exists", thing, args.Name)
-		}
-		return nil, err
-	}
-
-	revert := true
-	defer func() {
-		if !revert {
-			return
-		}
-
-		s.Cluster.DeleteInstance(dbInst.Project, dbInst.Name)
-	}()
-
-	args = db.InstanceToArgs(&dbInst)
-	inst, err := instance.Create(s, args)
-	if err != nil {
-		logger.Error("Failed initialising instance", log.Ctx{"project": args.Project, "instance": args.Name, "type": args.Type, "err": err})
-		return nil, errors.Wrap(err, "Failed initialising instance")
-	}
-
-	// Wipe any existing log for this instance name.
-	os.RemoveAll(inst.LogPath())
-
-	revert = false
 	return inst, nil
 }
 
@@ -650,49 +374,47 @@ func instanceLoadNodeProjectAll(s *state.State, project string, instanceType ins
 
 func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 	f := func(ctx context.Context) {
-		// Load all local instances
-		allContainers, err := instance.LoadNodeAll(d.State(), instancetype.Any)
+		// Get project names
+		var projectNames []string
+		err := d.State().Cluster.Transaction(func(tx *db.ClusterTx) error {
+			var err error
+			projectNames, err = tx.GetProjectNames()
+			return err
+		})
 		if err != nil {
-			logger.Error("Failed to load containers for scheduled snapshots", log.Ctx{"err": err})
 			return
+		}
+
+		// Load local instances by project
+		allInstances := []instance.Instance{}
+		for _, projectName := range projectNames {
+			err := d.State().Cluster.Transaction(func(tx *db.ClusterTx) error {
+				return project.AllowSnapshotCreation(tx, projectName)
+			})
+			if err != nil {
+				continue
+			}
+			projectInstances, err := instanceLoadNodeProjectAll(d.State(), projectName, instancetype.Any)
+			if err != nil {
+				continue
+			}
+			allInstances = append(allInstances, projectInstances...)
 		}
 
 		// Figure out which need snapshotting (if any)
 		instances := []instance.Instance{}
-		for _, c := range allContainers {
-			schedule := c.ExpandedConfig()["snapshots.schedule"]
-
-			if schedule == "" {
+		for _, c := range allInstances {
+			schedule, ok := c.ExpandedConfig()["snapshots.schedule"]
+			if !ok || schedule == "" {
 				continue
 			}
 
-			// Extend our schedule to one that is accepted by the used cron parser
-			sched, err := cron.Parse(fmt.Sprintf("* %s", schedule))
-			if err != nil {
+			// Check if snapshot is scheduled
+			if !snapshotIsScheduledNow(schedule, int64(c.ID())) {
 				continue
 			}
 
-			// Check if it's time to snapshot
-			now := time.Now()
-
-			// Truncate the time now back to the start of the minute, before passing to
-			// the cron scheduler, as it will add 1s to the scheduled time and we don't
-			// want the next scheduled time to roll over to the next minute and break
-			// the time comparison below.
-			now = now.Truncate(time.Minute)
-
-			// Calculate the next scheduled time based on the snapshots.schedule
-			// pattern and the time now.
-			next := sched.Next(now)
-
-			// Ignore everything that is more precise than minutes.
-			next = next.Truncate(time.Minute)
-
-			if !now.Equal(next) {
-				continue
-			}
-
-			// Check if the container is running
+			// Check if the instance is running
 			if !shared.IsTrue(c.ExpandedConfig()["snapshots.schedule.stopped"]) && !c.IsRunning() {
 				continue
 			}
@@ -744,14 +466,12 @@ func autoCreateContainerSnapshots(ctx context.Context, d *Daemon, instances []in
 	for _, c := range instances {
 		ch := make(chan error)
 		go func() {
-			snapshotName, err := containerDetermineNextSnapshotName(d, c, "snap%d")
+			snapshotName, err := instance.NextSnapshotName(d.State(), c, "snap%d")
 			if err != nil {
 				logger.Error("Error retrieving next snapshot name", log.Ctx{"err": err, "container": c})
 				ch <- nil
 				return
 			}
-
-			snapshotName = fmt.Sprintf("%s%s%s", c.Name(), shared.SnapshotDelimiter, snapshotName)
 
 			expiry, err := shared.GetSnapshotExpiry(time.Now(), c.ExpandedConfig()["snapshots.expiry"])
 			if err != nil {
@@ -760,21 +480,7 @@ func autoCreateContainerSnapshots(ctx context.Context, d *Daemon, instances []in
 				return
 			}
 
-			args := db.InstanceArgs{
-				Architecture: c.Architecture(),
-				Config:       c.LocalConfig(),
-				Type:         c.Type(),
-				Snapshot:     true,
-				Devices:      c.LocalDevices(),
-				Ephemeral:    c.IsEphemeral(),
-				Name:         snapshotName,
-				Profiles:     c.Profiles(),
-				Project:      c.Project(),
-				Stateful:     false,
-				ExpiryDate:   expiry,
-			}
-
-			_, err = instanceCreateAsSnapshot(d.State(), args, c, nil)
+			err = c.Snapshot(snapshotName, expiry, false)
 			if err != nil {
 				logger.Error("Error creating snapshots", log.Ctx{"err": err, "container": c})
 			}
@@ -872,54 +578,6 @@ func pruneExpiredContainerSnapshots(ctx context.Context, d *Daemon, snapshots []
 	}
 
 	return nil
-}
-
-func containerDetermineNextSnapshotName(d *Daemon, c instance.Instance, defaultPattern string) (string, error) {
-	var err error
-
-	pattern := c.ExpandedConfig()["snapshots.pattern"]
-	if pattern == "" {
-		pattern = defaultPattern
-	}
-
-	pattern, err = shared.RenderTemplate(pattern, pongo2.Context{
-		"creation_date": time.Now(),
-	})
-	if err != nil {
-		return "", err
-	}
-
-	count := strings.Count(pattern, "%d")
-	if count > 1 {
-		return "", fmt.Errorf("Snapshot pattern may contain '%%d' only once")
-	} else if count == 1 {
-		i := d.cluster.GetNextInstanceSnapshotIndex(c.Project(), c.Name(), pattern)
-		return strings.Replace(pattern, "%d", strconv.Itoa(i), 1), nil
-	}
-
-	snapshotExists := false
-
-	snapshots, err := c.Snapshots()
-	if err != nil {
-		return "", err
-	}
-
-	for _, snap := range snapshots {
-		_, snapOnlyName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
-		if snapOnlyName == pattern {
-			snapshotExists = true
-			break
-		}
-	}
-
-	// Append '-0', '-1', etc. if the actual pattern/snapshot name already exists
-	if snapshotExists {
-		pattern = fmt.Sprintf("%s-%%d", pattern)
-		i := d.cluster.GetNextInstanceSnapshotIndex(c.Project(), c.Name(), pattern)
-		return strings.Replace(pattern, "%d", strconv.Itoa(i), 1), nil
-	}
-
-	return pattern, nil
 }
 
 var instanceDriversCacheVal atomic.Value

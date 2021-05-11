@@ -60,7 +60,7 @@ For help with any of those, simply call them with --help.`))
 	app.PersistentFlags().BoolVar(&globalCmd.flagVersion, "version", false, i18n.G("Print version number"))
 	app.PersistentFlags().BoolVarP(&globalCmd.flagHelp, "help", "h", false, i18n.G("Print help"))
 	app.PersistentFlags().BoolVar(&globalCmd.flagForceLocal, "force-local", false, i18n.G("Force using the local unix socket"))
-	app.PersistentFlags().StringVar(&globalCmd.flagProject, "project", "", i18n.G("Override the source project"))
+	app.PersistentFlags().StringVar(&globalCmd.flagProject, "project", "", i18n.G("Override the source project")+"``")
 	app.PersistentFlags().BoolVar(&globalCmd.flagLogDebug, "debug", false, i18n.G("Show all debug messages"))
 	app.PersistentFlags().BoolVarP(&globalCmd.flagLogVerbose, "verbose", "v", false, i18n.G("Show all information messages"))
 	app.PersistentFlags().BoolVarP(&globalCmd.flagQuiet, "quiet", "q", false, i18n.G("Don't show progress information"))
@@ -208,6 +208,10 @@ For help with any of those, simply call them with --help.`))
 	// version sub-command
 	versionCmd := cmdVersion{global: &globalCmd}
 	app.AddCommand(versionCmd.Command())
+
+	// warning sub-command
+	warningCmd := cmdWarning{global: &globalCmd}
+	app.AddCommand(warningCmd.Command())
 
 	// Get help command
 	app.InitDefaultHelpCmd()

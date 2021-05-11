@@ -8,6 +8,7 @@ import (
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/ip"
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/revert"
@@ -36,13 +37,14 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 		"maas.subnet.ipv4",
 		"maas.subnet.ipv6",
 		"boot.priority",
+		"gvrp",
 	}
 
 	// Check that if network proeperty is set that conflicting keys are not present.
 	if d.config["network"] != "" {
 		requiredFields = append(requiredFields, "network")
 
-		bannedKeys := []string{"nictype", "parent", "mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6"}
+		bannedKeys := []string{"nictype", "parent", "mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6", "gvrp"}
 		for _, bannedKey := range bannedKeys {
 			if d.config[bannedKey] != "" {
 				return fmt.Errorf("Cannot use %q property in conjunction with %q property", bannedKey, "network")
@@ -70,7 +72,7 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 		d.config["parent"] = netConfig["parent"]
 
 		// Copy certain keys verbatim from the network's settings.
-		inheritKeys := []string{"mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6"}
+		inheritKeys := []string{"mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6", "gvrp"}
 		for _, inheritKey := range inheritKeys {
 			if _, found := netConfig[inheritKey]; found {
 				d.config[inheritKey] = netConfig[inheritKey]
@@ -81,7 +83,7 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 		requiredFields = append(requiredFields, "parent")
 	}
 
-	err := d.config.Validate(nicValidationRules(requiredFields, optionalFields))
+	err := d.config.Validate(nicValidationRules(requiredFields, optionalFields, instConf))
 	if err != nil {
 		return err
 	}
@@ -125,7 +127,7 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 	saveData["host_name"] = network.RandomDevName("mac")
 
 	// Create VLAN parent device if needed.
-	statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], actualParentName, d.config["vlan"])
+	statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], actualParentName, d.config["vlan"], shared.IsTrue(d.config["gvrp"]))
 	if err != nil {
 		return nil, err
 	}
@@ -141,13 +143,29 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 
 	if d.inst.Type() == instancetype.Container {
 		// Create MACVLAN interface.
-		_, err = shared.RunCommand("ip", "link", "add", "dev", saveData["host_name"], "link", actualParentName, "type", "macvlan", "mode", "bridge")
+		macvlan := &ip.Macvlan{
+			Link: ip.Link{
+				Name:   saveData["host_name"],
+				Parent: actualParentName,
+			},
+			Mode: "bridge",
+		}
+		err = macvlan.Add()
 		if err != nil {
 			return nil, err
 		}
 	} else if d.inst.Type() == instancetype.VM {
 		// Create MACVTAP interface.
-		_, err = shared.RunCommand("ip", "link", "add", "dev", saveData["host_name"], "link", actualParentName, "type", "macvtap", "mode", "bridge")
+		macvtap := &ip.Macvtap{
+			Macvlan: ip.Macvlan{
+				Link: ip.Link{
+					Name:   saveData["host_name"],
+					Parent: actualParentName,
+				},
+				Mode: "bridge",
+			},
+		}
+		err = macvtap.Add()
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +175,8 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 
 	// Set the MAC address.
 	if d.config["hwaddr"] != "" {
-		_, err := shared.RunCommand("ip", "link", "set", "dev", saveData["host_name"], "address", d.config["hwaddr"])
+		link := &ip.Link{Name: saveData["host_name"]}
+		err := link.SetAddress(d.config["hwaddr"])
 		if err != nil {
 			return nil, fmt.Errorf("Failed to set the MAC address: %s", err)
 		}
@@ -173,7 +192,8 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 
 	if d.inst.Type() == instancetype.VM {
 		// Bring the interface up on host side.
-		_, err := shared.RunCommand("ip", "link", "set", "dev", saveData["host_name"], "up")
+		link := &ip.Link{Name: saveData["host_name"]}
+		err := link.SetUp()
 		if err != nil {
 			return nil, fmt.Errorf("Failed to bring up interface %s: %v", saveData["host_name"], err)
 		}
@@ -186,8 +206,8 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 
 	runConf := deviceConfig.RunConfig{}
 	runConf.NetworkInterface = []deviceConfig.RunConfigItem{
-		{Key: "name", Value: d.config["name"]},
 		{Key: "type", Value: "phys"},
+		{Key: "name", Value: d.config["name"]},
 		{Key: "flags", Value: "up"},
 		{Key: "link", Value: saveData["host_name"]},
 	}

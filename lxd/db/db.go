@@ -1,3 +1,4 @@
+//go:build linux && cgo && !agent
 // +build linux,cgo,!agent
 
 package db
@@ -247,7 +248,7 @@ func OpenCluster(name string, store driver.NodeStore, address, dir string, timeo
 		return cluster, ErrSomeNodesAreBehind
 	}
 
-	stmts, err := cluster.PrepareStmts(db)
+	stmts, err := cluster.PrepareStmts(db, false)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to prepare statements")
 	}
@@ -315,7 +316,7 @@ func ForLocalInspection(db *sql.DB) *Cluster {
 func ForLocalInspectionWithPreparedStmts(db *sql.DB) (*Cluster, error) {
 	c := ForLocalInspection(db)
 
-	stmts, err := cluster.PrepareStmts(c.db)
+	stmts, err := cluster.PrepareStmts(c.db, true)
 	if err != nil {
 		return nil, errors.Wrap(err, "Prepare database statements")
 	}

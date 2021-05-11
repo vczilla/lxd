@@ -24,6 +24,7 @@ import (
 	"github.com/lxc/lxd/lxd/rsync"
 	"github.com/lxc/lxd/lxd/state"
 	storagePools "github.com/lxc/lxd/lxd/storage"
+	storageDrivers "github.com/lxc/lxd/lxd/storage/drivers"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
@@ -48,7 +49,7 @@ func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool
 
 	if stateful && inst.IsRunning() {
 		if inst.Type() == instancetype.VM {
-			return nil, errors.Wrap(storagePools.ErrNotImplemented, "Unable to perform VM live migration")
+			return nil, errors.Wrap(storageDrivers.ErrNotImplemented, "Unable to perform VM live migration")
 		}
 
 		_, err := exec.LookPath("criu")
@@ -875,7 +876,7 @@ func (c *migrationSink) Do(state *state.State, migrateOp *operations.Operation) 
 			Name:          args.Instance.Name(),
 			MigrationType: respTypes[0],
 			Refresh:       args.Refresh,    // Indicate to receiver volume should exist.
-			TrackProgress: false,           // Do not use a progress tracker on receiver.
+			TrackProgress: true,            // Use a progress tracker on receiver to get in-cluster progress information.
 			Live:          args.Live,       // Indicates we will get a final rootfs sync.
 			VolumeSize:    args.VolumeSize, // Block size setting override.
 		}
@@ -918,7 +919,7 @@ func (c *migrationSink) Do(state *state.State, migrateOp *operations.Operation) 
 				_, err := instance.LoadByProjectAndName(state, args.Instance.Project(), snapArgs.Name)
 				if err != nil {
 					// Create the snapshot as it doesn't seem to exist.
-					_, err := instanceCreateInternal(state, snapArgs)
+					_, err := instance.CreateInternal(state, snapArgs)
 					if err != nil {
 						return errors.Wrapf(err, "Failed creating instance snapshot record %q", snapArgs.Name)
 					}

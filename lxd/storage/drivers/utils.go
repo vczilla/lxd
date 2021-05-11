@@ -165,7 +165,7 @@ func TryMount(src string, dst string, fs string, flags uintptr, options string) 
 	}
 
 	if err != nil {
-		return errors.Wrapf(err, "Failed to mount '%s' on '%s'", src, dst)
+		return errors.Wrapf(err, "Failed to mount %q on %q using %q", src, dst, fs)
 	}
 
 	return nil
@@ -207,7 +207,13 @@ func tryExists(path string) bool {
 
 // fsUUID returns the filesystem UUID for the given block path.
 func fsUUID(path string) (string, error) {
-	return shared.RunCommand("blkid", "-s", "UUID", "-o", "value", path)
+	val, err := shared.RunCommand("blkid", "-s", "UUID", "-o", "value", path)
+	if err != nil {
+		return "", err
+	}
+
+	val = strings.TrimSpace(val)
+	return val, nil
 }
 
 // hasFilesystem checks if a given path is backed by a specified filesystem.
@@ -332,8 +338,10 @@ func roundVolumeBlockFileSizeBytes(sizeBytes int64) int64 {
 
 // ensureVolumeBlockFile creates new block file or enlarges the raw block file for a volume to the specified size.
 // Returns true if resize took place, false if not. Requested size is rounded to nearest block size using
-// roundVolumeBlockFileSizeBytes() before decision whether to resize is taken.
-func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64) (bool, error) {
+// roundVolumeBlockFileSizeBytes() before decision whether to resize is taken. Accepts unsupportedResizeTypes
+// list that indicates which volume types it should not attempt to resize (when vol.allowUnsafeResize=false) and
+// instead return ErrNotSupported.
+func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64, unsupportedResizeTypes ...VolumeType) (bool, error) {
 	if sizeBytes <= 0 {
 		return false, fmt.Errorf("Size cannot be zero")
 	}
@@ -352,16 +360,18 @@ func ensureVolumeBlockFile(vol Volume, path string, sizeBytes int64) (bool, erro
 			return false, nil
 		}
 
-		// Block image volumes cannot be resized because they can have a readonly snapshot that doesn't get
-		// updated when the volume's size is changed, and this is what instances are created from.
-		// During initial volume fill allowUnsafeResize is enabled because snapshot hasn't been taken yet.
-		if !vol.allowUnsafeResize && vol.volType == VolumeTypeImage {
-			return false, ErrNotSupported
-		}
-
 		// Only perform pre-resize sanity checks if we are not in "unsafe" mode.
 		// In unsafe mode we expect the caller to know what they are doing and understand the risks.
 		if !vol.allowUnsafeResize {
+			// Reject if would try and resize a volume type that is not supported.
+			// This needs to come before the ErrCannotBeShrunk check below so that any resize attempt
+			// is blocked with ErrNotSupported error.
+			for _, unsupportedType := range unsupportedResizeTypes {
+				if unsupportedType == vol.volType {
+					return false, ErrNotSupported
+				}
+			}
+
 			if sizeBytes < oldSizeBytes {
 				return false, errors.Wrap(ErrCannotBeShrunk, "Block volumes cannot be shrunk")
 			}
@@ -820,7 +830,7 @@ func BlockDiskSizeBytes(blockDiskPath string) (int64, error) {
 		defer f.Close()
 		fd := int(f.Fd())
 
-		// Retrieve the block size.
+		// Retrieve the block device size.
 		res, err := unix.IoctlGetInt(fd, unix.BLKGETSIZE64)
 		if err != nil {
 			return -1, err

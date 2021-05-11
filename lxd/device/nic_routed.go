@@ -10,6 +10,7 @@ import (
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/ip"
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
@@ -29,7 +30,13 @@ func (d *nicRouted) CanHotPlug() bool {
 }
 
 // UpdatableFields returns a list of fields that can be updated without triggering a device remove & add.
-func (d *nicRouted) UpdatableFields() []string {
+func (d *nicRouted) UpdatableFields(oldDevice Type) []string {
+	// Check old and new device types match.
+	_, match := oldDevice.(*nicRouted)
+	if !match {
+		return []string{}
+	}
+
 	return []string{"limits.ingress", "limits.egress", "limits.max"}
 }
 
@@ -37,6 +44,11 @@ func (d *nicRouted) UpdatableFields() []string {
 func (d *nicRouted) validateConfig(instConf instance.ConfigReader) error {
 	if !instanceSupported(instConf.Type(), instancetype.Container) {
 		return ErrUnsupportedDevType
+	}
+
+	err := d.isUniqueWithGatewayAutoMode(instConf)
+	if err != nil {
+		return err
 	}
 
 	requiredFields := []string{}
@@ -56,15 +68,33 @@ func (d *nicRouted) validateConfig(instConf instance.ConfigReader) error {
 		"ipv6.host_address",
 		"ipv4.host_table",
 		"ipv6.host_table",
+		"gvrp",
 	}
 
-	rules := nicValidationRules(requiredFields, optionalFields)
+	rules := nicValidationRules(requiredFields, optionalFields, instConf)
 	rules["ipv4.address"] = validate.Optional(validate.IsNetworkAddressV4List)
 	rules["ipv6.address"] = validate.Optional(validate.IsNetworkAddressV6List)
+	rules["gvrp"] = validate.Optional(validate.IsBool)
 
-	err := d.config.Validate(rules)
+	err = d.config.Validate(rules)
 	if err != nil {
 		return err
+	}
+
+	// Detect duplicate IPs in config.
+	for _, key := range []string{"ipv4.address", "ipv6.address"} {
+		ips := make(map[string]struct{})
+
+		if d.config[key] != "" {
+			for _, addr := range strings.Split(d.config[key], ",") {
+				addr = strings.TrimSpace(addr)
+				if _, dupe := ips[addr]; dupe {
+					return fmt.Errorf("Duplicate address %q in %q", addr, key)
+				}
+
+				ips[addr] = struct{}{}
+			}
+		}
 	}
 
 	return nil
@@ -127,7 +157,7 @@ func (d *nicRouted) validateEnvironment() error {
 	if effectiveParentName != "" && d.config["ipv4.address"] != "" {
 		ipv4FwdPath := fmt.Sprintf("net/ipv4/conf/%s/forwarding", effectiveParentName)
 		sysctlVal, err := util.SysctlGet(ipv4FwdPath)
-		if err != nil || sysctlVal != "1\n" {
+		if err != nil {
 			return fmt.Errorf("Error reading net sysctl %s: %v", ipv4FwdPath, err)
 		}
 		if sysctlVal != "1\n" {
@@ -180,7 +210,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 	if d.config["parent"] != "" {
 		parentName = network.GetHostDevice(d.config["parent"], d.config["vlan"])
 
-		statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], parentName, d.config["vlan"])
+		statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], parentName, d.config["vlan"], shared.IsTrue(d.config["gvrp"]))
 		if err != nil {
 			return nil, err
 		}
@@ -210,8 +240,8 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 
 	runConf := deviceConfig.RunConfig{}
 	nic := []deviceConfig.RunConfigItem{
-		{Key: "name", Value: d.config["name"]},
 		{Key: "type", Value: "veth"},
+		{Key: "name", Value: d.config["name"]},
 		{Key: "flags", Value: "up"},
 		{Key: "veth.mode", Value: "router"},
 		{Key: "veth.pair", Value: saveData["host_name"]},
@@ -349,7 +379,12 @@ func (d *nicRouted) postStart() error {
 		// Add dummy link-local gateway IPs to the host end of the veth pair. This ensures that
 		// liveness detection of the gateways inside the instance work and ensure that traffic
 		// doesn't periodically halt whilst ARP is re-detected.
-		_, err := shared.RunCommand("ip", "-4", "addr", "add", fmt.Sprintf("%s/32", d.ipv4HostAddress()), "dev", d.config["host_name"])
+		addr := &ip.Addr{
+			DevName: d.config["host_name"],
+			Address: fmt.Sprintf("%s/32", d.ipv4HostAddress()),
+			Family:  ip.FamilyV4,
+		}
+		err := addr.Add()
 		if err != nil {
 			return err
 		}
@@ -361,7 +396,13 @@ func (d *nicRouted) postStart() error {
 		if d.config["ipv4.host_table"] != "" {
 			for _, addr := range strings.Split(d.config["ipv4.address"], ",") {
 				addr = strings.TrimSpace(addr)
-				_, err := shared.RunCommand("ip", "-4", "route", "add", "table", d.config["ipv4.host_table"], fmt.Sprintf("%s/32", addr), "dev", d.config["host_name"])
+				r := &ip.Route{
+					DevName: d.config["host_name"],
+					Route:   fmt.Sprintf("%s/32", addr),
+					Table:   d.config["ipv4.host_table"],
+					Family:  ip.FamilyV4,
+				}
+				err := r.Add()
 				if err != nil {
 					return err
 				}
@@ -373,7 +414,12 @@ func (d *nicRouted) postStart() error {
 		// Add dummy link-local gateway IPs to the host end of the veth pair. This ensures that
 		// liveness detection of the gateways inside the instance work and ensure that traffic
 		// doesn't periodically halt whilst NDP is re-detected.
-		_, err := shared.RunCommand("ip", "-6", "addr", "add", fmt.Sprintf("%s/128", d.ipv6HostAddress()), "dev", d.config["host_name"])
+		addr := &ip.Addr{
+			DevName: d.config["host_name"],
+			Address: fmt.Sprintf("%s/128", d.ipv6HostAddress()),
+			Family:  ip.FamilyV6,
+		}
+		err := addr.Add()
 		if err != nil {
 			return err
 		}
@@ -385,7 +431,13 @@ func (d *nicRouted) postStart() error {
 		if d.config["ipv6.host_table"] != "" {
 			for _, addr := range strings.Split(d.config["ipv6.address"], ",") {
 				addr = strings.TrimSpace(addr)
-				_, err := shared.RunCommand("ip", "-6", "route", "add", "table", d.config["ipv6.host_table"], fmt.Sprintf("%s/128", addr), "dev", d.config["host_name"])
+				r := &ip.Route{
+					DevName: d.config["host_name"],
+					Route:   fmt.Sprintf("%s/128", addr),
+					Table:   d.config["ipv6.host_table"],
+					Family:  ip.FamilyV6,
+				}
+				err := r.Add()
 				if err != nil {
 					return err
 				}
@@ -418,11 +470,25 @@ func (d *nicRouted) postStop() error {
 
 	errs := []error{}
 
+	// Delete host-side end of veth pair if not removed by liblxc.
 	if network.InterfaceExists(d.config["host_name"]) {
 		// Removing host-side end of veth pair will delete the peer end too.
 		err := network.InterfaceRemove(d.config["host_name"])
 		if err != nil {
 			errs = append(errs, errors.Wrapf(err, "Failed to remove interface %q", d.config["host_name"]))
+		}
+	}
+
+	// Delete IP neighbour proxy entries on the parent if they haven't been removed by liblxc.
+	for _, key := range []string{"ipv4.address", "ipv6.address"} {
+		if d.config[key] != "" {
+			for _, addr := range strings.Split(d.config[key], ",") {
+				neigh := &ip.Neigh{
+					DevName: d.config["parent"],
+					Proxy:   strings.TrimSpace(addr),
+				}
+				neigh.Delete()
+			}
 		}
 	}
 
@@ -462,4 +528,26 @@ func (d *nicRouted) ipv6HostAddress() string {
 	}
 
 	return nicRoutedIPv6GW
+}
+
+func (d *nicRouted) isUniqueWithGatewayAutoMode(instConf instance.ConfigReader) error {
+	instDevs := instConf.ExpandedDevices()
+	for _, k := range []string{"ipv4.gateway", "ipv6.gateway"} {
+		if d.config[k] != "auto" && d.config[k] != "" {
+			continue // nothing to do as auto not being used.
+		}
+
+		// Check other routed NIC devices don't have auto set.
+		for nicName, nicConfig := range instDevs {
+			if nicName == d.name || nicConfig["nictype"] != "routed" {
+				continue // Skip ourselves.
+			}
+
+			if nicConfig[k] == "auto" || nicConfig[k] == "" {
+				return fmt.Errorf("Existing NIC %q already uses %q in auto mode", nicName, k)
+			}
+		}
+	}
+
+	return nil
 }

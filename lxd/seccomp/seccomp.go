@@ -1,5 +1,5 @@
-// +build linux
-// +build cgo
+//go:build linux && cgo
+// +build linux,cgo
 
 package seccomp
 
@@ -470,6 +470,7 @@ fsmount errno 38
 fspick errno 38
 open_tree errno 38
 move_mount errno 38
+openat2 errno 38
 `
 
 // We don't want to filter any of the following flag combinations since they do
@@ -878,7 +879,7 @@ func (siov *Iovec) PutSeccompIovec() {
 
 // ReceiveSeccompIovec receives a seccomp iovec.
 func (siov *Iovec) ReceiveSeccompIovec(fd int) (uint64, error) {
-	bytes, fds, err := netutils.AbstractUnixReceiveFdData(fd, 3, unsafe.Pointer(siov.iov), 4)
+	bytes, fds, err := netutils.AbstractUnixReceiveFdData(fd, 3, netutils.UnixFdsAcceptLess, unsafe.Pointer(siov.iov), 4)
 	if err != nil || err == io.EOF {
 		return 0, err
 	}

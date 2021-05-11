@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -15,6 +14,7 @@ import (
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/locking"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
@@ -28,8 +28,13 @@ import (
 	log "github.com/lxc/lxd/shared/log15"
 )
 
-var imagesDownloading = map[string]chan bool{}
-var imagesDownloadingLock sync.Mutex
+// imageDownloadLock aquires a lock for downloading/transferring an image and returns the unlock function.
+func (d *Daemon) imageDownloadLock(fingerprint string) locking.UnlockFunc {
+	logger.Debugf("Acquiring lock for image download of %q", fingerprint)
+	defer logger.Debugf("Lock acquired for image download of %q", fingerprint)
+
+	return locking.Lock(fmt.Sprintf("ImageDownload_%s", fingerprint))
+}
 
 // ImageDownload resolves the image fingerprint and if not in the database, downloads it
 func (d *Daemon) ImageDownload(op *operations.Operation, server string, protocol string, certificate string, secret string, alias string, imageType string, forContainer bool, autoUpdate bool, storagePool string, preferCached bool, project string, budget int64) (*api.Image, error) {
@@ -61,13 +66,13 @@ func (d *Daemon) ImageDownload(op *operations.Operation, server string, protocol
 			// Setup LXD client
 			remote, err = lxd.ConnectPublicLXD(server, args)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrapf(err, "Failed to connect to LXD server %q", server)
 			}
 		} else {
 			// Setup simplestreams client
 			remote, err = lxd.ConnectSimpleStreams(server, args)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrapf(err, "Failed to connect to simple streams server %q", server)
 			}
 		}
 
@@ -82,12 +87,16 @@ func (d *Daemon) ImageDownload(op *operations.Operation, server string, protocol
 			// Expand partial fingerprints
 			info, _, err = remote.GetImage(fp)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrapf(err, "Failed getting remote image info")
 			}
 
 			fp = info.Fingerprint
 		}
 	}
+
+	// Ensure we are the only ones operating on this image.
+	unlock := d.imageDownloadLock(fp)
+	defer unlock()
 
 	// If auto-update is on and we're being given the image by
 	// alias, try to use a locally cached image matching the given
@@ -114,20 +123,20 @@ func (d *Daemon) ImageDownload(op *operations.Operation, server string, protocol
 		// Check if the image is available locally or it's on another node.
 		nodeAddress, err := d.State().Cluster.LocateImage(imgInfo.Fingerprint)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Locate image %q in the cluster", imgInfo.Fingerprint)
+			return nil, errors.Wrapf(err, "Failed locating image %q in the cluster", imgInfo.Fingerprint)
 		}
 
 		if nodeAddress != "" {
 			// The image is available from another node, let's try to import it.
 			err = instanceImageTransfer(d, project, imgInfo.Fingerprint, nodeAddress)
 			if err != nil {
-				return nil, errors.Wrapf(err, "Failed transferring image")
+				return nil, errors.Wrapf(err, "Failed transferring image %q from %q", imgInfo.Fingerprint, nodeAddress)
 			}
 
 			// As the image record already exists in the project, just add the node ID to the image.
 			err = d.cluster.AddImageToLocalNode(project, imgInfo.Fingerprint)
 			if err != nil {
-				return nil, errors.Wrapf(err, "Failed adding image to local node")
+				return nil, errors.Wrapf(err, "Failed adding transferred image %q to local cluster member", imgInfo.Fingerprint)
 			}
 		}
 	} else if err == db.ErrNoSuchObject {
@@ -214,45 +223,6 @@ func (d *Daemon) ImageDownload(op *operations.Operation, server string, protocol
 		logger.Debug("Created image on storage pool", ctxMap)
 		return info, nil
 	}
-
-	// Deal with parallel downloads
-	imagesDownloadingLock.Lock()
-	if waitChannel, ok := imagesDownloading[fp]; ok {
-		// We are already downloading the image
-		imagesDownloadingLock.Unlock()
-
-		logger.Debug("Already downloading the image, waiting for it to succeed", log.Ctx{"fingerprint": fp})
-
-		// Wait until the download finishes (channel closes)
-		<-waitChannel
-
-		// Grab the database entry
-		_, imgInfo, err := d.cluster.GetImage(project, fp, false)
-		if err != nil {
-			// Other download failed, lets try again
-			logger.Error("Other image download didn't succeed", log.Ctx{"fingerprint": fp})
-		} else {
-			// Other download succeeded, we're done
-			return imgInfo, nil
-		}
-	} else {
-		imagesDownloadingLock.Unlock()
-	}
-
-	// Add the download to the queue
-	imagesDownloadingLock.Lock()
-	imagesDownloading[fp] = make(chan bool)
-	imagesDownloadingLock.Unlock()
-
-	// Unlock once this func ends.
-	defer func() {
-		imagesDownloadingLock.Lock()
-		if waitChannel, ok := imagesDownloading[fp]; ok {
-			close(waitChannel)
-			delete(imagesDownloading, fp)
-		}
-		imagesDownloadingLock.Unlock()
-	}()
 
 	// Begin downloading
 	if op == nil {

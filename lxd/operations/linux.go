@@ -1,3 +1,4 @@
+//go:build linux && cgo && !agent
 // +build linux,cgo,!agent
 
 package operations
@@ -14,7 +15,7 @@ func registerDBOperation(op *Operation, opType db.OperationType) error {
 	}
 
 	err := op.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		_, err := tx.CreateOperation(op.project, op.id, opType)
+		_, err := tx.CreateOperation(op.projectName, op.id, opType)
 		return err
 	})
 	if err != nil {
@@ -59,5 +60,5 @@ func (op *Operation) sendEvent(eventMessage interface{}) {
 		return
 	}
 
-	op.events.Send(op.project, "operation", eventMessage)
+	op.events.Send(op.projectName, "operation", eventMessage)
 }

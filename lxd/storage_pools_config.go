@@ -35,6 +35,7 @@ var storagePoolConfigKeys = map[string]func(value string) error{
 		return err
 	},
 	"ceph.rbd.clone_copy": validate.Optional(validate.IsBool),
+	"ceph.rbd.features":   validate.IsAny,
 	"ceph.user.name":      validate.IsAny,
 
 	// valid drivers: cephfs
@@ -164,8 +165,7 @@ func storagePoolValidateConfig(name string, driver string, config map[string]str
 func storagePoolFillDefault(name string, driver string, config map[string]string) error {
 	if driver == "dir" || driver == "ceph" || driver == "cephfs" {
 		if config["size"] != "" {
-			return fmt.Errorf(`The "size" property does not apply `+
-				`to %s storage pools`, driver)
+			return fmt.Errorf(`The "size" property does not apply to %q storage pools`, driver)
 		}
 	} else {
 		if config["size"] == "" {

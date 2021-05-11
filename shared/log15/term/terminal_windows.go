@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package term
@@ -10,8 +11,6 @@ package term
 import (
 	"golang.org/x/sys/windows"
 )
-
-var kernel32 = windows.NewLazyDLL("kernel32.dll")
 
 // IsTty returns true if the given file descriptor is a terminal.
 func IsTty(fd uintptr) bool {

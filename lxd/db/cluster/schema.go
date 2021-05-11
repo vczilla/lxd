@@ -12,8 +12,23 @@ CREATE TABLE certificates (
     type INTEGER NOT NULL,
     name TEXT NOT NULL,
     certificate TEXT NOT NULL,
+    restricted INTEGER NOT NULL DEFAULT 0,
     UNIQUE (fingerprint)
 );
+CREATE TABLE certificates_projects (
+	certificate_id INTEGER NOT NULL,
+	project_id INTEGER NOT NULL,
+	FOREIGN KEY (certificate_id) REFERENCES certificates (id) ON DELETE CASCADE,
+	FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+	UNIQUE (certificate_id, project_id)
+);
+CREATE VIEW certificates_projects_ref (fingerprint,
+    value) AS
+	SELECT certificates.fingerprint,
+    projects.name FROM certificates_projects
+		JOIN certificates ON certificates.id=certificates_projects.certificate_id
+		JOIN projects ON projects.id=certificates_projects.project_id
+		ORDER BY projects.name;
 CREATE TABLE config (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     key TEXT NOT NULL,
@@ -283,7 +298,26 @@ CREATE TABLE "networks" (
     description TEXT,
     state INTEGER NOT NULL DEFAULT 0,
     type INTEGER NOT NULL DEFAULT 0,
-    UNIQUE (project_id, name)
+    UNIQUE (project_id, name),
+    FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+CREATE TABLE networks_acls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    project_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    ingress TEXT NOT NULL,
+    egress TEXT NOT NULL,
+    UNIQUE (project_id, name),
+    FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+CREATE TABLE networks_acls_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    network_acl_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT,
+    UNIQUE (network_acl_id, key),
+    FOREIGN KEY (network_acl_id) REFERENCES networks_acls (id) ON DELETE CASCADE
 );
 CREATE TABLE "networks_config" (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -304,9 +338,9 @@ CREATE TABLE "networks_nodes" (
     FOREIGN KEY (network_id) REFERENCES "networks" (id) ON DELETE CASCADE,
     FOREIGN KEY (node_id) REFERENCES nodes (id) ON DELETE CASCADE
 );
-CREATE UNIQUE INDEX networks_unique_network_id_node_id_key ON networks_config (network_id, IFNULL(node_id, -1), key);
+CREATE UNIQUE INDEX networks_unique_network_id_node_id_key ON "networks_config" (network_id, IFNULL(node_id, -1), key);
 CREATE TABLE nodes (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name TEXT NOT NULL,
     description TEXT DEFAULT '',
     address TEXT NOT NULL,
@@ -460,6 +494,12 @@ CREATE VIEW projects_used_by_ref (name,
     nodes.name)
     FROM storage_volumes JOIN storage_pools ON storage_pool_id=storage_pools.id JOIN nodes ON node_id=nodes.id JOIN projects ON project_id=projects.id WHERE storage_volumes.type=2 UNION
   SELECT projects.name,
+    printf('/1.0/storage-pools/%s/volumes/custom/%s?project=%s',
+    storage_pools.name,
+    storage_volumes.name,
+    projects.name)
+    FROM storage_volumes JOIN storage_pools ON storage_pool_id=storage_pools.id JOIN projects ON project_id=projects.id WHERE storage_volumes.type=2 AND storage_volumes.node_id IS NULL UNION
+  SELECT projects.name,
     printf('/1.0/profiles/%s?project=%s',
     profiles.name,
     projects.name)
@@ -468,7 +508,12 @@ CREATE VIEW projects_used_by_ref (name,
     printf('/1.0/networks/%s?project=%s',
     networks.name,
     projects.name)
-    FROM networks JOIN projects ON project_id=projects.id;
+    FROM networks JOIN projects ON project_id=projects.id UNION
+  SELECT projects.name,
+    printf('/1.0/network-acls/%s?project=%s',
+    networks_acls.name,
+    projects.name)
+    FROM networks_acls JOIN projects ON project_id=projects.id;
 CREATE TABLE storage_pools (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name TEXT NOT NULL,
@@ -592,6 +637,25 @@ CREATE TABLE storage_volumes_snapshots_config (
     FOREIGN KEY (storage_volume_snapshot_id) REFERENCES storage_volumes_snapshots (id) ON DELETE CASCADE,
     UNIQUE (storage_volume_snapshot_id, key)
 );
+CREATE TABLE warnings (
+	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+	node_id INTEGER,
+	project_id INTEGER,
+	entity_type_code INTEGER,
+	entity_id INTEGER,
+	uuid TEXT NOT NULL,
+	type_code INTEGER NOT NULL,
+	status INTEGER NOT NULL,
+	first_seen_date DATETIME NOT NULL,
+	last_seen_date DATETIME NOT NULL,
+	updated_date DATETIME,
+	last_message TEXT NOT NULL,
+	count INTEGER NOT NULL,
+	UNIQUE (uuid),
+	FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+	FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX warnings_unique_node_id_project_id_entity_type_code_entity_id_type_code ON warnings(IFNULL(node_id, -1), IFNULL(project_id, -1), entity_type_code, entity_id, type_code);
 
-INSERT INTO schema (version, updated_at) VALUES (44, strftime("%s"))
+INSERT INTO schema (version, updated_at) VALUES (48, strftime("%s"))
 `

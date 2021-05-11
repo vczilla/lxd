@@ -222,8 +222,9 @@ spawn_lxd_and_join_cluster() {
   fi
 
   echo "==> Spawn additional cluster node in ${ns} with storage driver ${driver}"
+  secret="${LXD_SECRET:-"sekret"}"
 
-  LXD_ALT_CERT=1 LXD_NETNS="${ns}" spawn_lxd "${LXD_DIR}" false
+  LXD_NETNS="${ns}" spawn_lxd "${LXD_DIR}" false
   (
     set -e
 
@@ -240,7 +241,7 @@ cluster:
   server_address: 10.1.1.10${index}:${port}
   cluster_address: 10.1.1.10${target}:8443
   cluster_certificate: "$cert"
-  cluster_password: sekret
+  cluster_password: ${secret}
   member_config:
 EOF
     # Declare the pool only if the driver is not ceph, because

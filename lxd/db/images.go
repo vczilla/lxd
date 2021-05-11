@@ -1,3 +1,4 @@
+//go:build linux && cgo && !agent
 // +build linux,cgo,!agent
 
 package db
@@ -23,11 +24,13 @@ import (
 //
 //go:generate mapper stmt -p db -e image objects
 //go:generate mapper stmt -p db -e image objects-by-Project
+//go:generate mapper stmt -p db -e image objects-by-Project-and-Cached
 //go:generate mapper stmt -p db -e image objects-by-Project-and-Public
 //go:generate mapper stmt -p db -e image objects-by-Project-and-Fingerprint
 //go:generate mapper stmt -p db -e image objects-by-Project-and-Fingerprint-and-Public
 //go:generate mapper stmt -p db -e image objects-by-Fingerprint
 //go:generate mapper stmt -p db -e image objects-by-Cached
+//go:generate mapper stmt -p db -e image objects-by-AutoUpdate
 //
 //go:generate mapper method -p db -e image List
 //go:generate mapper method -p db -e image Get
@@ -56,6 +59,7 @@ type ImageFilter struct {
 	Fingerprint string // Matched with LIKE
 	Public      bool
 	Cached      bool
+	AutoUpdate  bool
 }
 
 // ImageSourceProtocol maps image source protocol codes to human-readable names.
@@ -263,25 +267,19 @@ SELECT fingerprint
 	return fingerprints, nil
 }
 
-// ExpiredImage used to store expired image info.
-type ExpiredImage struct {
-	Fingerprint string
-	ProjectName string
-}
-
-// GetExpiredImages returns the names and project name of all images that have expired since the given time.
-func (c *Cluster) GetExpiredImages(expiry int64) ([]ExpiredImage, error) {
+// GetExpiredImagesInProject returns the names of all images that have expired since the given time.
+func (c *Cluster) GetExpiredImagesInProject(expiry int64, project string) ([]string, error) {
 	var images []Image
 	err := c.Transaction(func(tx *ClusterTx) error {
 		var err error
-		images, err = tx.GetImages(ImageFilter{Cached: true})
+		images, err = tx.GetImages(ImageFilter{Cached: true, Project: project})
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	results := []ExpiredImage{}
+	results := []string{}
 	for _, r := range images {
 		// Figure out the expiry
 		timestamp := r.UploadDate
@@ -297,12 +295,7 @@ func (c *Cluster) GetExpiredImages(expiry int64) ([]ExpiredImage, error) {
 			continue
 		}
 
-		result := ExpiredImage{
-			Fingerprint: r.Fingerprint,
-			ProjectName: r.Project,
-		}
-
-		results = append(results, result)
+		results = append(results, r.Fingerprint)
 	}
 
 	return results, nil
@@ -896,6 +889,10 @@ func (c *Cluster) UpdateImage(id int, fname string, sz int64, public bool, autoU
 		defer stmt2.Close()
 
 		for key, value := range properties {
+			if value == "" {
+				continue
+			}
+
 			_, err = stmt2.Exec(id, 0, key, value)
 			if err != nil {
 				return err
@@ -1037,7 +1034,7 @@ func (c *Cluster) CreateImage(project, fp string, fname string, sz int64, public
 
 // GetPoolsWithImage get the IDs of all storage pools on which a given image exists.
 func (c *Cluster) GetPoolsWithImage(imageFingerprint string) ([]int64, error) {
-	q := "SELECT storage_pool_id FROM storage_volumes WHERE node_id=? AND name=? AND type=?"
+	q := "SELECT storage_pool_id FROM storage_volumes WHERE (node_id=? OR node_id IS NULL) AND name=? AND type=?"
 	var ids []int
 	err := c.Transaction(func(tx *ClusterTx) error {
 		var err error
@@ -1094,6 +1091,35 @@ func (c *Cluster) UpdateImageUploadDate(id int, uploadedAt time.Time) error {
 	return err
 }
 
+// GetImages returns all images.
+func (c *Cluster) GetImages() (map[string][]string, error) {
+	images := make(map[string][]string) // key is fingerprint, value is list of projects
+	err := c.Transaction(func(tx *ClusterTx) error {
+		stmt := `
+    SELECT images.fingerprint, projects.name FROM images
+      LEFT JOIN projects ON images.project_id = projects.id
+		`
+		rows, err := tx.tx.Query(stmt)
+		if err != nil {
+			return err
+		}
+
+		var fingerprint string
+		var projectName string
+		for rows.Next() {
+			err := rows.Scan(&fingerprint, &projectName)
+			if err != nil {
+				return err
+			}
+
+			images[fingerprint] = append(images[fingerprint], projectName)
+		}
+
+		return rows.Err()
+	})
+	return images, err
+}
+
 // GetImagesOnLocalNode returns all images that the local LXD node has.
 func (c *Cluster) GetImagesOnLocalNode() (map[string][]string, error) {
 	return c.GetImagesOnNode(c.nodeID)
@@ -1139,7 +1165,18 @@ SELECT DISTINCT nodes.address FROM nodes
   LEFT JOIN images ON images_nodes.image_id = images.id
 WHERE images.fingerprint = ?
 	`
-	return c.getNodesByImageFingerprint(q, fingerprint)
+	return c.getNodesByImageFingerprint(q, fingerprint, nil)
+}
+
+// GetNodesWithImageAndAutoUpdate returns the addresses of online nodes which already have the image.
+func (c *Cluster) GetNodesWithImageAndAutoUpdate(fingerprint string, autoUpdate bool) ([]string, error) {
+	q := `
+SELECT DISTINCT nodes.address FROM nodes
+  JOIN images_nodes ON images_nodes.node_id = nodes.id
+  JOIN images ON images_nodes.image_id = images.id
+WHERE images.fingerprint = ? AND images.auto_update = ?
+	`
+	return c.getNodesByImageFingerprint(q, fingerprint, &autoUpdate)
 }
 
 // GetNodesWithoutImage returns the addresses of online nodes which don't have the image.
@@ -1151,10 +1188,10 @@ SELECT DISTINCT nodes.address FROM nodes WHERE nodes.address NOT IN (
     LEFT JOIN images ON images_nodes.image_id = images.id
   WHERE images.fingerprint = ?)
 `
-	return c.getNodesByImageFingerprint(q, fingerprint)
+	return c.getNodesByImageFingerprint(q, fingerprint, nil)
 }
 
-func (c *Cluster) getNodesByImageFingerprint(stmt, fingerprint string) ([]string, error) {
+func (c *Cluster) getNodesByImageFingerprint(stmt, fingerprint string, autoUpdate *bool) ([]string, error) {
 	var addresses []string // Addresses of online nodes with the image
 	err := c.Transaction(func(tx *ClusterTx) error {
 		offlineThreshold, err := tx.GetNodeOfflineThreshold()
@@ -1162,7 +1199,14 @@ func (c *Cluster) getNodesByImageFingerprint(stmt, fingerprint string) ([]string
 			return err
 		}
 
-		allAddresses, err := query.SelectStrings(tx.tx, stmt, fingerprint)
+		var allAddresses []string
+
+		if autoUpdate == nil {
+			allAddresses, err = query.SelectStrings(tx.tx, stmt, fingerprint)
+		} else {
+			allAddresses, err = query.SelectStrings(tx.tx, stmt, fingerprint, autoUpdate)
+		}
+
 		if err != nil {
 			return err
 		}

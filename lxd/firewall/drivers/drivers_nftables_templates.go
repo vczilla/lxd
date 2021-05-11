@@ -13,18 +13,29 @@ table {{.family}} {{.namespace}} {
 var nftablesNetForwardingPolicy = template.Must(template.New("nftablesNetForwardingPolicy").Parse(`
 chain fwd{{.chainSeparator}}{{.networkName}} {
 	type filter hook forward priority 0; policy accept;
-	oifname "{{.networkName}}" {{.action}}
-	iifname "{{.networkName}}" {{.action}}
+
+	{{if .ip4Action -}}
+	ip version 4 oifname "{{.networkName}}" {{.ip4Action}}
+	ip version 4 iifname "{{.networkName}}" {{.ip4Action}}
+	{{- end}}
+
+	{{if .ip6Action -}}
+	ip6 version 6 oifname "{{.networkName}}" {{.ip6Action}}
+	ip6 version 6 iifname "{{.networkName}}" {{.ip6Action}}
+	{{- end}}
 }
 `))
 
 var nftablesNetOutboundNAT = template.Must(template.New("nftablesNetOutboundNAT").Parse(`
 chain pstrt{{.chainSeparator}}{{.networkName}} {
 	type nat hook postrouting priority 100; policy accept;
-	{{if .srcIP -}}
-	{{.family}} saddr {{.subnet}} {{.family}} daddr != {{.subnet}} snat {{.srcIP}}
+
+	{{- range $ipFamily, $config := .rules}}
+	{{if $config.SNATAddress -}}
+	{{$ipFamily}} saddr {{$config.Subnet}} {{$ipFamily}} daddr != {{$config.Subnet}} snat {{$config.SNATAddress}}
 	{{else -}}
-	{{.family}} saddr {{.subnet}} {{.family}} daddr != {{.subnet}} masquerade
+	{{$ipFamily}} saddr {{$config.Subnet}} {{$ipFamily}} daddr != {{$config.Subnet}} masquerade
+	{{- end}}
 	{{- end}}
 }
 `))
@@ -32,23 +43,31 @@ chain pstrt{{.chainSeparator}}{{.networkName}} {
 var nftablesNetDHCPDNS = template.Must(template.New("nftablesNetDHCPDNS").Parse(`
 chain in{{.chainSeparator}}{{.networkName}} {
 	type filter hook input priority 0; policy accept;
+
 	iifname "{{.networkName}}" tcp dport 53 accept
 	iifname "{{.networkName}}" udp dport 53 accept
-	{{if eq .family "ip" -}}
-	iifname "{{.networkName}}" udp dport 67 accept
+
+	{{- range .ipFamilies}}
+	{{if eq . "ip" -}}
+	iifname "{{$.networkName}}" udp dport 67 accept
 	{{else -}}
-	iifname "{{.networkName}}" udp dport 547 accept
+	iifname "{{$.networkName}}" udp dport 547 accept
+	{{- end}}
 	{{- end}}
 }
 
 chain out{{.chainSeparator}}{{.networkName}} {
 	type filter hook output priority 0; policy accept;
+
 	oifname "{{.networkName}}" tcp sport 53 accept
 	oifname "{{.networkName}}" udp sport 53 accept
-	{{if eq .family "ip" -}}
-	oifname "{{.networkName}}" udp sport 67 accept
+
+	{{- range .ipFamilies}}
+	{{if eq . "ip" -}}
+	oifname "{{$.networkName}}" udp sport 67 accept
 	{{else -}}
-	oifname "{{.networkName}}" udp sport 547 accept
+	oifname "{{$.networkName}}" udp sport 547 accept
+	{{- end}}
 	{{- end}}
 }
 `))
@@ -57,22 +76,87 @@ var nftablesNetProxyNAT = template.Must(template.New("nftablesNetProxyNAT").Pars
 chain prert{{.chainSeparator}}{{.deviceLabel}} {
 	type nat hook prerouting priority -100; policy accept;
 	{{- range .rules}}
-	{{.family}} daddr {{.listenHost}} {{.connType}} dport {{.listenPort}} dnat to {{.connectDest}}
+	{{.ipFamily}} daddr {{.listenHost}} {{.connType}} dport {{.listenPort}} dnat to {{.connectDest}}
 	{{- end}}
 }
 
 chain out{{.chainSeparator}}{{.deviceLabel}} {
 	type nat hook output priority -100; policy accept;
 	{{- range .rules}}
-	{{.family}} daddr {{.listenHost}} {{.connType}} dport {{.listenPort}} dnat to {{.connectDest}}
+	{{.ipFamily}} daddr {{.listenHost}} {{.connType}} dport {{.listenPort}} dnat to {{.connectDest}}
 	{{- end}}
 }
 
 chain pstrt{{.chainSeparator}}{{.deviceLabel}} {
 	type nat hook postrouting priority 100; policy accept;
 	{{- range .rules}}
-	{{.family}} saddr {{.connectHost}} {{.family}} daddr {{.connectHost}} {{.connType}} dport {{.connectPort}} masquerade
+	{{if .addHairpinNat}}
+	{{.ipFamily}} saddr {{.connectHost}} {{.ipFamily}} daddr {{.connectHost}} {{.connType}} dport {{.connectPort}} masquerade
 	{{- end}}
+	{{- end}}
+}
+`))
+
+var nftablesNetACLSetup = template.Must(template.New("nftablesNetACLSetup").Parse(`
+add table {{.family}} {{.namespace}}
+add chain {{.family}} {{.namespace}} acl{{.chainSeparator}}{{.networkName}}
+add chain {{.family}} {{.namespace}} aclin{{.chainSeparator}}{{.networkName}} {type filter hook input priority filter; policy accept;}
+add chain {{.family}} {{.namespace}} aclout{{.chainSeparator}}{{.networkName}} {type filter hook output priority filter; policy accept;}
+add chain {{.family}} {{.namespace}} aclfwd{{.chainSeparator}}{{.networkName}} {type filter hook forward priority filter; policy accept;}
+flush chain {{.family}} {{.namespace}} acl{{.chainSeparator}}{{.networkName}}
+flush chain {{.family}} {{.namespace}} aclin{{.chainSeparator}}{{.networkName}}
+flush chain {{.family}} {{.namespace}} aclout{{.chainSeparator}}{{.networkName}}
+flush chain {{.family}} {{.namespace}} aclfwd{{.chainSeparator}}{{.networkName}}
+
+table {{.family}} {{.namespace}} {
+	chain aclin{{.chainSeparator}}{{.networkName}} {
+		# Allow DNS to LXD host.
+		iifname "{{.networkName}}" tcp dport 53 accept
+		iifname "{{.networkName}}" udp dport 53 accept
+
+		# Allow DHCPv6 to LXD host.
+		iifname "{{$.networkName}}" udp dport 67 accept
+		iifname "{{$.networkName}}" udp dport 547 accept
+
+		# Allow core ICMPv4 to LXD host.
+		iifname "{{$.networkName}}" icmp type {3, 11, 12} accept
+		iifname "{{$.networkName}}" icmpv6 type {1, 2, 3, 4, 133, 135, 136, 143} accept
+
+		iifname {{.networkName}} jump acl{{.chainSeparator}}{{.networkName}}
+	}
+
+	chain aclout{{.chainSeparator}}{{.networkName}} {
+		# Allow DHCPv6 from LXD host.
+		oifname "{{$.networkName}}" udp sport 67 accept
+		oifname "{{$.networkName}}" udp sport 547 accept
+
+		# Allow core ICMPv4 from LXD host.
+		oifname "{{$.networkName}}" icmp type {3, 11, 12} accept
+
+		# Allow ICMPv6 ping from host into network as dnsmasq uses this to probe IP allocations.
+		oifname "{{$.networkName}}" icmpv6 type {1, 2, 3, 4, 128, 134, 135, 136, 143}  accept
+
+		oifname {{.networkName}} jump acl{{.chainSeparator}}{{.networkName}}
+	}
+
+	chain aclfwd{{.chainSeparator}}{{.networkName}} {
+		iifname {{.networkName}} jump acl{{.chainSeparator}}{{.networkName}}
+		oifname {{.networkName}} jump acl{{.chainSeparator}}{{.networkName}}
+	}
+}
+`))
+
+var nftablesNetACLRules = template.Must(template.New("nftablesNetACLRules").Parse(`
+flush chain {{.family}} {{.namespace}} acl{{.chainSeparator}}{{.networkName}}
+
+table {{.family}} {{.namespace}} {
+	chain acl{{.chainSeparator}}{{.networkName}} {
+                ct state established,related accept
+
+		{{- range .rules}}
+		{{.}}
+		{{- end}}
+	}
 }
 `))
 

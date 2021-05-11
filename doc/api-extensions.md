@@ -350,7 +350,7 @@ This adds support for btrfs as a storage volume filesystem, in addition to ext4
 and xfs.
 
 ## resources
-This adds support for querying an LXD daemon for the system resources it has
+This adds support for querying a LXD daemon for the system resources it has
 available.
 
 ## kernel\_limits
@@ -647,6 +647,11 @@ be passed to a container (similar to what's done for GPUs).
 This adds support for snapshot scheduling. It introduces three new
 configuration keys: `snapshots.schedule`, `snapshots.schedule.stopped`, and
 `snapshots.pattern`. Snapshots can be created automatically up to every minute.
+
+## snapshots\_schedule\_aliases
+Snapshot schedule can be configured by a comma separated list of schedule aliases.
+Available aliases are `<@hourly> <@daily> <@midnight> <@weekly> <@monthly> <@annually> <@yearly> <@startup>` for instances,
+and `<@hourly> <@daily> <@midnight> <@weekly> <@monthly> <@annually> <@yearly>` for storage volumes.
 
 ## container\_copy\_project
 Introduces a `project` field to the container source dict, allowing for
@@ -1267,3 +1272,108 @@ Those contain additional state information relevant to VLAN interfaces:
 
 ## instance\_nic\_bridged\_port\_isolation
 This adds the `security.port_isolation` field for bridged NIC instances.
+
+## instance\_bulk\_state\_change
+Adds the following endpoint for bulk state change (see [RESTful API](rest-api.md) for details):
+
+* `PUT /1.0/instances`
+
+## network\_gvrp
+This adds an optional `gvrp` property to `macvlan` and `physical` networks,
+and to `ipvlan`, `macvlan`, `routed` and `physical` NIC devices.
+
+When set, this specifies whether the VLAN should be registered using GARP VLAN
+Registration Protocol. Defaults to false.
+
+## instance\_pool\_move
+This adds a `pool` field to the `POST /1.0/instances/NAME` API,
+allowing for easy move of an instance root disk between pools.
+
+## gpu\_sriov
+This adds support for SR-IOV enabled GPUs.
+It introduces the `sriov` gpu type property.
+
+## pci\_device\_type
+This introduces the `pci` device type.
+
+## storage\_volume\_state
+Add new `/1.0/storage-pools/POOL/volumes/VOLUME/state` API endpoint to get usage data on a volume.
+
+## network\_acl
+This adds the concept of network ACLs to API under the API endpoint prefix `/1.0/network-acls`.
+
+## migration\_stateful
+Add a new `migration.stateful` config key.
+
+## disk\_state\_quota
+This introduces the `size.state` device config key on `disk` devices.
+
+## storage\_ceph\_features
+Adds a new `ceph.rbd.features` config key on storage pools to control the RBD features used for new volumes.
+
+## projects\_compression
+Adds new `backups.compression_algorithm` and `images.compression_algorithm` config keys which
+allows configuration of backup and image compression per-project.
+
+## projects\_images\_remote\_cache\_expiry
+Add new `images.remote_cache_expiry` config key to projects,
+allowing for set number of days after which an unused cached remote image will be flushed.
+
+## certificate\_project
+Adds a new `restricted` property to certificates in the API as well as
+`projects` holding a list of project names that the certificate has
+access to.
+
+## network\_ovn\_acl
+Adds a new `security.acls` property to OVN networks and OVN NICs, allowing Network ACLs to be applied.
+
+## projects\_images\_auto\_update
+Adds new `images.auto_update_cached` and `images.auto_update_interval` config keys which
+allows configuration of images auto update in projects
+
+## projects\_restricted\_cluster\_target
+Adds new `restricted.cluster.target` config key to project which prevent the user from using --target
+to specify what cluster member to place a workload on or the ability to move a workload between members.
+
+## images\_default\_architecture
+Adds new `images.default_architecture` global config key and matching per-project key which lets user tell LXD
+what architecture to go with when no specific one is specified as part of the image request.
+
+## network\_ovn\_acl\_defaults
+Adds new `security.acls.default.{in,e}gress.action` and `security.acls.default.{in,e}gress.logged` config keys for
+OVN networks and NICs. This replaces the removed ACL `default.action` and `default.logged` keys.
+
+## gpu\_mig
+This adds support for NVIDIA MIG. It introduces the `mig` gputype and associaetd config keys.
+
+## project\_usage
+Adds an API endpoint to get current resource allocations in a project.
+Accessible at API `GET /1.0/projects/<name>/state`.
+
+## network\_bridge\_acl
+Adds a new `security.acls` config key to `bridge` networks, allowing Network ACLs to be applied.
+
+Also adds `security.acls.default.{in,e}gress.action` and `security.acls.default.{in,e}gress.logged` config keys for
+specifying the default behaviour for unmatched traffic.
+
+## warnings
+Warning API for LXD.
+
+This includes the following endpoints (see  [Restful API](rest-api.md) for details):
+
+* `GET /1.0/warnings`
+
+* `GET /1.0/warnings/<uuid>`
+* `PUT /1.0/warnings/<uuid>`
+* `DELETE /1.0/warnings/<uuid>`
+
+## projects\_restricted\_backups\_and\_snapshots
+Adds new `restricted.backups` and `restricted.snapshots` config keys to project which
+prevents the user from creation of backups and snapshots.
+
+## clustering\_join\_token
+Adds `POST /1.0/cluster/members` API endpoint for requesting a join token used when adding new cluster members
+without using the trust password.
+
+## clustering\_description
+Adds an editable description to the cluster members.

@@ -24,8 +24,8 @@ var instanceLogCmd = APIEndpoint{
 		{Name: "vmLog", Path: "virtual-machines/{name}/logs/{file}"},
 	},
 
-	Delete: APIEndpointAction{Handler: containerLogDelete, AccessHandler: allowProjectPermission("containers", "operate-containers")},
-	Get:    APIEndpointAction{Handler: containerLogGet, AccessHandler: allowProjectPermission("containers", "view")},
+	Delete: APIEndpointAction{Handler: instanceLogDelete, AccessHandler: allowProjectPermission("containers", "operate-containers")},
+	Get:    APIEndpointAction{Handler: instanceLogGet, AccessHandler: allowProjectPermission("containers", "view")},
 }
 
 var instanceLogsCmd = APIEndpoint{
@@ -36,10 +36,60 @@ var instanceLogsCmd = APIEndpoint{
 		{Name: "vmLogs", Path: "virtual-machines/{name}/logs"},
 	},
 
-	Get: APIEndpointAction{Handler: containerLogsGet, AccessHandler: allowProjectPermission("containers", "view")},
+	Get: APIEndpointAction{Handler: instanceLogsGet, AccessHandler: allowProjectPermission("containers", "view")},
 }
 
-func containerLogsGet(d *Daemon, r *http.Request) response.Response {
+// swagger:operation GET /1.0/instances/{name}/logs instances instance_logs_get
+//
+// Get the log files
+//
+// Returns a list of log files (URLs).
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+// responses:
+//   "200":
+//     description: API endpoints
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           type: array
+//           description: List of endpoints
+//           items:
+//             type: string
+//           example: |-
+//             [
+//               "/1.0/instances/foo/logs/lxc.conf",
+//               "/1.0/instances/foo/logs/lxc.log"
+//             ]
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "404":
+//     $ref: "#/responses/NotFound"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 	/* Let's explicitly *not* try to do a containerLoadByName here. In some
 	 * cases (e.g. when container creation failed), the container won't
 	 * exist in the DB but it does have some log files on disk.
@@ -101,7 +151,39 @@ func validLogFileName(fname string) bool {
 		strings.HasPrefix(fname, "exec_")
 }
 
-func containerLogGet(d *Daemon, r *http.Request) response.Response {
+// swagger:operation GET /1.0/instances/{name}/logs/{filename} instances instance_log_get
+//
+// Get the log file
+//
+// Gets the log file.
+//
+// ---
+// produces:
+//   - application/json
+//   - application/octet-stream
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+// responses:
+//   "200":
+//      description: Raw file
+//      content:
+//        application/octet-stream:
+//          schema:
+//            type: string
+//            example: some-text
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "404":
+//     $ref: "#/responses/NotFound"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instanceLogGet(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
@@ -138,17 +220,43 @@ func containerLogGet(d *Daemon, r *http.Request) response.Response {
 	return response.FileResponse(r, []response.FileResponseEntry{ent}, nil, false)
 }
 
-func containerLogDelete(d *Daemon, r *http.Request) response.Response {
+// swagger:operation DELETE /1.0/instances/{name}/logs/{filename} instances instance_log_delete
+//
+// Delete the log file
+//
+// Removes the log file.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "404":
+//     $ref: "#/responses/NotFound"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -171,5 +279,5 @@ func containerLogDelete(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("lxc.log and lxc.conf may not be deleted"))
 	}
 
-	return response.SmartError(os.Remove(shared.LogPath(name, file)))
+	return response.SmartError(os.Remove(shared.LogPath(project.Instance(projectName, name), file)))
 }

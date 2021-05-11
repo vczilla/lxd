@@ -51,7 +51,7 @@ test_clustering_membership() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -127,17 +127,45 @@ test_clustering_membership() {
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster list
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster show node3 | grep -q "status: Offline"
 
-  # Gracefully remove a node.
+  # Gracefully remove a node and check trust certificate is removed.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep node4
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'SELECT name FROM certificates WHERE type = 2' | grep node4
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster remove node4
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep node4 || false
+  ! LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'SELECT name FROM certificates WHERE type = 2' | grep node4 || false
 
   # The node isn't clustered anymore.
   ! LXD_DIR="${LXD_FOUR_DIR}" lxc cluster list || false
 
+  # Generate a join token for the sixth node.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster list
+  token=$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster add node6 | awk '{print $5}')
+
+  # Check token is associated to correct name.
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster list-tokens | grep node6 | grep "${token}"
+
+  # Spawn a sixth node, using join token.
+  setup_clustering_netns 6
+  LXD_SIX_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_SIX_DIR}"
+  ns6="${prefix}6"
+
+  # shellcheck disable=SC2034
+  LXD_SECRET="${token}"
+  spawn_lxd_and_join_cluster "${ns6}" "${bridge}" "${cert}" 6 2 "${LXD_SIX_DIR}"
+  unset LXD_SECRET
+
+  # Check token has been deleted after join.
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster list-tokens
+  ! LXD_DIR="${LXD_TWO_DIR}" lxc cluster list-tokens | grep node6 || false
+
+  LXD_DIR="${LXD_SIX_DIR}" lxd shutdown
   LXD_DIR="${LXD_FIVE_DIR}" lxd shutdown
   LXD_DIR="${LXD_FOUR_DIR}" lxd shutdown
   LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
   LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
   sleep 0.5
+  rm -f "${LXD_SIX_DIR}/unix.socket"
   rm -f "${LXD_FIVE_DIR}/unix.socket"
   rm -f "${LXD_FOUR_DIR}/unix.socket"
   rm -f "${LXD_THREE_DIR}/unix.socket"
@@ -152,6 +180,7 @@ test_clustering_membership() {
   kill_lxd "${LXD_THREE_DIR}"
   kill_lxd "${LXD_FOUR_DIR}"
   kill_lxd "${LXD_FIVE_DIR}"
+  kill_lxd "${LXD_SIX_DIR}"
 }
 
 test_clustering_containers() {
@@ -169,7 +198,7 @@ test_clustering_containers() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -353,7 +382,7 @@ test_clustering_storage() {
   LXD_DIR="${LXD_ONE_DIR}" lxc storage list | grep data | grep -q CREATED
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -778,7 +807,7 @@ test_clustering_network() {
   LXD_DIR="${LXD_ONE_DIR}" lxc network list | grep "${bridge}" | grep -q CREATED
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -932,7 +961,7 @@ test_clustering_upgrade() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -950,7 +979,7 @@ test_clustering_upgrade() {
   # The second daemon is blocked waiting for the other to be upgraded
   ! LXD_DIR="${LXD_TWO_DIR}" lxd waitready --timeout=5 || false
 
-  LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node1 | grep -q "message: fully operational"
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node1 | grep -q "message: Fully operational"
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node2 | grep -q "message: waiting for other nodes to be upgraded"
 
   # Respawn the first node, so it matches the version the second node
@@ -981,9 +1010,9 @@ test_clustering_upgrade() {
   # upgraded
   ! LXD_DIR="${LXD_TWO_DIR}" lxd waitready --timeout=5 || false
 
-  LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node1 | grep -q "message: fully operational"
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node1 | grep -q "message: Fully operational"
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node2 | grep -q "message: waiting for other nodes to be upgraded"
-  LXD_DIR="${LXD_THREE_DIR}" lxc cluster show node3 | grep -q "message: fully operational"
+  LXD_DIR="${LXD_THREE_DIR}" lxc cluster show node3 | grep -q "message: Fully operational"
 
   # Respawn the first node and third node, so they match the version
   # the second node believes to have.
@@ -1031,7 +1060,7 @@ test_clustering_upgrade_large() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   for i in $(seq 2 "${N}"); do
     setup_clustering_netns "${i}"
@@ -1083,7 +1112,7 @@ test_clustering_publish() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1135,7 +1164,7 @@ test_clustering_profiles() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1208,18 +1237,18 @@ test_clustering_join_api() {
   ns1="${prefix}1"
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
-  cert=$(sed ':a;N;$!ba;s/\n/\\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   setup_clustering_netns 2
   LXD_TWO_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_TWO_DIR}"
   ns2="${prefix}2"
-  LXD_ALT_CERT=1 LXD_NETNS="${ns2}" spawn_lxd "${LXD_TWO_DIR}" false
+  LXD_NETNS="${ns2}" spawn_lxd "${LXD_TWO_DIR}" false
 
   op=$(curl --unix-socket "${LXD_TWO_DIR}/unix.socket" -X PUT "lxd/1.0/cluster" -d "{\"server_name\":\"node2\",\"enabled\":true,\"member_config\":[{\"entity\": \"storage-pool\",\"name\":\"data\",\"key\":\"source\",\"value\":\"\"}],\"server_address\":\"10.1.1.102:8443\",\"cluster_address\":\"10.1.1.101:8443\",\"cluster_certificate\":\"${cert}\",\"cluster_password\":\"sekret\"}" | jq -r .operation)
   curl --unix-socket "${LXD_TWO_DIR}/unix.socket" "lxd${op}/wait"
 
-  LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node2 | grep -q "message: fully operational"
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster show node2 | grep -q "message: Fully operational"
 
   LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
   LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
@@ -1249,7 +1278,7 @@ test_clustering_shutdown_nodes() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1318,7 +1347,7 @@ test_clustering_projects() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1395,7 +1424,7 @@ test_clustering_address() {
   lxc storage list cluster: | grep -q data
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node using a custom cluster port
   setup_clustering_netns 2
@@ -1461,7 +1490,7 @@ test_clustering_image_replication() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1543,7 +1572,8 @@ test_clustering_image_replication() {
 
   # Modify the container's rootfs and create a new image from the container
   lxc exec c1 -- touch /a
-  lxc stop c1 --force && lxc publish c1 --alias new-image
+  lxc stop c1 --force
+  lxc publish c1 --alias new-image
 
   fingerprint=$(LXD_DIR="${LXD_ONE_DIR}" lxc image info new-image | grep "Fingerprint:" | cut -f2 -d" ")
   [ -f "${LXD_ONE_DIR}/images/${fingerprint}" ] || false
@@ -1661,6 +1691,12 @@ test_clustering_dns() {
     false
   fi
 
+  # Test querying forkdns1 for AAAA record when equivalent A record is on forkdns2 network
+  if ! dig @127.0.1.1"${ipRand}" -p1053 AAAA test1.lxd | grep "status: NOERROR" ; then
+    echo "test1.lxd empty AAAAA DNS resolution failed"
+    false
+  fi
+
   # Test querying forkdns1 for PTR record that is on forkdns2 network
   if ! dig @127.0.1.1"${ipRand}" -p1053 -x 10.140.78.145 | grep "test1.lxd" ; then
     echo "10.140.78.145 PTR DNS resolution failed"
@@ -1703,7 +1739,7 @@ test_clustering_recover() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1785,7 +1821,7 @@ test_clustering_handover() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1808,12 +1844,15 @@ test_clustering_handover() {
   ns4="${prefix}4"
   spawn_lxd_and_join_cluster "${ns4}" "${bridge}" "${cert}" 4 1 "${LXD_FOUR_DIR}"
 
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster list
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster list | grep "node4" | grep -q "NO"
 
   # Shutdown the first node.
   LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
 
   # The fourth node has been promoted, while the first one demoted.
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster list
+  LXD_DIR="${LXD_THREE_DIR}" lxc cluster list
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster list | grep "node4" | grep -q "YES"
   LXD_DIR="${LXD_THREE_DIR}" lxc cluster list | grep "node1" | grep -q "NO"
 
@@ -1879,7 +1918,7 @@ test_clustering_rebalance() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1902,6 +1941,7 @@ test_clustering_rebalance() {
   ns4="${prefix}4"
   spawn_lxd_and_join_cluster "${ns4}" "${bridge}" "${cert}" 4 1 "${LXD_FOUR_DIR}"
 
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster list
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster list | grep "node4" | grep -q "NO"
 
   # Kill the second node.
@@ -1965,7 +2005,7 @@ test_clustering_remove_raft_node() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -2009,12 +2049,23 @@ test_clustering_remove_raft_node() {
   kill -9 "$(cat "${LXD_TWO_DIR}/lxd.pid")"
 
   # Remove the second node from the database but not from the raft configuration.
-  LXD_DIR="${LXD_ONE_DIR}" lxd sql global "DELETE FROM nodes WHERE address = '10.1.1.102:8443'"
+  retries=10
+  while [ "${retries}" != "0" ]; do
+    LXD_DIR="${LXD_ONE_DIR}" lxd sql global "DELETE FROM nodes WHERE address = '10.1.1.102:8443'" && break
+    sleep 0.5
+    retries=$((retries-1))
+  done
+
+  if [ "${retries}" -eq 0 ]; then
+      echo "Failed to remove node from database"
+      return 1
+  fi
 
   # The node does not appear anymore in the cluster list.
   ! LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep -q "node2" || false
 
   # There are only 2 database nodes.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster list
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep "node1" | grep -q "YES"
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep "node3" | grep -q "YES"
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep "node4" | grep -q "NO"
@@ -2029,6 +2080,7 @@ test_clustering_remove_raft_node() {
   sleep 20
 
   # We're back to 3 database nodes.
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster list
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep "node1" | grep -q "YES"
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep "node3" | grep -q "YES"
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep "node4" | grep -q "YES"
@@ -2069,7 +2121,7 @@ test_clustering_failure_domains() {
   spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
 
   # Add a newline at the end of each line. YAML as weird rules..
-  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/server.crt")
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -2155,4 +2207,205 @@ test_clustering_failure_domains() {
   kill_lxd "${LXD_FOUR_DIR}"
   kill_lxd "${LXD_FIVE_DIR}"
   kill_lxd "${LXD_SIX_DIR}"
+}
+
+test_clustering_image_refresh() {
+  # shellcheck disable=2039
+  local LXD_DIR
+
+  setup_clustering_bridge
+  prefix="lxd$$"
+  bridge="${prefix}"
+
+  # The random storage backend is not supported in clustering tests,
+  # since we need to have the same storage driver on all nodes.
+  driver="${LXD_BACKEND}"
+  if [ "${driver}" = "random" ] || [ "${driver}" = "lvm" ]; then
+    driver="dir"
+  fi
+
+  # Spawn first node
+  setup_clustering_netns 1
+  LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_ONE_DIR}"
+  ns1="${prefix}1"
+  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${driver}"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc config set cluster.images_minimal_replica 1
+  LXD_DIR="${LXD_ONE_DIR}" lxc config set images.auto_update_interval 1
+
+  # The state of the preseeded storage pool shows up as CREATED
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage list | grep data | grep -q CREATED
+
+  # Add a newline at the end of each line. YAML as weird rules..
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
+
+  # Spawn a second node
+  setup_clustering_netns 2
+  LXD_TWO_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_TWO_DIR}"
+  ns2="${prefix}2"
+  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}" "${driver}"
+
+  # Spawn a third node
+  setup_clustering_netns 3
+  LXD_THREE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_THREE_DIR}"
+  ns3="${prefix}3"
+  spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}" "${driver}"
+
+  # Spawn public node which has a public testimage
+  setup_clustering_netns 4
+  LXD_REMOTE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_REMOTE_DIR}"
+  ns4="${prefix}4"
+
+  LXD_NETNS="${ns4}" spawn_lxd "${LXD_REMOTE_DIR}" false
+  dir_configure "${LXD_REMOTE_DIR}"
+  LXD_DIR="${LXD_REMOTE_DIR}" deps/import-busybox --alias testimage --public
+
+  LXD_DIR="${LXD_REMOTE_DIR}" lxc config set core.https_address "10.1.1.104:8443"
+
+  # Add remotes
+  lxc remote add public "https://10.1.1.104:8443" --accept-certificate --password foo --public
+  lxc remote add cluster "https://10.1.1.101:8443" --accept-certificate --password sekret
+
+  LXD_DIR="${LXD_REMOTE_DIR}" lxc init testimage c1
+
+  # Create additional projects
+  LXD_DIR="${LXD_ONE_DIR}" lxc project create foo
+  LXD_DIR="${LXD_ONE_DIR}" lxc project create bar
+
+  # Copy default profile to all projects (this includes the root disk)
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile show default | LXD_DIR="${LXD_ONE_DIR}" lxc profile edit default --project foo
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile show default | LXD_DIR="${LXD_ONE_DIR}" lxc profile edit default --project bar
+
+  for project in default foo bar; do
+    # Copy the public image to each project
+    LXD_DIR="${LXD_ONE_DIR}" lxc image copy public:testimage local: --alias testimage --project "${project}"
+
+    # Diable autoupdate for testimage in project foo
+    if [ "${project}" = "foo" ]; then
+      auto_update=false
+    else
+      auto_update=true
+    fi
+
+    LXD_DIR="${LXD_ONE_DIR}" lxc image show testimage --project "${project}" | sed -r "s/auto_update: .*/auto_update: ${auto_update}/g" | LXD_DIR="${LXD_ONE_DIR}" lxc image edit testimage --project "${project}"
+
+    # Create a container in each project
+    LXD_DIR="${LXD_ONE_DIR}" lxc init testimage c1 --project "${project}"
+  done
+
+  # Modify public testimage
+  old_fingerprint="$(LXD_DIR="${LXD_REMOTE_DIR}" lxc image ls testimage -c f --format csv)"
+  dd if=/dev/urandom count=32 | LXD_DIR="${LXD_REMOTE_DIR}" lxc file push - c1/foo
+  LXD_DIR="${LXD_REMOTE_DIR}" lxc publish c1 --alias testimage --public
+  new_fingerprint="$(LXD_DIR="${LXD_REMOTE_DIR}" lxc image ls testimage -c f --format csv)"
+
+  pids=""
+
+  # Trigger image refresh on all nodes
+  for lxd_dir in "${LXD_ONE_DIR}" "${LXD_TWO_DIR}" "${LXD_THREE_DIR}"; do
+    LXD_DIR="${lxd_dir}" lxc query /internal/testing/image-refresh &
+    pids="$! ${pids}"
+  done
+
+  # Wait for the image to be refreshed
+  for pid in ${pids}; do
+    wait "${pid}"
+  done
+
+  # The projects default and bar should have received the new image
+  # while project foo should still have the old image.
+  # Also, it should only show 1 entry for the old image and 2 entries
+  # for the new one.
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="foo"' | grep "${old_fingerprint}"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images' | grep -c "${old_fingerprint}")" -eq 1 ] || false
+
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="default"' | grep "${new_fingerprint}"
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="bar"' | grep "${new_fingerprint}"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images' | grep -c "${new_fingerprint}")" -eq 2 ] || false
+
+  pids=""
+
+  # Trigger image refresh on all nodes. This shouldn't do anything as the image
+  # is already up-to-date.
+  for lxd_dir in "${LXD_ONE_DIR}" "${LXD_TWO_DIR}" "${LXD_THREE_DIR}"; do
+    LXD_DIR="${lxd_dir}" lxc query /internal/testing/image-refresh &
+    pids="$! ${pids}"
+  done
+
+  # Wait for the image to be refreshed
+  for pid in ${pids}; do
+    wait "${pid}"
+  done
+
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="foo"' | grep "${old_fingerprint}"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images' | grep -c "${old_fingerprint}")" -eq 1 ] || false
+
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="default"' | grep "${new_fingerprint}"
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="bar"' | grep "${new_fingerprint}"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images' | grep -c "${new_fingerprint}")" -eq 2 ] || false
+
+  # Modify public testimage
+  dd if=/dev/urandom count=32 | LXD_DIR="${LXD_REMOTE_DIR}" lxc file push - c1/foo
+  LXD_DIR="${LXD_REMOTE_DIR}" lxc publish c1 --alias testimage --public
+  new_fingerprint="$(LXD_DIR="${LXD_REMOTE_DIR}" lxc image ls testimage -c f --format csv)"
+
+  pids=""
+
+  # Trigger image refresh on all nodes
+  for lxd_dir in "${LXD_ONE_DIR}" "${LXD_TWO_DIR}" "${LXD_THREE_DIR}"; do
+    LXD_DIR="${lxd_dir}" lxc query /internal/testing/image-refresh &
+    pids="$! ${pids}"
+  done
+
+  # Wait for the image to be refreshed
+  for pid in ${pids}; do
+    wait "${pid}"
+  done
+
+  pids=""
+
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="foo"' | grep "${old_fingerprint}"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images' | grep -c "${old_fingerprint}")" -eq 1 ] || false
+
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="default"' | grep "${new_fingerprint}"
+  LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images join projects on images.project_id=projects.id where projects.name="bar"' | grep "${new_fingerprint}"
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxd sql global 'select images.fingerprint from images' | grep -c "${new_fingerprint}")" -eq 2 ] || false
+
+  # Clean up everything
+  for project in default foo bar; do
+    # shellcheck disable=SC2046
+    LXD_DIR="${LXD_ONE_DIR}" lxc image rm --project "${project}" $(LXD_DIR="${LXD_ONE_DIR}" lxc image ls --format csv --project "${project}" | cut -d, -f2)
+    # shellcheck disable=SC2046
+    LXD_DIR="${LXD_ONE_DIR}" lxc rm --project "${project}" $(LXD_DIR="${LXD_ONE_DIR}" lxc ls --format csv --project "${project}" | cut -d, -f1)
+  done
+
+  # shellcheck disable=SC2046
+  LXD_DIR="${LXD_REMOTE_DIR}" lxc image rm $(LXD_DIR="${LXD_REMOTE_DIR}" lxc image ls --format csv | cut -d, -f2)
+  # shellcheck disable=SC2046
+  LXD_DIR="${LXD_REMOTE_DIR}" lxc rm $(LXD_DIR="${LXD_REMOTE_DIR}" lxc ls --format csv | cut -d, -f1)
+
+  LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
+  LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
+  LXD_DIR="${LXD_THREE_DIR}" lxd shutdown
+  LXD_DIR="${LXD_REMOTE_DIR}" lxd shutdown
+  sleep 0.5
+  rm -f "${LXD_ONE_DIR}/unix.socket"
+  rm -f "${LXD_TWO_DIR}/unix.socket"
+  rm -f "${LXD_THREE_DIR}/unix.socket"
+  rm -f "${LXD_REMOTE_DIR}/unix.socket"
+
+  teardown_clustering_netns
+  teardown_clustering_bridge
+
+  kill_lxd "${LXD_ONE_DIR}"
+  kill_lxd "${LXD_TWO_DIR}"
+  kill_lxd "${LXD_THREE_DIR}"
+  kill_lxd "${LXD_REMOTE_DIR}"
+
+  # shellcheck disable=SC2034
+  LXD_NETNS=
 }

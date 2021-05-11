@@ -30,7 +30,6 @@ import (
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/daemon"
 	"github.com/lxc/lxd/lxd/db"
-	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/lxd/device"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/device/nictype"
@@ -233,21 +232,49 @@ func lxcCreate(s *state.State, args db.InstanceArgs) (instance.Instance, error) 
 		return nil, errors.Wrapf(err, "Failed loading storage pool")
 	}
 
-	// Fill default config.
-	volumeConfig := map[string]string{}
-	err = d.storagePool.FillInstanceConfig(d, volumeConfig)
+	volType, err := storagePools.InstanceTypeToVolumeType(d.Type())
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed filling default config")
+		return nil, err
+	}
+
+	storagePoolSupported := false
+	for _, supportedType := range d.storagePool.Driver().Info().VolumeTypes {
+		if supportedType == volType {
+			storagePoolSupported = true
+			break
+		}
+	}
+
+	if !storagePoolSupported {
+		return nil, fmt.Errorf("Storage pool does not support instance type")
 	}
 
 	// Create a new storage volume database entry for the container's storage volume.
 	if d.IsSnapshot() {
-		_, err = s.Cluster.CreateStorageVolumeSnapshot(args.Project, args.Name, "", db.StoragePoolVolumeTypeContainer, d.storagePool.ID(), volumeConfig, time.Time{})
+		// Copy volume config from parent.
+		parentName, _, _ := shared.InstanceGetParentAndSnapshotName(args.Name)
+		_, parentVol, err := s.Cluster.GetLocalStoragePoolVolume(args.Project, parentName, db.StoragePoolVolumeTypeContainer, d.storagePool.ID())
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed loading source volume for snapshot")
+		}
+
+		_, err = s.Cluster.CreateStorageVolumeSnapshot(args.Project, args.Name, "", db.StoragePoolVolumeTypeContainer, d.storagePool.ID(), parentVol.Config, time.Time{})
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed creating storage record for snapshot")
+		}
+
 	} else {
+		// Fill default config for new instances.
+		volumeConfig := map[string]string{}
+		err = d.storagePool.FillInstanceConfig(d, volumeConfig)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed filling default config")
+		}
+
 		_, err = s.Cluster.CreateStoragePoolVolume(args.Project, args.Name, "", db.StoragePoolVolumeTypeContainer, d.storagePool.ID(), volumeConfig, db.StoragePoolVolumeContentTypeFS)
-	}
-	if err != nil {
-		return nil, errors.Wrapf(err, "Failed creating storage record")
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed creating storage record")
+		}
 	}
 
 	// Setup initial idmap config
@@ -815,7 +842,11 @@ func (d *lxc) initLXC(config bool) error {
 
 	// Configure devices cgroup
 	if d.IsPrivileged() && !d.state.OS.RunningInUserNS && d.state.OS.CGInfo.Supports(cgroup.Devices, cg) {
-		err = lxcSetConfigItem(cc, "lxc.cgroup.devices.deny", "a")
+		if d.state.OS.CGInfo.Layout == cgroup.CgroupsUnified {
+			err = lxcSetConfigItem(cc, "lxc.cgroup2.devices.deny", "a")
+		} else {
+			err = lxcSetConfigItem(cc, "lxc.cgroup.devices.deny", "a")
+		}
 		if err != nil {
 			return err
 		}
@@ -837,7 +868,11 @@ func (d *lxc) initLXC(config bool) error {
 		}
 
 		for _, dev := range devices {
-			err = lxcSetConfigItem(cc, "lxc.cgroup.devices.allow", dev)
+			if d.state.OS.CGInfo.Layout == cgroup.CgroupsUnified {
+				err = lxcSetConfigItem(cc, "lxc.cgroup2.devices.allow", dev)
+			} else {
+				err = lxcSetConfigItem(cc, "lxc.cgroup.devices.allow", dev)
+			}
 			if err != nil {
 				return err
 			}
@@ -1647,6 +1682,8 @@ func (d *lxc) deviceHandleMounts(mounts []deviceConfig.MountEntryItem) error {
 					flags |= unix.MS_BIND
 				} else if opt == "rbind" {
 					flags |= unix.MS_BIND | unix.MS_REC
+				} else if opt == "ro" {
+					flags |= unix.MS_RDONLY
 				}
 			}
 
@@ -1710,54 +1747,6 @@ func (d *lxc) deviceRemove(deviceName string, rawConfig deviceConfig.Device, ins
 	}
 
 	return dev.Remove()
-}
-
-// deviceResetVolatile resets a device's volatile data when its removed or updated in such a way
-// that it is removed then added immediately afterwards.
-func (d *lxc) deviceResetVolatile(devName string, oldConfig, newConfig deviceConfig.Device) error {
-	volatileClear := make(map[string]string)
-	devicePrefix := fmt.Sprintf("volatile.%s.", devName)
-
-	newNICType, err := nictype.NICType(d.state, d.Project(), newConfig)
-	if err != nil {
-		return err
-	}
-
-	oldNICType, err := nictype.NICType(d.state, d.Project(), oldConfig)
-	if err != nil {
-		return err
-	}
-
-	// If the device type has changed, remove all old volatile keys.
-	// This will occur if the newConfig is empty (i.e the device is actually being removed) or
-	// if the device type is being changed but keeping the same name.
-	if newConfig["type"] != oldConfig["type"] || newNICType != oldNICType {
-		for k := range d.localConfig {
-			if !strings.HasPrefix(k, devicePrefix) {
-				continue
-			}
-
-			volatileClear[k] = ""
-		}
-
-		return d.VolatileSet(volatileClear)
-	}
-
-	// If the device type remains the same, then just remove any volatile keys that have
-	// the same key name present in the new config (i.e the new config is replacing the
-	// old volatile key).
-	for k := range d.localConfig {
-		if !strings.HasPrefix(k, devicePrefix) {
-			continue
-		}
-
-		devKey := strings.TrimPrefix(k, devicePrefix)
-		if _, found := newConfig[devKey]; found {
-			volatileClear[k] = ""
-		}
-	}
-
-	return d.VolatileSet(volatileClear)
 }
 
 // DeviceEventHandler actions the results of a RunConfig after an event has occurred on a device.
@@ -1994,6 +1983,7 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 	// Create the devices
 	postStartHooks := []func() error{}
 	nicID := -1
+	nvidiaDevices := []string{}
 
 	// Setup devices in sorted order, this ensures that device mounts are added in path order.
 	for _, entry := range d.expandedDevices.Sorted() {
@@ -2071,7 +2061,14 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 		// Pass any cgroups rules into LXC.
 		if len(runConf.CGroups) > 0 {
 			for _, rule := range runConf.CGroups {
-				err = lxcSetConfigItem(d.c, fmt.Sprintf("lxc.cgroup.%s", rule.Key), rule.Value)
+				if strings.HasPrefix(rule.Key, "devices.") && (!d.isCurrentlyPrivileged() || d.state.OS.RunningInUserNS) {
+					continue
+				}
+				if d.state.OS.CGInfo.Layout == cgroup.CgroupsUnified {
+					err = lxcSetConfigItem(d.c, fmt.Sprintf("lxc.cgroup2.%s", rule.Key), rule.Value)
+				} else {
+					err = lxcSetConfigItem(d.c, fmt.Sprintf("lxc.cgroup.%s", rule.Key), rule.Value)
+				}
 				if err != nil {
 					return "", nil, errors.Wrapf(err, "Failed to setup device cgroup '%s'", dev.Name)
 				}
@@ -2136,6 +2133,23 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 		if len(runConf.PostHooks) > 0 {
 			postStartHooks = append(postStartHooks, runConf.PostHooks...)
 		}
+
+		// Build list of NVIDIA GPUs (used for MIG).
+		if len(runConf.GPUDevice) > 0 {
+			for _, entry := range runConf.GPUDevice {
+				if entry.Key == device.GPUNvidiaDeviceKey {
+					nvidiaDevices = append(nvidiaDevices, entry.Value)
+				}
+			}
+		}
+	}
+
+	// Override NVIDIA_VISIBLE_DEVICES if we have devices that need it.
+	if len(nvidiaDevices) > 0 {
+		err = lxcSetConfigItem(d.c, "lxc.environment", fmt.Sprintf("NVIDIA_VISIBLE_DEVICES=%s", strings.Join(nvidiaDevices, ",")))
+		if err != nil {
+			return "", nil, errors.Wrapf(err, "Unable to set NVIDIA_VISIBLE_DEVICES in LXC environment")
+		}
 	}
 
 	// Generate the LXC config
@@ -2181,6 +2195,12 @@ func (d *lxc) startCommon() (string, []func() error, error) {
 
 	// Unmount any previously mounted shiftfs
 	unix.Unmount(d.RootfsPath(), unix.MNT_DETACH)
+
+	// Snapshot if needed.
+	err = d.startupSnapshot(d)
+	if err != nil {
+		return "", nil, err
+	}
 
 	revert.Success()
 	return configPath, postStartHooks, nil
@@ -2286,10 +2306,11 @@ func (d *lxc) Start(stateful bool) error {
 		// Run any post start hooks.
 		err = d.runHooks(postStartHooks)
 		if err != nil {
+			op.Done(err) // Must come before Stop() otherwise stop will not proceed.
+
 			// Attempt to stop container.
 			d.Stop(false)
 
-			op.Done(err)
 			return err
 		}
 
@@ -2361,10 +2382,11 @@ func (d *lxc) Start(stateful bool) error {
 	// Run any post start hooks.
 	err = d.runHooks(postStartHooks)
 	if err != nil {
+		op.Done(err) // Must come before Stop() otherwise stop will not proceed.
+
 		// Attempt to stop container.
 		d.Stop(false)
 
-		op.Done(err)
 		return err
 	}
 
@@ -2405,7 +2427,7 @@ func (d *lxc) onStart(_ map[string]string) error {
 	key := "volatile.apply_template"
 	if d.localConfig[key] != "" {
 		// Run any template that needs running
-		err = d.templateApplyNow(d.localConfig[key])
+		err = d.templateApplyNow(instance.TemplateTrigger(d.localConfig[key]))
 		if err != nil {
 			apparmor.InstanceUnload(d.state, d)
 			return err
@@ -2617,6 +2639,14 @@ func (d *lxc) Shutdown(timeout time.Duration) error {
 		return nil
 	}
 
+	// If frozen, resume so the signal can be handled.
+	if d.IsFrozen() {
+		err := d.Unfreeze()
+		if err != nil {
+			return err
+		}
+	}
+
 	// Check that we're not already stopped
 	if !d.IsRunning() {
 		err = fmt.Errorf("The container is already stopped")
@@ -2680,7 +2710,7 @@ func (d *lxc) Restart(timeout time.Duration) error {
 
 	d.logger.Info("Restarting container", ctxMap)
 
-	err := d.restart(d, timeout)
+	err := d.restartCommon(d, timeout)
 	if err != nil {
 		return err
 	}
@@ -3036,13 +3066,7 @@ func (d *lxc) Render(options ...func(response interface{}) error) (interface{}, 
 	// Prepare the ETag
 	etag := []interface{}{d.architecture, d.localConfig, d.localDevices, d.ephemeral, d.profiles}
 
-	// FIXME: Render shouldn't directly access the go-lxc struct
-	cState, err := d.getLxcState()
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "Get container stated")
-	}
-	statusCode := lxcStatusCode(cState)
-
+	statusCode := d.statusCode()
 	instState := api.Instance{
 		ExpandedConfig:  d.expandedConfig,
 		ExpandedDevices: d.expandedDevices.CloneNative(),
@@ -3089,7 +3113,7 @@ func (d *lxc) RenderFull() (*api.InstanceFull, interface{}, error) {
 	ct := api.InstanceFull{Instance: *base.(*api.Instance)}
 
 	// Add the ContainerState
-	ct.State, err = d.RenderState()
+	ct.State, err = d.renderState(ct.StatusCode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3132,19 +3156,14 @@ func (d *lxc) RenderFull() (*api.InstanceFull, interface{}, error) {
 	return &ct, etag, nil
 }
 
-// RenderState renders just the running state of the instance.
-func (d *lxc) RenderState() (*api.InstanceState, error) {
-	cState, err := d.getLxcState()
-	if err != nil {
-		return nil, err
-	}
-	statusCode := lxcStatusCode(cState)
+// renderState renders just the running state of the instance.
+func (d *lxc) renderState(statusCode api.StatusCode) (*api.InstanceState, error) {
 	status := api.InstanceState{
 		Status:     statusCode.String(),
 		StatusCode: statusCode,
 	}
 
-	if d.IsRunning() {
+	if d.isRunningStatusCode(statusCode) {
 		pid := d.InitPID()
 		status.CPU = d.cpuState()
 		status.Memory = d.memoryState()
@@ -3152,9 +3171,66 @@ func (d *lxc) RenderState() (*api.InstanceState, error) {
 		status.Pid = int64(pid)
 		status.Processes = d.processesState()
 	}
+
 	status.Disk = d.diskState()
 
 	return &status, nil
+}
+
+// RenderState renders just the running state of the instance.
+func (d *lxc) RenderState() (*api.InstanceState, error) {
+	return d.renderState(d.statusCode())
+}
+
+// Snapshot takes a new snapshot.
+func (d *lxc) Snapshot(name string, expiry time.Time, stateful bool) error {
+	// Deal with state.
+	if stateful {
+		// Sanity checks.
+		if !d.IsRunning() {
+			return fmt.Errorf("Unable to create a stateful snapshot. The instance isn't running")
+		}
+
+		_, err := exec.LookPath("criu")
+		if err != nil {
+			return fmt.Errorf("Unable to create a stateful snapshot. CRIU isn't installed")
+		}
+
+		/* TODO: ideally we would freeze here and unfreeze below after
+		 * we've copied the filesystem, to make sure there are no
+		 * changes by the container while snapshotting. Unfortunately
+		 * there is abug in CRIU where it doesn't leave the container
+		 * in the same state it found it w.r.t. freezing, i.e. CRIU
+		 * freezes too, and then /always/ thaws, even if the container
+		 * was frozen. Until that's fixed, all calls to Unfreeze()
+		 * after snapshotting will fail.
+		 */
+		criuMigrationArgs := instance.CriuMigrationArgs{
+			Cmd:          liblxc.MIGRATE_DUMP,
+			StateDir:     d.StatePath(),
+			Function:     "snapshot",
+			Stop:         false,
+			ActionScript: false,
+			DumpDir:      "",
+			PreDumpDir:   "",
+		}
+
+		// Create the state path and Make sure we don't keep state around after the snapshot has been made.
+		err = os.MkdirAll(d.StatePath(), 0700)
+		if err != nil {
+			return err
+		}
+
+		defer os.RemoveAll(d.StatePath())
+
+		// Dump the state.
+		err = d.Migrate(&criuMigrationArgs)
+		if err != nil {
+			return err
+		}
+	}
+
+	return d.snapshotCommon(d, name, expiry, stateful)
 }
 
 // Restore restores a snapshot.
@@ -3230,13 +3306,14 @@ func (d *lxc) Restore(sourceContainer instance.Instance, stateful bool) error {
 		return err
 	}
 
+	d.logger.Debug("Mounting instance to check for CRIU state path existence")
+
 	// Ensure that storage is mounted for state path checks and for backup.yaml updates.
 	_, err = pool.MountInstance(d, nil)
 	if err != nil {
 		op.Done(err)
 		return err
 	}
-	defer pool.UnmountInstance(d, nil)
 
 	// Check for CRIU if necessary, before doing a bunch of filesystem manipulations.
 	// Requires container be mounted to check StatePath exists.
@@ -3247,6 +3324,12 @@ func (d *lxc) Restore(sourceContainer instance.Instance, stateful bool) error {
 			op.Done(err)
 			return err
 		}
+	}
+
+	_, err = pool.UnmountInstance(d, nil)
+	if err != nil {
+		op.Done(err)
+		return err
 	}
 
 	// Restore the rootfs.
@@ -3270,15 +3353,8 @@ func (d *lxc) Restore(sourceContainer instance.Instance, stateful bool) error {
 	}
 
 	// Don't pass as user-requested as there's no way to fix a bad config.
+	// This will call d.UpdateBackupFile() to ensure snapshot list is up to date.
 	err = d.Update(args, false)
-	if err != nil {
-		op.Done(err)
-		return err
-	}
-
-	// The old backup file may be out of date (e.g. it doesn't have all the current snapshots of
-	// the container listed); let's write a new one to be safe.
-	err = d.UpdateBackupFile()
 	if err != nil {
 		op.Done(err)
 		return err
@@ -3331,6 +3407,7 @@ func (d *lxc) Restore(sourceContainer instance.Instance, stateful bool) error {
 
 	// Restart the container.
 	if wasRunning {
+		d.logger.Debug("Starting instance after snapshot restore")
 		err = d.Start(false)
 		if err != nil {
 			op.Done(err)
@@ -3376,7 +3453,7 @@ func (d *lxc) Delete(force bool) error {
 
 	isImport := false
 	pool, err := storagePools.GetPoolByInstance(d.state, d)
-	if err != nil && err != db.ErrNoSuchObject {
+	if err != nil && errors.Cause(err) != db.ErrNoSuchObject {
 		return err
 	} else if pool != nil {
 		// Check if we're dealing with "lxd import".
@@ -3397,6 +3474,8 @@ func (d *lxc) Delete(force bool) error {
 				if err != nil {
 					return err
 				}
+			} else {
+				d.logger.Info("Skipping snapshot volume delete")
 			}
 		} else {
 			// Remove all snapshots by initialising each snapshot as an Instance and
@@ -3413,6 +3492,8 @@ func (d *lxc) Delete(force bool) error {
 				if err != nil {
 					return err
 				}
+			} else {
+				d.logger.Info("Skipping instance volume delete")
 			}
 		}
 	}
@@ -3480,8 +3561,8 @@ func (d *lxc) Delete(force bool) error {
 	return nil
 }
 
-// Rename renames the instance.
-func (d *lxc) Rename(newName string) error {
+// Rename renames the instance. Accepts an argument to enable applying deferred TemplateTriggerRename.
+func (d *lxc) Rename(newName string, applyTemplateTrigger bool) error {
 	oldName := d.Name()
 	ctxMap := log.Ctx{
 		"created":   d.creationDate,
@@ -3506,7 +3587,7 @@ func (d *lxc) Rename(newName string) error {
 
 	pool, err := storagePools.GetPoolByInstance(d.state, d)
 	if err != nil {
-		return errors.Wrap(err, "Load instance storage pool")
+		return errors.Wrap(err, "Failed loading instance storage pool")
 	}
 
 	if d.IsSnapshot() {
@@ -3520,6 +3601,13 @@ func (d *lxc) Rename(newName string) error {
 		if err != nil {
 			return errors.Wrap(err, "Rename instance")
 		}
+
+		if applyTemplateTrigger {
+			err = d.DeferTemplateApply(instance.TemplateTriggerRename)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	if !d.IsSnapshot() {
@@ -3527,7 +3615,7 @@ func (d *lxc) Rename(newName string) error {
 		results, err := d.state.Cluster.GetInstanceSnapshotsNames(d.project, oldName)
 		if err != nil {
 			d.logger.Error("Failed to get container snapshots", ctxMap)
-			return err
+			return errors.Wrapf(err, "Failed to get container snapshots")
 		}
 
 		for _, sname := range results {
@@ -3539,7 +3627,7 @@ func (d *lxc) Rename(newName string) error {
 			})
 			if err != nil {
 				d.logger.Error("Failed renaming snapshot", ctxMap)
-				return err
+				return errors.Wrapf(err, "Failed renaming snapshot")
 			}
 		}
 	}
@@ -3556,7 +3644,7 @@ func (d *lxc) Rename(newName string) error {
 	})
 	if err != nil {
 		d.logger.Error("Failed renaming container", ctxMap)
-		return err
+		return errors.Wrapf(err, "Failed renaming container")
 	}
 
 	// Rename the logging path.
@@ -3566,7 +3654,7 @@ func (d *lxc) Rename(newName string) error {
 		err := os.Rename(d.LogPath(), shared.LogPath(newFullName))
 		if err != nil {
 			d.logger.Error("Failed renaming container", ctxMap)
-			return err
+			return errors.Wrapf(err, "Failed renaming container")
 		}
 	}
 
@@ -3824,31 +3912,22 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 	}
 
 	// Diff the devices
-	removeDevices, addDevices, updateDevices, updateDiff := oldExpandedDevices.Update(d.expandedDevices, func(oldDevice deviceConfig.Device, newDevice deviceConfig.Device) []string {
+	removeDevices, addDevices, updateDevices, allUpdatedKeys := oldExpandedDevices.Update(d.expandedDevices, func(oldDevice deviceConfig.Device, newDevice deviceConfig.Device) []string {
 		// This function needs to return a list of fields that are excluded from differences
 		// between oldDevice and newDevice. The result of this is that as long as the
 		// devices are otherwise identical except for the fields returned here, then the
 		// device is considered to be being "updated" rather than "added & removed".
-		oldNICType, err := nictype.NICType(d.state, d.Project(), newDevice)
-		if err != nil {
-			return []string{} // Cannot hot-update due to config error.
-		}
-
-		newNICType, err := nictype.NICType(d.state, d.Project(), oldDevice)
-		if err != nil {
-			return []string{} // Cannot hot-update due to config error.
-		}
-
-		if oldDevice["type"] != newDevice["type"] || oldNICType != newNICType {
-			return []string{} // Device types aren't the same, so this cannot be an update.
-		}
-
-		dev, err := device.New(d, d.state, "", newDevice, nil, nil)
+		oldDevType, err := device.LoadByType(d.state, d.Project(), oldDevice)
 		if err != nil {
 			return []string{} // Couldn't create Device, so this cannot be an update.
 		}
 
-		return dev.UpdatableFields()
+		newDevType, err := device.LoadByType(d.state, d.Project(), newDevice)
+		if err != nil {
+			return []string{} // Couldn't create Device, so this cannot be an update.
+		}
+
+		return newDevType.UpdatableFields(oldDevType)
 	})
 
 	if userRequested {
@@ -3938,7 +4017,7 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 	// Update MAAS (must run after the MAC addresses have been generated).
 	updateMAAS := false
 	for _, key := range []string{"maas.subnet.ipv4", "maas.subnet.ipv6", "ipv4.address", "ipv6.address"} {
-		if shared.StringInSlice(key, updateDiff) {
+		if shared.StringInSlice(key, allUpdatedKeys) {
 			updateMAAS = true
 			break
 		}
@@ -4274,12 +4353,9 @@ func (d *lxc) Update(args db.InstanceArgs, userRequested bool) error {
 		return errors.Wrap(err, "Failed to update database")
 	}
 
-	// Only update the backup file if it already exists (indicating the instance is mounted).
-	if shared.PathExists(filepath.Join(d.Path(), "backup.yaml")) {
-		err := d.UpdateBackupFile()
-		if err != nil && !os.IsNotExist(err) {
-			return errors.Wrap(err, "Failed to write backup file")
-		}
+	err = d.UpdateBackupFile()
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrap(err, "Failed to write backup file")
 	}
 
 	// Send devlxd notifications
@@ -4373,7 +4449,7 @@ func (d *lxc) updateDevices(removeDevices deviceConfig.Devices, addDevices devic
 		// Check whether we are about to add the same device back with updated config and
 		// if not, or if the device type has changed, then remove all volatile keys for
 		// this device (as its an actual removal or a device type change).
-		err = d.deviceResetVolatile(dev.Name, dev.Config, addDevices[dev.Name])
+		err = d.deviceVolatileReset(dev.Name, dev.Config, addDevices[dev.Name])
 		if err != nil {
 			return errors.Wrapf(err, "Failed to reset volatile data for device %q", dev.Name)
 		}
@@ -4851,7 +4927,7 @@ func (d *lxc) Migrate(args *instance.CriuMigrationArgs) error {
 	return nil
 }
 
-func (d *lxc) templateApplyNow(trigger string) error {
+func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 	// If there's no metadata, just return
 	fname := filepath.Join(d.Path(), "metadata.yaml")
 	if !shared.PathExists(fname) {
@@ -4920,7 +4996,7 @@ func (d *lxc) templateApplyNow(trigger string) error {
 			// Check if the template should be applied now
 			found := false
 			for _, tplTrigger := range tpl.When {
-				if tplTrigger == trigger {
+				if tplTrigger == string(trigger) {
 					found = true
 					break
 				}
@@ -5476,14 +5552,14 @@ func (d *lxc) Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, st
 
 	cmd.ExtraFiles = []*os.File{stdin, stdout, stderr, wStatus}
 	err = cmd.Start()
+	wStatus.Close()
 	if err != nil {
-		wStatus.Close()
 		return nil, err
 	}
-	wStatus.Close()
 
 	attachedPid := shared.ReadPid(rStatus)
 	if attachedPid <= 0 {
+		cmd.Wait()
 		d.logger.Error("Failed to retrieve PID of executing child process")
 		return nil, fmt.Errorf("Failed to retrieve PID of executing child process")
 	}
@@ -5540,7 +5616,7 @@ func (d *lxc) diskState() map[string]api.InstanceStateDisk {
 
 			usage, err = pool.GetInstanceUsage(d)
 			if err != nil {
-				if err != storageDrivers.ErrNotSupported {
+				if errors.Cause(err) != storageDrivers.ErrNotSupported {
 					d.logger.Error("Error getting disk usage", log.Ctx{"err": err})
 				}
 				continue
@@ -5554,7 +5630,7 @@ func (d *lxc) diskState() map[string]api.InstanceStateDisk {
 
 			usage, err = pool.GetCustomVolumeUsage(d.Project(), dev.Config["source"])
 			if err != nil {
-				if err != storageDrivers.ErrNotSupported {
+				if errors.Cause(err) != storageDrivers.ErrNotSupported {
 					d.logger.Error("Error getting volume usage", log.Ctx{"volume": dev.Config["source"], "err": err})
 				}
 				continue
@@ -5843,9 +5919,25 @@ func (d *lxc) insertMountLXD(source, target, fstype string, flags int, mntnsPID 
 	}
 	defer unix.Unmount(tmpMount, unix.MNT_DETACH)
 
+	// Ensure that only flags modifying mount _properties_ make it through.
+	// Strip things such as MS_BIND which would cause the creation of a
+	// shiftfs mount to be skipped.
+	// (Fyi, this is just one of the reasons why multiplexers are bad;
+	// specifically when they do heinous things such as confusing flags
+	// with commands.)
+
+	// This is why multiplexers are bad
+	shiftfsFlags := (flags & (unix.MS_RDONLY |
+		unix.MS_NOSUID |
+		unix.MS_NODEV |
+		unix.MS_NOEXEC |
+		unix.MS_DIRSYNC |
+		unix.MS_NOATIME |
+		unix.MS_NODIRATIME))
+
 	// Setup host side shiftfs as needed
 	if shiftfs {
-		err = unix.Mount(tmpMount, tmpMount, "shiftfs", 0, "mark,passthrough=3")
+		err = unix.Mount(tmpMount, tmpMount, "shiftfs", uintptr(shiftfsFlags), "mark,passthrough=3")
 		if err != nil {
 			return fmt.Errorf("Failed to setup host side shiftfs mount: %s", err)
 		}
@@ -5871,7 +5963,8 @@ func (d *lxc) insertMountLXD(source, target, fstype string, flags int, mntnsPID 
 		fmt.Sprintf("%d", pidFdNr),
 		mntsrc,
 		target,
-		fmt.Sprintf("%v", shiftfs))
+		fmt.Sprintf("%v", shiftfs),
+		fmt.Sprintf("%d", shiftfsFlags))
 	if err != nil {
 		return err
 	}
@@ -6127,95 +6220,66 @@ func (d *lxc) FillNetworkDevice(name string, m deviceConfig.Device) (deviceConfi
 		}
 	}
 
-	updateKey := func(key string, value string) error {
-		tx, err := d.state.Cluster.Begin()
-		if err != nil {
-			return err
-		}
-
-		err = db.CreateInstanceConfig(tx, d.id, map[string]string{key: value})
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		err = db.TxCommit(tx)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	}
-
 	nicType, err := nictype.NICType(d.state, d.Project(), m)
 	if err != nil {
 		return nil, err
 	}
 
-	// Fill in the MAC address
+	// Fill in the MAC address.
 	if !shared.StringInSlice(nicType, []string{"physical", "ipvlan", "sriov"}) && m["hwaddr"] == "" {
 		configKey := fmt.Sprintf("volatile.%s.hwaddr", name)
 		volatileHwaddr := d.localConfig[configKey]
 		if volatileHwaddr == "" {
-			// Generate a new MAC address
+			// Generate a new MAC address.
 			volatileHwaddr, err = instance.DeviceNextInterfaceHWAddr()
-			if err != nil {
-				return nil, err
+			if err != nil || volatileHwaddr == "" {
+				return nil, errors.Wrapf(err, "Failed generating %q", configKey)
 			}
 
-			// Update the database
-			err = query.Retry(func() error {
-				err := updateKey(configKey, volatileHwaddr)
-				if err != nil {
-					// Check if something else filled it in behind our back
-					value, err1 := d.state.Cluster.GetInstanceConfig(d.id, configKey)
-					if err1 != nil || value == "" {
-						return err
-					}
-
-					d.localConfig[configKey] = value
-					d.expandedConfig[configKey] = value
-					return nil
-				}
-
-				d.localConfig[configKey] = volatileHwaddr
-				d.expandedConfig[configKey] = volatileHwaddr
-				return nil
-			})
+			// Update the database and update volatileHwaddr with stored value.
+			volatileHwaddr, err = d.insertConfigkey(configKey, volatileHwaddr)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrapf(err, "Failed storing generated config key %q", configKey)
 			}
+
+			// Set stored value into current instance config.
+			d.localConfig[configKey] = volatileHwaddr
+			d.expandedConfig[configKey] = volatileHwaddr
 		}
+
+		if volatileHwaddr == "" {
+			return nil, fmt.Errorf("Failed getting %q", configKey)
+		}
+
 		newDevice["hwaddr"] = volatileHwaddr
 	}
 
-	// Fill in the name
+	// Fill in the interface name.
 	if m["name"] == "" {
 		configKey := fmt.Sprintf("volatile.%s.name", name)
 		volatileName := d.localConfig[configKey]
 		if volatileName == "" {
-			// Generate a new interface name
-			volatileName, err := nextInterfaceName()
-			if err != nil {
-				return nil, err
+			// Generate a new interface name.
+			volatileName, err = nextInterfaceName()
+			if err != nil || volatileName == "" {
+				return nil, errors.Wrapf(err, "Failed generating %q", configKey)
 			}
 
-			// Update the database
-			err = updateKey(configKey, volatileName)
+			// Update the database and update volatileName with stored value.
+			volatileName, err = d.insertConfigkey(configKey, volatileName)
 			if err != nil {
-				// Check if something else filled it in behind our back
-				value, err1 := d.state.Cluster.GetInstanceConfig(d.id, configKey)
-				if err1 != nil || value == "" {
-					return nil, err
-				}
-
-				d.localConfig[configKey] = value
-				d.expandedConfig[configKey] = value
-			} else {
-				d.localConfig[configKey] = volatileName
-				d.expandedConfig[configKey] = volatileName
+				return nil, errors.Wrapf(err, "Failed storing generated config key %q", configKey)
 			}
+
+			// Set stored value into current instance config.
+			d.localConfig[configKey] = volatileName
+			d.expandedConfig[configKey] = volatileName
 		}
+
+		if volatileName == "" {
+			return nil, fmt.Errorf("Failed getting %q", configKey)
+		}
+
 		newDevice["name"] = volatileName
 	}
 
@@ -6317,7 +6381,7 @@ func (d *lxc) setNetworkPriority() error {
 
 // IsFrozen returns if instance is frozen.
 func (d *lxc) IsFrozen() bool {
-	return d.State() == "FROZEN"
+	return d.statusCode() == api.Frozen
 }
 
 // IsNesting returns if instance is nested.
@@ -6345,8 +6409,7 @@ func (d *lxc) IsPrivileged() bool {
 
 // IsRunning returns if instance is running.
 func (d *lxc) IsRunning() bool {
-	state := d.State()
-	return state != "BROKEN" && state != "STOPPED"
+	return d.isRunningStatusCode(d.statusCode())
 }
 
 // InitPID returns PID of init process.
@@ -6416,13 +6479,19 @@ func (d *lxc) NextIdmap() (*idmap.IdmapSet, error) {
 	return idmap.JSONUnmarshal(jsonIdmap)
 }
 
-// State returns instance state.
-func (d *lxc) State() string {
+// statusCode returns instance status code.
+func (d *lxc) statusCode() api.StatusCode {
 	state, err := d.getLxcState()
 	if err != nil {
-		return api.Error.String()
+		return api.Error
 	}
-	return state.String()
+
+	return lxcStatusCode(state)
+}
+
+// State returns instance state.
+func (d *lxc) State() string {
+	return strings.ToUpper(d.statusCode().String())
 }
 
 // LogFilePath log file path.

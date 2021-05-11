@@ -2,21 +2,21 @@ package device
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net"
 	"os/exec"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"github.com/pkg/errors"
 
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
+	pcidev "github.com/lxc/lxd/lxd/device/pci"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/ip"
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/revert"
@@ -92,11 +92,11 @@ func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	// For VMs only NIC properties that can be specified on the parent's VF settings are controllable.
-	if instConf.Type() == instancetype.Container {
+	if instConf.Type() == instancetype.Container || instConf.Type() == instancetype.Any {
 		optionalFields = append(optionalFields, "mtu")
 	}
 
-	err := d.config.Validate(nicValidationRules(requiredFields, optionalFields))
+	err := d.config.Validate(nicValidationRules(requiredFields, optionalFields, instConf))
 	if err != nil {
 		return err
 	}
@@ -106,12 +106,16 @@ func (d *nicSRIOV) validateConfig(instConf instance.ConfigReader) error {
 
 // validateEnvironment checks the runtime environment for correctness.
 func (d *nicSRIOV) validateEnvironment() error {
+	if d.inst.Type() == instancetype.VM && shared.IsTrue(d.inst.ExpandedConfig()["migration.stateful"]) {
+		return fmt.Errorf("Network SR-IOV devices cannot be used when migration.stateful is enabled")
+	}
+
 	if d.inst.Type() == instancetype.Container && d.config["name"] == "" {
 		return fmt.Errorf("Requires name property to start")
 	}
 
-	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", d.config["parent"])) {
-		return fmt.Errorf("Parent device '%s' doesn't exist", d.config["parent"])
+	if !network.InterfaceExists(d.config["parent"]) {
+		return fmt.Errorf("Parent device %q doesn't exist", d.config["parent"])
 	}
 
 	return nil
@@ -134,12 +138,7 @@ func (d *nicSRIOV) Start() (*deviceConfig.RunConfig, error) {
 		}
 	}
 
-	reservedDevices, err := instanceGetReservedDevices(d.state, d.config)
-	if err != nil {
-		return nil, err
-	}
-
-	vfDev, vfID, err := d.findFreeVirtualFunction(reservedDevices)
+	vfDev, vfID, err := network.SRIOVFindFreeVirtualFunction(d.state, d.config["parent"])
 	if err != nil {
 		return nil, err
 	}
@@ -150,12 +149,17 @@ func (d *nicSRIOV) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	if d.inst.Type() == instancetype.Container {
+		macSet := false
+
 		// Set the MAC address.
 		if d.config["hwaddr"] != "" {
-			_, err := shared.RunCommand("ip", "link", "set", "dev", saveData["host_name"], "address", d.config["hwaddr"])
+			link := &ip.Link{Name: saveData["host_name"]}
+			err := link.SetAddress(d.config["hwaddr"])
 			if err != nil {
-				return nil, fmt.Errorf("Failed to set the MAC address: %s", err)
+				return nil, errors.Wrapf(err, "Failed setting MAC address %q on %q", d.config["hwaddr"], saveData["host_name"])
 			}
+
+			macSet = true
 		}
 
 		// Set the MTU.
@@ -167,9 +171,44 @@ func (d *nicSRIOV) Start() (*deviceConfig.RunConfig, error) {
 		}
 
 		// Bring the interface up.
-		_, err = shared.RunCommand("ip", "link", "set", "dev", saveData["host_name"], "up")
+		link := &ip.Link{Name: saveData["host_name"]}
+		err = link.SetUp()
 		if err != nil {
-			return nil, fmt.Errorf("Failed to bring up the interface: %v", err)
+			if macSet {
+				return nil, errors.Wrapf(err, "Failed to bring up VF interface %q", saveData["host_name"])
+			}
+
+			upErr := err
+
+			// If interface fails to come up and MAC not previously set, some NICs require us to set
+			// a specific MAC before being allowed to bring up the VF interface. So check if interface
+			// has an empty MAC and set a random one if needed.
+			vfIF, err := net.InterfaceByName(saveData["host_name"])
+			if err != nil {
+				return nil, errors.Wrapf(err, "Failed getting interface info for VF %q", saveData["host_name"])
+			}
+
+			// If the VF interface has a MAC already, something else prevented bringing interface up.
+			if vfIF.HardwareAddr.String() != "00:00:00:00:00:00" {
+				return nil, errors.Wrapf(upErr, "Failed to bring up VF interface %q", saveData["host_name"])
+			}
+
+			// Try using a random MAC address and bringing interface up.
+			randMAC, err := instance.DeviceNextInterfaceHWAddr()
+			if err != nil {
+				return nil, errors.Wrapf(err, "Failed generating random MAC for VF %q", saveData["host_name"])
+			}
+
+			link := &ip.Link{Name: saveData["host_name"]}
+			err = link.SetAddress(randMAC)
+			if err != nil {
+				return nil, errors.Wrapf(err, "Failed to set random MAC address %q on %q", randMAC, saveData["host_name"])
+			}
+
+			err = link.SetUp()
+			if err != nil {
+				return nil, errors.Wrapf(err, "Failed to bring up VF interface %q", saveData["host_name"])
+			}
 		}
 	}
 
@@ -180,8 +219,8 @@ func (d *nicSRIOV) Start() (*deviceConfig.RunConfig, error) {
 
 	runConf := deviceConfig.RunConfig{}
 	runConf.NetworkInterface = []deviceConfig.RunConfigItem{
-		{Key: "name", Value: d.config["name"]},
 		{Key: "type", Value: "phys"},
+		{Key: "name", Value: d.config["name"]},
 		{Key: "flags", Value: "up"},
 		{Key: "link", Value: saveData["host_name"]},
 	}
@@ -234,163 +273,10 @@ func (d *nicSRIOV) postStop() error {
 	return nil
 }
 
-// findFreeVirtualFunction looks on the specified parent device for an unused virtual function.
-// Returns the name of the interface and virtual function index ID if found, error if not.
-func (d *nicSRIOV) findFreeVirtualFunction(reservedDevices map[string]struct{}) (string, int, error) {
-	sriovNumVFs := fmt.Sprintf("/sys/class/net/%s/device/sriov_numvfs", d.config["parent"])
-	sriovTotalVFs := fmt.Sprintf("/sys/class/net/%s/device/sriov_totalvfs", d.config["parent"])
-
-	// Verify that this is indeed a SR-IOV enabled device.
-	if !shared.PathExists(sriovTotalVFs) {
-		return "", 0, fmt.Errorf("Parent device '%s' doesn't support SR-IOV", d.config["parent"])
-	}
-
-	// Get parent dev_port and dev_id values.
-	pfDevPort, err := ioutil.ReadFile(fmt.Sprintf("/sys/class/net/%s/dev_port", d.config["parent"]))
-	if err != nil {
-		return "", 0, err
-	}
-
-	pfDevID, err := ioutil.ReadFile(fmt.Sprintf("/sys/class/net/%s/dev_id", d.config["parent"]))
-	if err != nil {
-		return "", 0, err
-	}
-
-	// Get number of currently enabled VFs.
-	sriovNumVfsBuf, err := ioutil.ReadFile(sriovNumVFs)
-	if err != nil {
-		return "", 0, err
-	}
-	sriovNumVfsStr := strings.TrimSpace(string(sriovNumVfsBuf))
-	sriovNum, err := strconv.Atoi(sriovNumVfsStr)
-	if err != nil {
-		return "", 0, err
-	}
-
-	// Get number of possible VFs.
-	sriovTotalVfsBuf, err := ioutil.ReadFile(sriovTotalVFs)
-	if err != nil {
-		return "", 0, err
-	}
-	sriovTotalVfsStr := strings.TrimSpace(string(sriovTotalVfsBuf))
-	sriovTotal, err := strconv.Atoi(sriovTotalVfsStr)
-	if err != nil {
-		return "", 0, err
-	}
-
-	// Ensure parent is up (needed for Intel at least).
-	_, err = shared.RunCommand("ip", "link", "set", "dev", d.config["parent"], "up")
-	if err != nil {
-		return "", 0, err
-	}
-
-	// Check if any VFs are already enabled.
-	nicName := ""
-	vfID := 0
-	for i := 0; i < sriovNum; i++ {
-		if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s/device/virtfn%d/net", d.config["parent"], i)) {
-			continue
-		}
-
-		// Check if VF is already in use.
-		empty, err := shared.PathIsEmpty(fmt.Sprintf("/sys/class/net/%s/device/virtfn%d/net", d.config["parent"], i))
-		if err != nil {
-			return "", 0, err
-		}
-		if empty {
-			continue
-		}
-
-		vfListPath := fmt.Sprintf("/sys/class/net/%s/device/virtfn%d/net", d.config["parent"], i)
-		nicName, err = d.getFreeVFInterface(reservedDevices, vfListPath, pfDevID, pfDevPort)
-		if err != nil {
-			return "", 0, err
-		}
-
-		// Found a free VF.
-		if nicName != "" {
-			vfID = i
-			break
-		}
-	}
-
-	if nicName == "" {
-		if sriovNum == sriovTotal {
-			return "", 0, fmt.Errorf("All virtual functions of sriov device '%s' seem to be in use", d.config["parent"])
-		}
-
-		// Bump the number of VFs to the maximum.
-		err := ioutil.WriteFile(sriovNumVFs, []byte(sriovTotalVfsStr), 0644)
-		if err != nil {
-			return "", 0, err
-		}
-
-		// Use next free VF index.
-		for i := sriovNum + 1; i < sriovTotal; i++ {
-			vfListPath := fmt.Sprintf("/sys/class/net/%s/device/virtfn%d/net", d.config["parent"], i)
-			nicName, err = d.getFreeVFInterface(reservedDevices, vfListPath, pfDevID, pfDevPort)
-			if err != nil {
-				return "", 0, err
-			}
-
-			// Found a free VF.
-			if nicName != "" {
-				vfID = i
-				break
-			}
-		}
-	}
-
-	if nicName == "" {
-		return "", 0, fmt.Errorf("All virtual functions on parent device are already in use")
-	}
-
-	return nicName, vfID, nil
-}
-
-// getFreeVFInterface checks the contents of the VF directory to find a free VF interface name that
-// belongs to the same device and port as the parent. Returns VF interface name or empty string if
-// no free interface found.
-func (d *nicSRIOV) getFreeVFInterface(reservedDevices map[string]struct{}, vfListPath string, pfDevID []byte, pfDevPort []byte) (string, error) {
-	ents, err := ioutil.ReadDir(vfListPath)
-	if err != nil {
-		return "", err
-	}
-
-	for _, ent := range ents {
-		// We can't use this VF interface as it is reserved by another device.
-		_, exists := reservedDevices[ent.Name()]
-		if exists {
-			continue
-		}
-
-		// Get VF dev_port and dev_id values.
-		vfDevPort, err := ioutil.ReadFile(fmt.Sprintf("%s/%s/dev_port", vfListPath, ent.Name()))
-		if err != nil {
-			return "", err
-		}
-
-		vfDevID, err := ioutil.ReadFile(fmt.Sprintf("%s/%s/dev_id", vfListPath, ent.Name()))
-		if err != nil {
-			return "", err
-		}
-
-		// Skip VFs if they do not relate to the same device and port as the parent PF.
-		// Some card vendors change the device ID for each port.
-		if bytes.Compare(pfDevPort, vfDevPort) != 0 || bytes.Compare(pfDevID, vfDevID) != 0 {
-			continue
-		}
-
-		return ent.Name(), nil
-	}
-
-	return "", nil
-}
-
 // setupSriovParent configures a SR-IOV virtual function (VF) device on parent and stores original properties of
 // the physical device into voltatile for restoration on detach. Returns VF PCI device info.
-func (d *nicSRIOV) setupSriovParent(vfDevice string, vfID int, volatile map[string]string) (pciDevice, error) {
-	var vfPCIDev pciDevice
+func (d *nicSRIOV) setupSriovParent(vfDevice string, vfID int, volatile map[string]string) (pcidev.Device, error) {
+	var vfPCIDev pcidev.Device
 
 	// Retrieve VF settings from parent device.
 	vfInfo, err := d.networkGetVirtFuncInfo(d.config["parent"], vfID)
@@ -418,22 +304,23 @@ func (d *nicSRIOV) setupSriovParent(vfDevice string, vfID int, volatile map[stri
 	}
 
 	// Get VF device's PCI Slot Name so we can unbind and rebind it from the host.
-	vfPCIDev, err = d.networkGetVFDevicePCISlot(volatile["last_state.vf.id"])
+	vfPCIDev, err = network.SRIOVGetVFDevicePCISlot(d.config["parent"], volatile["last_state.vf.id"])
 	if err != nil {
 		return vfPCIDev, err
 	}
 
 	// Unbind VF device from the host so that the settings will take effect when we rebind it.
-	err = pciDeviceUnbind(vfPCIDev)
+	err = pcidev.DeviceUnbind(vfPCIDev)
 	if err != nil {
 		return vfPCIDev, err
 	}
 
-	revert.Add(func() { pciDeviceProbe(vfPCIDev) })
+	revert.Add(func() { pcidev.DeviceProbe(vfPCIDev) })
 
 	// Setup VF VLAN if specified.
 	if d.config["vlan"] != "" {
-		_, err := shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "vlan", d.config["vlan"])
+		link := &ip.Link{Name: d.config["parent"]}
+		err := link.SetVfVlan(volatile["last_state.vf.id"], d.config["vlan"])
 		if err != nil {
 			return vfPCIDev, err
 		}
@@ -450,13 +337,14 @@ func (d *nicSRIOV) setupSriovParent(vfDevice string, vfID int, volatile map[stri
 		}
 
 		// Set MAC on VF (this combined with spoof checking prevents any other MAC being used).
-		_, err = shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "mac", mac)
+		link := &ip.Link{Name: d.config["parent"]}
+		err = link.SetVfAddress(volatile["last_state.vf.id"], mac)
 		if err != nil {
 			return vfPCIDev, err
 		}
 
 		// Now that MAC is set on VF, we can enable spoof checking.
-		_, err = shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "spoofchk", "on")
+		err = link.SetVfSpoofchk(volatile["last_state.vf.id"], "on")
 		if err != nil {
 			return vfPCIDev, err
 		}
@@ -464,10 +352,14 @@ func (d *nicSRIOV) setupSriovParent(vfDevice string, vfID int, volatile map[stri
 		// Try to reset VF to ensure no previous MAC restriction exists, as some devices require this
 		// before being able to set a new VF MAC or disable spoofchecking. However some devices don't
 		// allow it so ignore failures.
-		shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "mac", "00:00:00:00:00:00")
+		link := &ip.Link{Name: d.config["parent"]}
+		err = link.SetVfAddress(volatile["last_state.vf.id"], "00:00:00:00:00:00")
+		if err != nil {
+			return vfPCIDev, err
+		}
 
 		// Ensure spoof checking is disabled if not enabled in instance.
-		_, err = shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "spoofchk", "off")
+		err = link.SetVfSpoofchk(volatile["last_state.vf.id"], "off")
 		if err != nil {
 			return vfPCIDev, err
 		}
@@ -480,7 +372,7 @@ func (d *nicSRIOV) setupSriovParent(vfDevice string, vfID int, volatile map[stri
 				mac = volatile["last_state.hwaddr"]
 			}
 
-			_, err = shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "mac", mac)
+			err = link.SetVfAddress(volatile["last_state.vf.id"], mac)
 			if err != nil {
 				return vfPCIDev, err
 			}
@@ -489,22 +381,22 @@ func (d *nicSRIOV) setupSriovParent(vfDevice string, vfID int, volatile map[stri
 
 	if d.inst.Type() == instancetype.Container {
 		// Bind VF device onto the host so that the settings will take effect.
-		err = pciDeviceProbe(vfPCIDev)
+		// This will remove the VF interface temporarily, and it will re-appear shortly after.
+		err = pcidev.DeviceProbe(vfPCIDev)
 		if err != nil {
 			return vfPCIDev, err
 		}
 
-		// Wait for VF driver to be reloaded, this will remove the VF interface temporarily, and
-		// it will re-appear shortly after. Unfortunately the time between sending the bind event
+		// Wait for VF driver to be reloaded. Unfortunately the time between sending the bind event
 		// to the nic and it actually appearing on the host is non-zero, so we need to watch and wait,
 		// otherwise next steps of applying settings to interface will fail.
-		err = networkInterfaceBindWait(volatile["host_name"])
+		err = network.InterfaceBindWait(volatile["host_name"])
 		if err != nil {
 			return vfPCIDev, err
 		}
 	} else if d.inst.Type() == instancetype.VM {
 		// Register VF device with vfio-pci driver so it can be passed to VM.
-		err = pciDeviceDriverOverride(vfPCIDev, "vfio-pci")
+		err = pcidev.DeviceDriverOverride(vfPCIDev, "vfio-pci")
 		if err != nil {
 			return vfPCIDev, err
 		}
@@ -662,17 +554,6 @@ func (d *nicSRIOV) networkGetVirtFuncInfo(devName string, vfID int) (VirtFuncInf
 	return vf, nil
 }
 
-// networkGetVFDevicePCISlot returns the PCI slot name for a network virtual function device.
-func (d *nicSRIOV) networkGetVFDevicePCISlot(vfID string) (pciDevice, error) {
-	ueventFile := fmt.Sprintf("/sys/class/net/%s/device/virtfn%s/uevent", d.config["parent"], vfID)
-	pciDev, err := pciParseUeventFile(ueventFile)
-	if err != nil {
-		return pciDev, err
-	}
-
-	return pciDev, nil
-}
-
 // restoreSriovParent restores SR-IOV parent device settings when removed from an instance using the
 // volatile data that was stored when the device was first added with setupSriovParent().
 func (d *nicSRIOV) restoreSriovParent(volatile map[string]string) error {
@@ -685,13 +566,13 @@ func (d *nicSRIOV) restoreSriovParent(volatile map[string]string) error {
 	defer revert.Fail()
 
 	// Get VF device's PCI info so we can unbind and rebind it from the host.
-	vfPCIDev, err := d.networkGetVFDevicePCISlot(volatile["last_state.vf.id"])
+	vfPCIDev, err := network.SRIOVGetVFDevicePCISlot(d.config["parent"], volatile["last_state.vf.id"])
 	if err != nil {
 		return err
 	}
 
 	// Unbind VF device from the host so that the restored settings will take effect when we rebind it.
-	err = pciDeviceUnbind(vfPCIDev)
+	err = pcidev.DeviceUnbind(vfPCIDev)
 	if err != nil {
 		return err
 	}
@@ -699,7 +580,7 @@ func (d *nicSRIOV) restoreSriovParent(volatile map[string]string) error {
 	if d.inst.Type() == instancetype.VM {
 		// Before we bind the device back to the host, ensure we restore the original driver info as it
 		// should be currently set to vfio-pci.
-		err = pciDeviceSetDriverOverride(vfPCIDev, volatile["last_state.pci.driver"])
+		err = pcidev.DeviceSetDriverOverride(vfPCIDev, volatile["last_state.pci.driver"])
 		if err != nil {
 			return err
 		}
@@ -707,11 +588,12 @@ func (d *nicSRIOV) restoreSriovParent(volatile map[string]string) error {
 
 	// However we return from this function, we must try to rebind the VF so its not orphaned.
 	// The OS won't let an already bound device be bound again so is safe to call twice.
-	revert.Add(func() { pciDeviceProbe(vfPCIDev) })
+	revert.Add(func() { pcidev.DeviceProbe(vfPCIDev) })
 
 	// Reset VF VLAN if specified
 	if volatile["last_state.vf.vlan"] != "" {
-		_, err := shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "vlan", volatile["last_state.vf.vlan"])
+		link := &ip.Link{Name: d.config["parent"]}
+		err := link.SetVfVlan(volatile["last_state.vf.id"], volatile["last_state.vf.vlan"])
 		if err != nil {
 			return err
 		}
@@ -725,7 +607,8 @@ func (d *nicSRIOV) restoreSriovParent(volatile map[string]string) error {
 			mode = "on"
 		}
 
-		_, err := shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "spoofchk", mode)
+		link := &ip.Link{Name: d.config["parent"]}
+		err := link.SetVfSpoofchk(volatile["last_state.vf.id"], mode)
 		if err != nil {
 			return err
 		}
@@ -733,14 +616,15 @@ func (d *nicSRIOV) restoreSriovParent(volatile map[string]string) error {
 
 	// Reset VF MAC specified if specified.
 	if volatile["last_state.vf.hwaddr"] != "" {
-		_, err := shared.TryRunCommand("ip", "link", "set", "dev", d.config["parent"], "vf", volatile["last_state.vf.id"], "mac", volatile["last_state.vf.hwaddr"])
+		link := &ip.Link{Name: d.config["parent"]}
+		err := link.SetVfAddress(volatile["last_state.vf.id"], volatile["last_state.vf.hwaddr"])
 		if err != nil {
 			return err
 		}
 	}
 
 	// Bind VF device onto the host so that the settings will take effect.
-	err = pciDeviceProbe(vfPCIDev)
+	err = pcidev.DeviceProbe(vfPCIDev)
 	if err != nil {
 		return err
 	}
@@ -749,7 +633,7 @@ func (d *nicSRIOV) restoreSriovParent(volatile map[string]string) error {
 	// and it will re-appear on the host. Unfortunately the time between sending the bind event
 	// to the nic and it actually appearing on the host is non-zero, so we need to watch and wait,
 	// otherwise next step of restoring MAC and MTU settings in restorePhysicalNic will fail.
-	err = networkInterfaceBindWait(volatile["host_name"])
+	err = network.InterfaceBindWait(volatile["host_name"])
 	if err != nil {
 		return err
 	}

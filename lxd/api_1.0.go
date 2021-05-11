@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -64,6 +65,8 @@ var api10 = []APIEndpoint{
 	networkLeasesCmd,
 	networksCmd,
 	networkStateCmd,
+	networkACLCmd,
+	networkACLsCmd,
 	operationCmd,
 	operationsCmd,
 	operationWait,
@@ -72,6 +75,7 @@ var api10 = []APIEndpoint{
 	profilesCmd,
 	projectCmd,
 	projectsCmd,
+	projectStateCmd,
 	storagePoolCmd,
 	storagePoolResourcesCmd,
 	storagePoolsCmd,
@@ -79,15 +83,95 @@ var api10 = []APIEndpoint{
 	storagePoolVolumeSnapshotsTypeCmd,
 	storagePoolVolumeSnapshotTypeCmd,
 	storagePoolVolumesTypeCmd,
-	storagePoolVolumeTypeContainerCmd,
-	storagePoolVolumeTypeCustomCmd,
-	storagePoolVolumeTypeImageCmd,
-	storagePoolVolumeTypeVMCmd,
+	storagePoolVolumeTypeCmd,
 	storagePoolVolumeTypeCustomBackupsCmd,
 	storagePoolVolumeTypeCustomBackupCmd,
 	storagePoolVolumeTypeCustomBackupExportCmd,
+	storagePoolVolumeTypeStateCmd,
+	warningsCmd,
+	warningCmd,
 }
 
+// swagger:operation GET /1.0?public server server_get_untrusted
+//
+// Get the server environment
+//
+// Shows a small subset of the server environment and configuration
+// which is required by untrusted clients to reach a server.
+//
+// The `?public` part of the URL isn't required, it's simply used to
+// separate the two behaviors of this endpoint.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: Server environment and configuration
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/ServerUntrusted"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+
+// swagger:operation GET /1.0 server server_get
+//
+// Get the server environment and configuration
+//
+// Shows the full server environment and configuration.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: target
+//     description: Cluster member name
+//     type: string
+//     example: lxd01
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+// responses:
+//   "200":
+//     description: Server environment and configuration
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/Server"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func api10Get(d *Daemon, r *http.Request) response.Response {
 	authMethods := []string{"tls"}
 	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
@@ -275,6 +359,40 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 	return response.SyncResponseETag(true, fullSrv, fullSrv.Config)
 }
 
+// swagger:operation PUT /1.0 server server_put
+//
+// Update the server configuration
+//
+// Updates the entire server configuration.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: target
+//     description: Cluster member name
+//     type: string
+//     example: lxd01
+//   - in: body
+//     name: server
+//     description: Server configuration
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ServerPut"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "412":
+//     $ref: "#/responses/PreconditionFailed"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func api10Put(d *Daemon, r *http.Request) response.Response {
 	// If a target was specified, forward the request to the relevant node.
 	resp := forwardedResponseIfTargetIsRemote(d, r)
@@ -283,7 +401,8 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 	}
 
 	req := api.ServerPut{}
-	if err := shared.ReadToJSON(r.Body, &req); err != nil {
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
@@ -323,6 +442,40 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 	return doApi10Update(d, req, false)
 }
 
+// swagger:operation PATCH /1.0 server server_patch
+//
+// Partially update the server configuration
+//
+// Updates a subset of the server configuration.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: target
+//     description: Cluster member name
+//     type: string
+//     example: lxd01
+//   - in: body
+//     name: server
+//     description: Server configuration
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ServerPut"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "412":
+//     $ref: "#/responses/PreconditionFailed"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func api10Patch(d *Daemon, r *http.Request) response.Response {
 	// If a target was specified, forward the request to the relevant node.
 	resp := forwardedResponseIfTargetIsRemote(d, r)
@@ -340,7 +493,8 @@ func api10Patch(d *Daemon, r *http.Request) response.Response {
 	}
 
 	req := api.ServerPut{}
-	if err := shared.ReadToJSON(r.Body, &req); err != nil {
+	err = json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
@@ -447,6 +601,7 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) response.Response {
 		if err != nil {
 			return errors.Wrap(err, "Failed to load cluster config")
 		}
+
 		if patch {
 			clusterChanged, err = newClusterConfig.Patch(req.Config)
 		} else {
@@ -464,7 +619,7 @@ func doApi10Update(d *Daemon, req api.ServerPut, patch bool) response.Response {
 	}
 
 	// Notify the other nodes about changes
-	notifier, err := cluster.NewNotifier(s, d.endpoints.NetworkCert(), cluster.NotifyAlive)
+	notifier, err := cluster.NewNotifier(s, d.endpoints.NetworkCert(), d.serverCert(), cluster.NotifyAlive)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -521,10 +676,10 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			fallthrough
 		case "candid.api.url":
 			candidChanged = true
+		case "cluster.images_minimal_replica":
+			autoSyncImages(d.ctx, d)
 		case "images.auto_update_interval":
-			if !d.os.MockMode {
-				d.taskAutoUpdate.Reset()
-			}
+			fallthrough
 		case "images.remote_cache_expiry":
 			if !d.os.MockMode {
 				d.taskPruneImages.Reset()
@@ -631,6 +786,12 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		if err != nil {
 			return err
 		}
+	}
+
+	_, ok = clusterChanged["cluster.offline_threshold"]
+	if ok {
+		d.gateway.HeartbeatOfflineThreshold = clusterConfig.OfflineThreshold()
+		d.taskClusterHeartbeat.Reset()
 	}
 
 	return nil

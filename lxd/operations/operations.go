@@ -25,22 +25,23 @@ var debug bool
 var operationsLock sync.Mutex
 var operations = make(map[string]*Operation)
 
-type operationClass int
+// OperationClass represents the OperationClass type
+type OperationClass int
 
 const (
 	// OperationClassTask represents the Task OperationClass
-	OperationClassTask operationClass = 1
+	OperationClassTask OperationClass = 1
 	// OperationClassWebsocket represents the Websocket OperationClass
-	OperationClassWebsocket operationClass = 2
+	OperationClassWebsocket OperationClass = 2
 	// OperationClassToken represents the Token OperationClass
-	OperationClassToken operationClass = 3
+	OperationClassToken OperationClass = 3
 )
 
-func (t operationClass) String() string {
-	return map[operationClass]string{
-		OperationClassTask:      "task",
-		OperationClassWebsocket: "websocket",
-		OperationClassToken:     "token",
+func (t OperationClass) String() string {
+	return map[OperationClass]string{
+		OperationClassTask:      api.OperationClassTask,
+		OperationClassWebsocket: api.OperationClassWebsocket,
+		OperationClassToken:     api.OperationClassToken,
 	}[t]
 }
 
@@ -88,9 +89,9 @@ func OperationGetInternal(id string) (*Operation, error) {
 
 // Operation represents an operation.
 type Operation struct {
-	project     string
+	projectName string
 	id          string
-	class       operationClass
+	class       OperationClass
 	createdAt   time.Time
 	updatedAt   time.Time
 	status      api.StatusCode
@@ -121,7 +122,7 @@ type Operation struct {
 
 // OperationCreate creates a new operation and returns it. If it cannot be
 // created, it returns an error.
-func OperationCreate(s *state.State, project string, opClass operationClass, opType db.OperationType, opResources map[string][]string, opMetadata interface{}, onRun func(*Operation) error, onCancel func(*Operation) error, onConnect func(*Operation, *http.Request, http.ResponseWriter) error) (*Operation, error) {
+func OperationCreate(s *state.State, projectName string, opClass OperationClass, opType db.OperationType, opResources map[string][]string, opMetadata interface{}, onRun func(*Operation) error, onCancel func(*Operation) error, onConnect func(*Operation, *http.Request, http.ResponseWriter) error) (*Operation, error) {
 	// Don't allow new operations when LXD is shutting down.
 	if s != nil && s.Context.Err() == context.Canceled {
 		return nil, fmt.Errorf("LXD is shutting down")
@@ -129,7 +130,7 @@ func OperationCreate(s *state.State, project string, opClass operationClass, opT
 
 	// Main attributes
 	op := Operation{}
-	op.project = project
+	op.projectName = projectName
 	op.id = uuid.NewRandom().String()
 	op.description = opType.Description()
 	op.permission = opType.Permission()
@@ -430,6 +431,7 @@ func (op *Operation) mayCancel() bool {
 }
 
 // Render renders the operation structure.
+// Returns URL of operation and operation info.
 func (op *Operation) Render() (string, *api.Operation, error) {
 	// Setup the resource URLs
 	resources := op.resources
@@ -593,12 +595,17 @@ func (op *Operation) Permission() string {
 
 // Project returns the operation project.
 func (op *Operation) Project() string {
-	return op.project
+	return op.projectName
 }
 
 // Status returns the operation status.
 func (op *Operation) Status() api.StatusCode {
 	return op.status
+}
+
+// Class returns the operation class.
+func (op *Operation) Class() OperationClass {
+	return op.class
 }
 
 // Type returns the db operation type.

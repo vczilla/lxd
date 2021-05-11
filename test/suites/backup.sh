@@ -27,6 +27,9 @@ test_container_import() {
     ! lxd import ctImport || false
     # Import without killing the running instance to test restoring control plane after DB corruption.
     lxd import ctImport --force
+
+    # Check exec works after forced import while running (to check config file is regenerated).
+    lxc exec ctImport -- date
     kill_lxc "${pid}"
     lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM instances WHERE name='ctImport'"
     lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='ctImport'"
@@ -153,6 +156,19 @@ test_container_import() {
     lxc delete --force ctImport
     # FIXME: the daemon code should get rid of this leftover db entry
     lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM storage_volumes WHERE name='ctImport/snap0'"
+
+    lxc init testimage ctImport
+    lxc snapshot ctImport
+    lxc start ctImport
+    lxd import ctImport --force
+    lxc config device show ctImport | grep '{}'
+
+    lxc config device override ctImport root size=11GB
+    lxd import ctImport --force
+    lxc config device show ctImport | grep 'size: 11GB'
+
+    lxc delete --force ctImport
+
   )
   # shellcheck disable=SC2031
   LXD_DIR=${LXD_DIR}

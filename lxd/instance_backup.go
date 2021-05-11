@@ -12,6 +12,7 @@ import (
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/instance"
+	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/response"
@@ -21,17 +22,17 @@ import (
 	"github.com/lxc/lxd/shared/version"
 )
 
-func containerBackupsGet(d *Daemon, r *http.Request) response.Response {
+func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	cname := mux.Vars(r)["name"]
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, cname, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, cname, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -41,7 +42,7 @@ func containerBackupsGet(d *Daemon, r *http.Request) response.Response {
 
 	recursion := util.IsRecursionRequest(r)
 
-	c, err := instance.LoadByProjectAndName(d.State(), project, cname)
+	c, err := instance.LoadByProjectAndName(d.State(), projectName, cname)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -72,17 +73,25 @@ func containerBackupsGet(d *Daemon, r *http.Request) response.Response {
 	return response.SyncResponse(true, resultMap)
 }
 
-func containerBackupsPost(d *Daemon, r *http.Request) response.Response {
+func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 
+	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		err := project.AllowBackupCreation(tx, projectName)
+		return err
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	// Handle requests targeted to a container on a different node.
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -90,7 +99,7 @@ func containerBackupsPost(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	inst, err := instance.LoadByProjectAndName(d.State(), project, name)
+	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -180,10 +189,14 @@ func containerBackupsPost(d *Daemon, r *http.Request) response.Response {
 
 	resources := map[string][]string{}
 	resources["instances"] = []string{name}
-	resources["containers"] = resources["instances"]
+
+	if inst.Type() == instancetype.Container {
+		resources["containers"] = resources["instances"]
+	}
+
 	resources["backups"] = []string{req.Name}
 
-	op, err := operations.OperationCreate(d.State(), project, operations.OperationClassTask,
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask,
 		db.OperationBackupCreate, resources, nil, backup, nil, nil)
 	if err != nil {
 		return response.InternalError(err)
@@ -192,18 +205,18 @@ func containerBackupsPost(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
-func containerBackupGet(d *Daemon, r *http.Request) response.Response {
+func instanceBackupGet(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 	backupName := mux.Vars(r)["backupName"]
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -212,7 +225,7 @@ func containerBackupGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	fullName := name + shared.SnapshotDelimiter + backupName
-	backup, err := instance.BackupLoadByName(d.State(), project, fullName)
+	backup, err := instance.BackupLoadByName(d.State(), projectName, fullName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -220,18 +233,18 @@ func containerBackupGet(d *Daemon, r *http.Request) response.Response {
 	return response.SyncResponse(true, backup.Render())
 }
 
-func containerBackupPost(d *Daemon, r *http.Request) response.Response {
+func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 	backupName := mux.Vars(r)["backupName"]
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -251,7 +264,7 @@ func containerBackupPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	oldName := name + shared.SnapshotDelimiter + backupName
-	backup, err := instance.BackupLoadByName(d.State(), project, oldName)
+	backup, err := instance.BackupLoadByName(d.State(), projectName, oldName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -268,9 +281,10 @@ func containerBackupPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	resources := map[string][]string{}
-	resources["containers"] = []string{name}
+	resources["instances"] = []string{name}
+	resources["containers"] = resources["instances"]
 
-	op, err := operations.OperationCreate(d.State(), project, operations.OperationClassTask,
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask,
 		db.OperationBackupRename, resources, nil, rename, nil, nil)
 	if err != nil {
 		return response.InternalError(err)
@@ -279,18 +293,18 @@ func containerBackupPost(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
-func containerBackupDelete(d *Daemon, r *http.Request) response.Response {
+func instanceBackupDelete(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 	backupName := mux.Vars(r)["backupName"]
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -299,7 +313,7 @@ func containerBackupDelete(d *Daemon, r *http.Request) response.Response {
 	}
 
 	fullName := name + shared.SnapshotDelimiter + backupName
-	backup, err := instance.BackupLoadByName(d.State(), project, fullName)
+	backup, err := instance.BackupLoadByName(d.State(), projectName, fullName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -316,7 +330,7 @@ func containerBackupDelete(d *Daemon, r *http.Request) response.Response {
 	resources := map[string][]string{}
 	resources["container"] = []string{name}
 
-	op, err := operations.OperationCreate(d.State(), project, operations.OperationClassTask,
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask,
 		db.OperationBackupRemove, resources, nil, remove, nil, nil)
 	if err != nil {
 		return response.InternalError(err)
@@ -325,18 +339,18 @@ func containerBackupDelete(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
-func containerBackupExportGet(d *Daemon, r *http.Request) response.Response {
+func instanceBackupExportGet(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	proj := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 	backupName := mux.Vars(r)["backupName"]
 
 	// Handle requests targeted to a container on a different node
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, proj, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -345,13 +359,13 @@ func containerBackupExportGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	fullName := name + shared.SnapshotDelimiter + backupName
-	backup, err := instance.BackupLoadByName(d.State(), proj, fullName)
+	backup, err := instance.BackupLoadByName(d.State(), projectName, fullName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	ent := response.FileResponseEntry{
-		Path: shared.VarPath("backups", "instances", project.Instance(proj, backup.Name())),
+		Path: shared.VarPath("backups", "instances", project.Instance(projectName, backup.Name())),
 	}
 
 	return response.FileResponse(r, []response.FileResponseEntry{ent}, nil, false)

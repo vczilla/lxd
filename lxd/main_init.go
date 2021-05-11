@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -128,6 +129,19 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Check if the path to the cluster certificate is set
+	// If yes then read cluster certificate from file
+	if config.Cluster != nil && config.Cluster.ClusterCertificatePath != "" {
+		if !shared.PathExists(config.Cluster.ClusterCertificatePath) {
+			return fmt.Errorf("Path %s doesn't exist", config.Cluster.ClusterCertificatePath)
+		}
+		content, err := ioutil.ReadFile(config.Cluster.ClusterCertificatePath)
+		if err != nil {
+			return err
+		}
+		config.Cluster.ClusterCertificate = string(content)
+	}
+
 	// If clustering is enabled, and no cluster.https_address network address
 	// was specified, we fallback to core.https_address.
 	if config.Cluster != nil &&
@@ -175,7 +189,7 @@ func (c *cmdInit) availableStorageDrivers(poolType string) []string {
 	}
 
 	// Get info for supported drivers.
-	s := state.NewState(nil, nil, nil, nil, sys.DefaultOS(), nil, nil, nil, nil, nil)
+	s := state.NewState(nil, nil, nil, nil, sys.DefaultOS(), nil, nil, nil, nil, nil, nil, func() {})
 	supportedDrivers := storageDrivers.SupportedDrivers(s)
 
 	drivers := make([]string, 0, len(supportedDrivers))

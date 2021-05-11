@@ -496,7 +496,7 @@ func (c *cmdProfileEdit) Run(cmd *cobra.Command, args []string) error {
 		// Respawn the editor
 		if err != nil {
 			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
-			fmt.Println(i18n.G("Press enter to open the editor again"))
+			fmt.Println(i18n.G("Press enter to open the editor again or ctrl+c to abort change"))
 
 			_, err := os.Stdin.Read(make([]byte, 1))
 			if err != nil {
@@ -578,7 +578,7 @@ func (c *cmdProfileList) Command() *cobra.Command {
 		`List profiles`))
 
 	cmd.RunE = c.Run
-	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	return cmd
 }
@@ -612,12 +612,13 @@ func (c *cmdProfileList) Run(cmd *cobra.Command, args []string) error {
 	data := [][]string{}
 	for _, profile := range profiles {
 		strUsedBy := fmt.Sprintf("%d", len(profile.UsedBy))
-		data = append(data, []string{profile.Name, strUsedBy})
+		data = append(data, []string{profile.Name, profile.Description, strUsedBy})
 	}
 	sort.Sort(byName(data))
 
 	header := []string{
 		i18n.G("NAME"),
+		i18n.G("DESCRIPTION"),
 		i18n.G("USED BY")}
 
 	return utils.RenderTable(c.flagFormat, header, data, profiles)

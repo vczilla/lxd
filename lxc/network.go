@@ -93,6 +93,10 @@ func (c *cmdNetwork) Command() *cobra.Command {
 	networkUnsetCmd := cmdNetworkUnset{global: c.global, network: c, networkSet: &networkSetCmd}
 	cmd.AddCommand(networkUnsetCmd.Command())
 
+	// ACL
+	networkACLCmd := cmdNetworkACL{global: c.global}
+	cmd.AddCommand(networkACLCmd.Command())
+
 	return cmd
 }
 
@@ -146,14 +150,26 @@ func (c *cmdNetworkAttach) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Prepare the instance's device entry
-	device := map[string]string{
-		"type":    "nic",
-		"nictype": "macvlan",
-		"parent":  resource.name,
-	}
+	var device map[string]string
+	if network.Managed && resource.server.HasExtension("instance_nic_network") {
+		// If network is managed, use the network property rather than nictype, so that the network's
+		// inherited properties are loaded into the NIC when started.
+		device = map[string]string{
+			"type":    "nic",
+			"network": network.Name,
+		}
+	} else {
+		// If network is unmanaged default to using a macvlan connected to the specified interface.
+		device = map[string]string{
+			"type":    "nic",
+			"nictype": "macvlan",
+			"parent":  resource.name,
+		}
 
-	if network.Type == "bridge" {
-		device["nictype"] = "bridged"
+		if network.Type == "bridge" {
+			// If the network type is an unmanaged bridge, use bridged NIC type.
+			device["nictype"] = "bridged"
+		}
 	}
 
 	if len(args) > 3 {
@@ -255,7 +271,7 @@ func (c *cmdNetworkCreate) Command() *cobra.Command {
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(`Create new networks`))
 
 	cmd.Flags().StringVar(&c.network.flagTarget, "target", "", i18n.G("Cluster member name")+"``")
-	cmd.Flags().StringVarP(&c.network.flagType, "type", "t", "", i18n.G("Network type"))
+	cmd.Flags().StringVarP(&c.network.flagType, "type", "t", "", i18n.G("Network type")+"``")
 
 	cmd.RunE = c.Run
 
@@ -641,7 +657,7 @@ func (c *cmdNetworkEdit) Run(cmd *cobra.Command, args []string) error {
 		// Respawn the editor
 		if err != nil {
 			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
-			fmt.Println(i18n.G("Press enter to open the editor again"))
+			fmt.Println(i18n.G("Press enter to open the editor again or ctrl+c to abort change"))
 
 			_, err := os.Stdin.Read(make([]byte, 1))
 			if err != nil {
@@ -811,7 +827,7 @@ func (c *cmdNetworkList) Command() *cobra.Command {
 		`List available networks`))
 
 	cmd.RunE = c.Run
-	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	return cmd
 }
@@ -904,7 +920,7 @@ func (c *cmdNetworkListLeases) Command() *cobra.Command {
 	cmd.Short = i18n.G("List DHCP leases")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
 		`List DHCP leases`))
-	cmd.Flags().StringVar(&c.flagFormat, "format", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
+	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml)")+"``")
 
 	cmd.RunE = c.Run
 

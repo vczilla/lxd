@@ -41,7 +41,8 @@ var clusterCmd = APIEndpoint{
 var clusterNodesCmd = APIEndpoint{
 	Path: "cluster/members",
 
-	Get: APIEndpointAction{Handler: clusterNodesGet, AccessHandler: allowAuthenticated},
+	Get:  APIEndpointAction{Handler: clusterNodesGet, AccessHandler: allowAuthenticated},
+	Post: APIEndpointAction{Handler: clusterNodesPost, AccessHandler: allowAuthenticated},
 }
 
 var clusterNodeCmd = APIEndpoint{
@@ -84,7 +85,40 @@ var internalClusterRaftNodeCmd = APIEndpoint{
 	Delete: APIEndpointAction{Handler: internalClusterRaftNodeDelete},
 }
 
-// Return information about the cluster.
+// swagger:operation GET /1.0/cluster/{name} cluster cluster_get
+//
+// Get the cluster configuration
+//
+// Gets the current cluster configuration.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: Cluster configuration
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/Cluster"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterGet(d *Daemon, r *http.Request) response.Response {
 	name := ""
 	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
@@ -186,6 +220,36 @@ func clusterGetMemberConfig(cluster *db.Cluster) ([]api.ClusterMemberConfigKey, 
 // - disable clustering on a node
 //
 // The client is required to be trusted.
+
+// swagger:operation PUT /1.0/cluster/{name} cluster cluster_put
+//
+// Update the cluster configuration
+//
+// Updates the entire cluster configuration.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: cluster
+//     description: Cluster configuration
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ClusterPut"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "412":
+//     $ref: "#/responses/PreconditionFailed"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterPut(d *Daemon, r *http.Request) response.Response {
 	req := api.ClusterPut{}
 
@@ -357,14 +421,13 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) response.Response {
 	}
 
 	// Client parameters to connect to the target cluster node.
-	cert := d.endpoints.NetworkCert()
+	serverCert := d.serverCert()
 	args := &lxd.ConnectionArgs{
-		TLSClientCert: string(cert.PublicKey()),
-		TLSClientKey:  string(cert.PrivateKey()),
+		TLSClientCert: string(serverCert.PublicKey()),
+		TLSClientKey:  string(serverCert.PrivateKey()),
 		TLSServerCert: string(req.ClusterCertificate),
 		UserAgent:     version.UserAgent,
 	}
-	fingerprint := cert.Fingerprint()
 
 	// Asynchronously join the cluster.
 	run := func(op *operations.Operation) error {
@@ -373,11 +436,17 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) response.Response {
 		// If the user has provided a cluster password, setup the trust
 		// relationship by adding our own certificate to the cluster.
 		if req.ClusterPassword != "" {
-			err = cluster.SetupTrust(string(cert.PublicKey()), req.ClusterAddress,
-				string(req.ClusterCertificate), req.ClusterPassword)
+			err = cluster.SetupTrust(serverCert, req.ServerName, req.ClusterAddress, req.ClusterCertificate, req.ClusterPassword)
 			if err != nil {
 				return errors.Wrap(err, "Failed to setup cluster trust")
 			}
+		}
+
+		// Now we are in the remote trust store, ensure our name and type are correct to allow the cluster
+		// to associate our member name to the server certificate.
+		err = cluster.UpdateTrust(serverCert, req.ServerName, req.ClusterAddress, req.ClusterCertificate)
+		if err != nil {
+			return errors.Wrap(err, "Failed to update cluster trust")
 		}
 
 		// Connect to the target cluster node.
@@ -466,14 +535,49 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) response.Response {
 		if err != nil {
 			return errors.Wrap(err, "Failed to save cluster certificate")
 		}
-		cert, err := util.LoadCert(d.os.VarDir)
+
+		networkCert, err := util.LoadClusterCert(d.os.VarDir)
 		if err != nil {
 			return errors.Wrap(err, "Failed to parse cluster certificate")
 		}
-		d.endpoints.NetworkUpdateCert(cert)
 
-		// Update local setup and possibly join the raft dqlite
-		// cluster.
+		d.endpoints.NetworkUpdateCert(networkCert)
+
+		// Add trusted certificates of other members to local trust store.
+		trustedCerts, err := client.GetCertificates()
+		if err != nil {
+			return errors.Wrap(err, "Failed to get trusted certificates")
+		}
+
+		for _, trustedCert := range trustedCerts {
+			if trustedCert.Type == api.CertificateTypeServer {
+				dbType, err := db.CertificateAPITypeToDBType(trustedCert.Type)
+				if err != nil {
+					return err
+				}
+
+				// Store the certificate in the local database.
+				dbCert := db.Certificate{
+					Fingerprint: trustedCert.Fingerprint,
+					Type:        dbType,
+					Name:        trustedCert.Name,
+					Certificate: trustedCert.Certificate,
+					Restricted:  trustedCert.Restricted,
+					Projects:    trustedCert.Projects,
+				}
+
+				logger.Debugf("Adding certificate %q (%s) to local trust store", trustedCert.Name, trustedCert.Fingerprint)
+				_, err = d.cluster.CreateCertificate(dbCert)
+				if err != nil && err.Error() != "This certificate already exists" {
+					return errors.Wrapf(err, "Failed adding local trusted certificate %q (%s)", trustedCert.Name, trustedCert.Fingerprint)
+				}
+			}
+		}
+
+		// Update cached trusted certificates.
+		updateCertificateCache(d)
+
+		// Update local setup and possibly join the raft dqlite cluster.
 		nodes := make([]db.RaftNode, len(info.RaftNodes))
 		for i, node := range info.RaftNodes {
 			nodes[i].ID = node.ID
@@ -485,22 +589,9 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) response.Response {
 		d.startClusterTasks()
 		revert.Add(func() { d.stopClusterTasks() })
 
-		err = cluster.Join(d.State(), d.gateway, cert, req.ServerName, nodes)
+		err = cluster.Join(d.State(), d.gateway, networkCert, serverCert, req.ServerName, nodes)
 		if err != nil {
 			return err
-		}
-
-		// Remove our old server certificate from the trust store, since it's not needed anymore.
-		_, err = d.cluster.GetCertificate(fingerprint)
-		if err != db.ErrNoSuchObject {
-			if err != nil {
-				return err
-			}
-
-			err := d.cluster.DeleteCertificate(fingerprint)
-			if err != nil {
-				return errors.Wrap(err, "Failed to delete joining member's certificate")
-			}
 		}
 
 		// Handle optional service integration on cluster join
@@ -556,60 +647,10 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) response.Response {
 			logger.Errorf("Failed starting networks: %v", err)
 		}
 
-		client, err = cluster.Connect(req.ClusterAddress, d.endpoints.NetworkCert(), true)
+		client, err = cluster.Connect(req.ClusterAddress, d.endpoints.NetworkCert(), serverCert, true)
 		if err != nil {
 			return err
 		}
-
-		// Re-use the client handler and import the images from the leader node which
-		// owns all available images to the joined node
-		go func() {
-			leader, err := d.gateway.LeaderAddress()
-			if err != nil {
-				logger.Errorf("Failed to get current leader member: %v", err)
-				return
-			}
-			var nodeInfo db.NodeInfo
-			err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-				var err error
-				nodeInfo, err = tx.GetNodeByAddress(leader)
-				return err
-			})
-			if err != nil {
-				logger.Errorf("Failed to retrieve the information of leader member: %v", err)
-				return
-			}
-			imageProjectInfo, err := d.cluster.GetImagesOnNode(nodeInfo.ID)
-			if err != nil {
-				logger.Errorf("Failed to retrieve the image fingerprints of leader member: %v", err)
-				return
-			}
-
-			imageImport := func(client lxd.InstanceServer, fingerprint string, projects []string) error {
-				err := imageImportFromNode(filepath.Join(d.os.VarDir, "images"), client, fingerprint)
-				if err != nil {
-					return err
-				}
-
-				for _, project := range projects {
-					err := d.cluster.AddImageToLocalNode(project, fingerprint)
-					if err != nil {
-						return err
-					}
-				}
-
-				return nil
-			}
-
-			for f, ps := range imageProjectInfo {
-				go func(fingerprint string, projects []string) {
-					err := imageImport(client, fingerprint, projects)
-					if err != nil {
-						logger.Errorf("Failed to import an image %s from %s: %v", fingerprint, leader, err)
-					}
-				}(f, ps)
-			}
-		}()
 
 		// Add the cluster flag from the agent
 		version.UserAgentFeatures([]string{"cluster"})
@@ -619,6 +660,12 @@ func clusterPutJoin(d *Daemon, req api.ClusterPut) response.Response {
 		_, _, err = client.RawQuery("POST", "/internal/cluster/rebalance", nil, "")
 		if err != nil {
 			logger.Warnf("Failed to trigger cluster rebalance: %v", err)
+		}
+
+		// Ensure all images are available after this node has joined.
+		err = autoSyncImages(d.ctx, d)
+		if err != nil {
+			logger.Warn("Failed to sync images")
 		}
 
 		revert.Success()
@@ -655,14 +702,15 @@ func clusterPutDisable(d *Daemon) response.Response {
 			return response.InternalError(err)
 		}
 	}
-	cert, err := util.LoadCert(d.os.VarDir)
+
+	networkCert, err := util.LoadCert(d.os.VarDir)
 	if err != nil {
 		return response.InternalError(errors.Wrap(err, "Failed to parse member certificate"))
 	}
 
 	// Reset the cluster database and make it local to this node.
-	d.endpoints.NetworkUpdateCert(cert)
-	err = d.gateway.Reset(cert)
+	d.endpoints.NetworkUpdateCert(networkCert)
+	err = d.gateway.Reset(networkCert)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -875,92 +923,419 @@ func clusterAcceptMember(
 	return info, nil
 }
 
+// swagger:operation GET /1.0/cluster/members cluster cluster_members_get
+//
+// Get the cluster members
+//
+// Returns a list of cluster members (URLs).
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: API endpoints
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           type: array
+//           description: List of endpoints
+//           items:
+//             type: string
+//           example: |-
+//             [
+//               "/1.0/cluster/members/lxd01",
+//               "/1.0/cluster/members/lxd02"
+//             ]
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+
+// swagger:operation GET /1.0/cluster/members?recursion=1 cluster cluster_members_get_recursion1
+//
+// Get the cluster members
+//
+// Returns a list of cluster members (structs).
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: API endpoints
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           type: array
+//           description: List of cluster members
+//           items:
+//             $ref: "#/definitions/ClusterMember"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterNodesGet(d *Daemon, r *http.Request) response.Response {
 	recursion := util.IsRecursionRequest(r)
+	state := d.State()
 
-	nodes, err := cluster.List(d.State(), d.gateway)
+	var err error
+	var nodes []db.NodeInfo
+	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		// Get the nodes.
+		nodes, err = tx.GetNodes()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	var result interface{}
 	if recursion {
-		result = nodes
-	} else {
-		urls := []string{}
+		result := []api.ClusterMember{}
 		for _, node := range nodes {
-			url := fmt.Sprintf("/%s/cluster/members/%s", version.APIVersion, node.ServerName)
-			urls = append(urls, url)
+			member, err := node.ToAPI(state.Cluster, state.Node)
+			if err != nil {
+				return response.InternalError(err)
+			}
+
+			result = append(result, *member)
 		}
-		result = urls
+
+		return response.SyncResponse(true, result)
 	}
 
-	return response.SyncResponse(true, result)
+	urls := []string{}
+	for _, node := range nodes {
+		url := fmt.Sprintf("/%s/cluster/members/%s", version.APIVersion, node.Name)
+		urls = append(urls, url)
+	}
+
+	return response.SyncResponse(true, urls)
 }
 
+// swagger:operation POST /1.0/cluster/members cluster cluster_members_post
+//
+// Request a join token
+//
+// Requests a join token to add a cluster member.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: cluster
+//     description: Cluster member add request
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ClusterMembersPost"
+// responses:
+//   "200":
+//     $ref: "#/responses/Operation"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func clusterNodesPost(d *Daemon, r *http.Request) response.Response {
+	req := api.ClusterMembersPost{}
+
+	// Parse the request.
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		return response.BadRequest(err)
+	}
+
+	clustered, err := cluster.Enabled(d.db)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if !clustered {
+		return response.BadRequest(fmt.Errorf("This server is not clustered"))
+	}
+
+	// Get target addresses for existing online members, so that it can be encoded into the join token so that
+	// the joining member will not have to specify a joining address during the join process.
+	// Use anonymous interface type to align with how the API response will be returned for consistency when
+	// retrieving remote operations.
+	onlineNodeAddresses := make([]interface{}, 0)
+
+	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		// Get the offline threshold.
+		config, err := cluster.ConfigLoad(tx)
+		if err != nil {
+			return errors.Wrap(err, "Failed to load LXD config")
+		}
+
+		// Get the nodes.
+		nodes, err := tx.GetNodes()
+		if err != nil {
+			return err
+		}
+
+		// Filter to online members.
+		for _, node := range nodes {
+			if node.IsOffline(config.OfflineThreshold()) {
+				continue
+			}
+
+			onlineNodeAddresses = append(onlineNodeAddresses, node.Address)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if len(onlineNodeAddresses) < 1 {
+		return response.InternalError(fmt.Errorf("There are no online cluster members"))
+	}
+
+	// Generate join secret for new member. This will be stored inside the join token operation and will be
+	// supplied by the joining member (encoded inside the join token) which will allow us to lookup the correct
+	// operation in order to validate the requested joining server name is correct and authorised.
+	joinSecret, err := shared.RandomCryptoString()
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	// Generate fingerprint of network certificate so joining member can automatically trust the correct
+	// certificate when it is presented during the join process.
+	fingerprint, err := shared.CertFingerprintStr(string(d.endpoints.NetworkPublicKey()))
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	meta := map[string]interface{}{
+		"serverName":  req.ServerName, // Add server name to allow validation of name during join process.
+		"secret":      joinSecret,
+		"fingerprint": fingerprint,
+		"addresses":   onlineNodeAddresses,
+	}
+
+	resources := map[string][]string{}
+	resources["cluster"] = []string{}
+
+	op, err := operations.OperationCreate(d.State(), project.Default, operations.OperationClassToken, db.OperationClusterJoinToken, resources, meta, nil, nil, nil)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	return operations.OperationResponse(op)
+}
+
+// swagger:operation GET /1.0/cluster/members/{name} cluster cluster_member_get
+//
+// Get the cluster member
+//
+// Gets a specific cluster member.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: Profile
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/ClusterMember"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterNodeGet(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
+	state := d.State()
 
-	nodes, err := cluster.List(d.State(), d.gateway)
+	var err error
+	var nodes []db.NodeInfo
+	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		// Get the node.
+		nodes, err = tx.GetNodes()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	for _, node := range nodes {
-		if node.ServerName == name {
-			return response.SyncResponseETag(true, node, node.ClusterMemberPut)
+		if node.Name != name {
+			continue
 		}
+
+		member, err := node.ToAPI(state.Cluster, state.Node)
+		if err != nil {
+			return response.InternalError(err)
+		}
+
+		return response.SyncResponseETag(true, member, member.ClusterMemberPut)
 	}
 
 	return response.NotFound(fmt.Errorf("Member '%s' not found", name))
 }
 
+// swagger:operation PATCH /1.0/cluster/members/{name} cluster cluster_member_patch
+//
+// Partially update the cluster member
+//
+// Updates a subset of the cluster member configuration.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: cluster
+//     description: Cluster member configuration
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ClusterMemberPut"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "412":
+//     $ref: "#/responses/PreconditionFailed"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterNodePatch(d *Daemon, r *http.Request) response.Response {
 	// Right now, Patch does the same as Put.
 	return clusterNodePut(d, r)
 }
 
+// swagger:operation PUT /1.0/cluster/members/{name} cluster cluster_member_put
+//
+// Update the cluster member
+//
+// Updates the entire cluster member configuration.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: cluster
+//     description: Cluster member configuration
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ClusterMemberPut"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "412":
+//     $ref: "#/responses/PreconditionFailed"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterNodePut(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
+	state := d.State()
 
-	// Find the requested one.
-	nodes, err := cluster.List(d.State(), d.gateway)
+	var err error
+	var node db.NodeInfo
+	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		// Get the node.
+		node, err = tx.GetNodeByName(name)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	var current *api.ClusterMember
-	for _, node := range nodes {
-		if node.ServerName == name {
-			current = &node
-			break
-		}
-	}
-
-	if current == nil {
-		return response.NotFound(fmt.Errorf("Member '%s' not found", name))
+	member, err := node.ToAPI(state.Cluster, state.Node)
+	if err != nil {
+		return response.InternalError(err)
 	}
 
 	// Validate the request is fine
-	err = util.EtagCheck(r, current.ClusterMemberPut)
+	err = util.EtagCheck(r, member.ClusterMemberPut)
 	if err != nil {
 		return response.PreconditionFailed(err)
 	}
 
 	// Parse the request
 	req := api.ClusterMemberPut{}
-
 	err = json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		return response.BadRequest(err)
 	}
 
 	// Validate the request
-	if shared.StringInSlice(string(db.ClusterRoleDatabase), current.Roles) && !shared.StringInSlice(string(db.ClusterRoleDatabase), req.Roles) {
+	if shared.StringInSlice(string(db.ClusterRoleDatabase), member.Roles) && !shared.StringInSlice(string(db.ClusterRoleDatabase), req.Roles) {
 		return response.BadRequest(fmt.Errorf("The '%s' role cannot be dropped at this time", db.ClusterRoleDatabase))
 	}
 
-	if !shared.StringInSlice(string(db.ClusterRoleDatabase), current.Roles) && shared.StringInSlice(string(db.ClusterRoleDatabase), req.Roles) {
+	if !shared.StringInSlice(string(db.ClusterRoleDatabase), member.Roles) && shared.StringInSlice(string(db.ClusterRoleDatabase), req.Roles) {
 		return response.BadRequest(fmt.Errorf("The '%s' role cannot be added at this time", db.ClusterRoleDatabase))
 	}
 
@@ -971,6 +1346,15 @@ func clusterNodePut(d *Daemon, r *http.Request) response.Response {
 			return errors.Wrap(err, "Loading node information")
 		}
 
+		// Update the description.
+		if req.Description != member.Description {
+			err = tx.SetDescription(nodeInfo.ID, req.Description)
+			if err != nil {
+				return errors.Wrap(err, "Update description")
+			}
+		}
+
+		// Update the roles.
 		dbRoles := []db.ClusterRole{}
 		for _, role := range req.Roles {
 			dbRoles = append(dbRoles, db.ClusterRole(role))
@@ -995,6 +1379,33 @@ func clusterNodePut(d *Daemon, r *http.Request) response.Response {
 	return response.EmptySyncResponse
 }
 
+// swagger:operation POST /1.0/cluster/members/{name} cluster cluster_member_post
+//
+// Rename the cluster member
+//
+// Renames an existing cluster member.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: body
+//     name: cluster
+//     description: Cluster member rename request
+//     required: true
+//     schema:
+//       $ref: "#/definitions/ClusterMemberPost"
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterNodePost(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
 
@@ -1016,6 +1427,24 @@ func clusterNodePost(d *Daemon, r *http.Request) response.Response {
 	return response.EmptySyncResponse
 }
 
+// swagger:operation DELETE /1.0/cluster/members/{name} cluster cluster_member_delete
+//
+// Delete the cluster member
+//
+// Removes the member from the cluster.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func clusterNodeDelete(d *Daemon, r *http.Request) response.Response {
 	d.clusterMembershipMutex.Lock()
 	defer d.clusterMembershipMutex.Unlock()
@@ -1039,7 +1468,7 @@ func clusterNodeDelete(d *Daemon, r *http.Request) response.Response {
 	}
 	if localAddress != leader {
 		logger.Debugf("Redirect member delete request to %s", leader)
-		client, err := cluster.Connect(leader, d.endpoints.NetworkCert(), false)
+		client, err := cluster.Connect(leader, d.endpoints.NetworkCert(), d.serverCert(), false)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -1053,6 +1482,16 @@ func clusterNodeDelete(d *Daemon, r *http.Request) response.Response {
 
 	logger.Debugf("Deleting member %s from cluster (force=%d)", name, force)
 
+	err = autoSyncImages(d.ctx, d)
+	if err != nil {
+		if force == 0 {
+			return response.SmartError(errors.Wrap(err, "Failed to sync images"))
+		}
+
+		// If force is set, only show a warning instead of returning an error.
+		logger.Warn("Failed to sync images")
+	}
+
 	// First check that the node is clear from containers and images and
 	// make it leave the database cluster, if it's part of it.
 	address, err := cluster.Leave(d.State(), d.gateway, name, force == 1)
@@ -1063,8 +1502,7 @@ func clusterNodeDelete(d *Daemon, r *http.Request) response.Response {
 	if force != 1 {
 		// Try to gracefully delete all networks and storage pools on it.
 		// Delete all networks on this node
-		cert := d.endpoints.NetworkCert()
-		client, err := cluster.Connect(address, cert, true)
+		client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), true)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -1114,6 +1552,11 @@ func clusterNodeDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(errors.Wrap(err, "Failed to remove member from database"))
 	}
 
+	// Refresh the trusted certificate cache now that the member certificate has been removed.
+	// We do not need to notify the other members here because the next heartbeat will trigger member change
+	// detection and updateCertificateCache is called as part of that.
+	updateCertificateCache(d)
+
 	err = rebalanceMemberRoles(d)
 	if err != nil {
 		logger.Warnf("Failed to rebalance dqlite nodes: %v", err)
@@ -1121,8 +1564,7 @@ func clusterNodeDelete(d *Daemon, r *http.Request) response.Response {
 
 	if force != 1 {
 		// Try to gracefully reset the database on the node.
-		cert := d.endpoints.NetworkCert()
-		client, err := cluster.Connect(address, cert, true)
+		client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), true)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -1133,6 +1575,12 @@ func clusterNodeDelete(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return response.SmartError(errors.Wrap(err, "Failed to cleanup the member"))
 		}
+	}
+
+	// Ensure all images are available after this node has been deleted.
+	err = autoSyncImages(d.ctx, d)
+	if err != nil {
+		logger.Warn("Failed to sync images")
 	}
 
 	return response.EmptySyncResponse
@@ -1286,7 +1734,7 @@ again:
 			continue
 		}
 
-		if cluster.HasConnectivity(d.endpoints.NetworkCert(), address) {
+		if cluster.HasConnectivity(d.endpoints.NetworkCert(), d.serverCert(), address) {
 			break
 		}
 
@@ -1339,8 +1787,7 @@ func changeMemberRole(d *Daemon, address string, nodes []db.RaftNode) error {
 		})
 	}
 
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.Connect(address, cert, true)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), true)
 	if err != nil {
 		return err
 	}
@@ -1396,8 +1843,7 @@ findLeader:
 		goto findLeader
 	}
 
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.Connect(leader, cert, true)
+	client, err := cluster.Connect(leader, d.endpoints.NetworkCert(), d.serverCert(), true)
 	if err != nil {
 		return err
 	}

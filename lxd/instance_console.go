@@ -365,13 +365,46 @@ func (s *consoleWs) doVGA(op *operations.Operation) error {
 	return nil
 }
 
-func containerConsolePost(d *Daemon, r *http.Request) response.Response {
+// swagger:operation POST /1.0/instances/{name}/console instances instance_console_post
+//
+// Connect to console
+//
+// Connects to the console of an instance.
+//
+// The returned operation metadata will contain two websockets, one for data and one for control.
+//
+// ---
+// consumes:
+//   - application/json
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+//   - in: body
+//     name: console
+//     description: Console request
+//     schema:
+//       $ref: "#/definitions/InstanceConsolePost"
+// responses:
+//   "200":
+//     $ref: "#/responses/Operation"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	post := api.InstanceConsolePost{}
@@ -386,21 +419,20 @@ func containerConsolePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Forward the request if the container is remote.
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, project, name, cert, instanceType)
+	client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, projectName, name, d.endpoints.NetworkCert(), d.serverCert(), instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	if client != nil {
-		url := fmt.Sprintf("/instances/%s/console?project=%s", name, project)
+		url := fmt.Sprintf("/instances/%s/console?project=%s", name, projectName)
 		op, _, err := client.RawOperation("POST", url, post, "")
 		if err != nil {
 			return response.SmartError(err)
 		}
 
 		opAPI := op.Get()
-		return operations.ForwardedOperationResponse(project, &opAPI)
+		return operations.ForwardedOperationResponse(projectName, &opAPI)
 	}
 
 	if post.Type == "" {
@@ -412,7 +444,7 @@ func containerConsolePost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Unknown console type %q", post.Type))
 	}
 
-	inst, err := instance.LoadByProjectAndName(d.State(), project, name)
+	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -451,9 +483,12 @@ func containerConsolePost(d *Daemon, r *http.Request) response.Response {
 
 	resources := map[string][]string{}
 	resources["instances"] = []string{ws.instance.Name()}
-	resources["containers"] = resources["instances"] // Old field name.
 
-	op, err := operations.OperationCreate(d.State(), project, operations.OperationClassWebsocket, db.OperationConsoleShow,
+	if inst.Type() == instancetype.Container {
+		resources["containers"] = resources["instances"]
+	}
+
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, db.OperationConsoleShow,
 		resources, ws.Metadata(), ws.Do, nil, ws.Connect)
 	if err != nil {
 		return response.InternalError(err)
@@ -462,17 +497,48 @@ func containerConsolePost(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
-func containerConsoleLogGet(d *Daemon, r *http.Request) response.Response {
+// swagger:operation GET /1.0/instances/{name}/console instances instance_console_get
+//
+// Get console log
+//
+// Gets the console log for the instance.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+// responses:
+//   "200":
+//      description: Raw console log
+//      content:
+//        application/octet-stream:
+//          schema:
+//            type: string
+//            example: some-text
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "404":
+//     $ref: "#/responses/NotFound"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instanceConsoleLogGet(d *Daemon, r *http.Request) response.Response {
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	project := projectParam(r)
+	projectName := projectParam(r)
 	name := mux.Vars(r)["name"]
 
 	// Forward the request if the container is remote.
-	resp, err := forwardedResponseIfInstanceIsRemote(d, r, project, name, instanceType)
+	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -484,7 +550,7 @@ func containerConsoleLogGet(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("Querying the console buffer requires liblxc >= 3.0"))
 	}
 
-	inst, err := instance.LoadByProjectAndName(d.State(), project, name)
+	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -530,15 +596,41 @@ func containerConsoleLogGet(d *Daemon, r *http.Request) response.Response {
 	return response.FileResponse(r, []response.FileResponseEntry{ent}, nil, false)
 }
 
-func containerConsoleLogDelete(d *Daemon, r *http.Request) response.Response {
+// swagger:operation DELETE /1.0/instances/{name}/console instances instance_console_delete
+//
+// Clear the console log
+//
+// Clears the console log buffer.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: project
+//     description: Project name
+//     type: string
+//     example: default
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "404":
+//     $ref: "#/responses/NotFound"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+func instanceConsoleLogDelete(d *Daemon, r *http.Request) response.Response {
 	if !util.RuntimeLiblxcVersionAtLeast(3, 0, 0) {
 		return response.BadRequest(fmt.Errorf("Clearing the console buffer requires liblxc >= 3.0"))
 	}
 
 	name := mux.Vars(r)["name"]
-	project := projectParam(r)
+	projectName := projectParam(r)
 
-	inst, err := instance.LoadByProjectAndName(d.State(), project, name)
+	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
 		return response.SmartError(err)
 	}

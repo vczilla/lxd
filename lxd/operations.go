@@ -8,6 +8,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
 
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
@@ -20,6 +21,7 @@ import (
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	log "github.com/lxc/lxd/shared/log15"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -65,9 +67,15 @@ func waitForOperations(s *state.State, chCancel chan struct{}) {
 		runningOps := 0
 
 		for _, op := range ops {
-			if op.Status() == api.Running {
-				runningOps++
+			if op.Status() != api.Running {
+				continue
 			}
+
+			if op.Class() == operations.OperationClassToken {
+				continue
+			}
+
+			runningOps++
 		}
 
 		// No more running operations left. Exit function.
@@ -84,8 +92,10 @@ func waitForOperations(s *state.State, chCancel chan struct{}) {
 				execConsoleOps++
 			}
 
-			_, opAPI, _ := op.Render()
-			if opAPI.MayCancel {
+			_, opAPI, err := op.Render()
+			if err != nil {
+				logger.Warn("Failed to render operation", log.Ctx{"operation": op, "err": err})
+			} else if opAPI.MayCancel {
 				op.Cancel()
 			}
 		}
@@ -112,6 +122,41 @@ func waitForOperations(s *state.State, chCancel chan struct{}) {
 }
 
 // API functions
+
+// swagger:operation GET /1.0/operations/{id} operations operation_get
+//
+// Get the operation state
+//
+// Gets the operation state.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: Operation
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/Operation"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func operationGet(d *Daemon, r *http.Request) response.Response {
 	id := mux.Vars(r)["id"]
 
@@ -143,8 +188,7 @@ func operationGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.Connect(address, cert, false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -152,6 +196,24 @@ func operationGet(d *Daemon, r *http.Request) response.Response {
 	return response.ForwardedResponse(client, r)
 }
 
+// swagger:operation DELETE /1.0/operations/{id} operations operation_delete
+//
+// Cancel the operation
+//
+// Cancels the operation if supported.
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     $ref: "#/responses/EmptySyncResponse"
+//   "400":
+//     $ref: "#/responses/BadRequest"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func operationDelete(d *Daemon, r *http.Request) response.Response {
 	id := mux.Vars(r)["id"]
 
@@ -192,8 +254,7 @@ func operationDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.Connect(address, cert, false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -201,8 +262,135 @@ func operationDelete(d *Daemon, r *http.Request) response.Response {
 	return response.ForwardedResponse(client, r)
 }
 
+// operationCancel cancels an operation that exists on any member.
+func operationCancel(d *Daemon, projectName string, op *api.Operation) error {
+	// Check if operation is local and if so, cancel it.
+	localOp, _ := operations.OperationGetInternal(op.ID)
+	if localOp != nil {
+		if localOp.Status() == api.Running {
+			_, err := localOp.Cancel()
+			if err != nil {
+				return errors.Wrapf(err, "Failed to cancel local operation %q", op.ID)
+			}
+		}
+
+		return nil
+	}
+
+	// If not found locally, try connecting to remote member to delete it.
+	var memberAddress string
+	var err error
+	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		operation, err := tx.GetOperationByUUID(op.ID)
+		if err != nil {
+			return errors.Wrapf(err, "Failed loading operation %q", op.ID)
+		}
+
+		memberAddress = operation.NodeAddress
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	client, err := cluster.Connect(memberAddress, d.endpoints.NetworkCert(), d.serverCert(), true)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to connect to %q", memberAddress)
+	}
+
+	err = client.UseProject(projectName).DeleteOperation(op.ID)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to delete remote operation %q on %q", op.ID, memberAddress)
+	}
+
+	return nil
+}
+
+// swagger:operation GET /1.0/operations operations operations_get
+//
+// Get the operations
+//
+// Returns a dict of operation type to operation list (URLs).
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: API endpoints
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           type: object
+//           additionalProperties:
+//             type: array
+//             items:
+//               type: string
+//           description: Dict of operation types to operation URLs
+//           example: |-
+//             {
+//               "running": [
+//                 "/1.0/operations/6916c8a6-9b7d-4abd-90b3-aedfec7ec7da"
+//               ]
+//             }
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+
+// swagger:operation GET /1.0/operations?recursion=1 operations operations_get_recursion1
+//
+// Get the operations
+//
+// Returns a list of operations (structs).
+//
+// ---
+// produces:
+//   - application/json
+// responses:
+//   "200":
+//     description: API endpoints
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           type: array
+//           description: List of operations
+//           items:
+//             $ref: "#/definitions/Operation"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func operationsGet(d *Daemon, r *http.Request) response.Response {
-	project := projectParam(r)
+	projectName := projectParam(r)
 	recursion := util.IsRecursionRequest(r)
 
 	localOperationURLs := func() (shared.Jmap, error) {
@@ -213,7 +401,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 		body := shared.Jmap{}
 
 		for _, v := range localOps {
-			if v.Project() != "" && v.Project() != project {
+			if v.Project() != "" && v.Project() != projectName {
 				continue
 			}
 			status := strings.ToLower(v.Status().String())
@@ -236,7 +424,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 		body := shared.Jmap{}
 
 		for _, v := range localOps {
-			if v.Project() != "" && v.Project() != project {
+			if v.Project() != "" && v.Project() != projectName {
 				continue
 			}
 			status := strings.ToLower(v.Status().String())
@@ -310,7 +498,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
 		var err error
 
-		nodes, err = tx.GetNodesWithRunningOperations(project)
+		nodes, err = tx.GetNodesWithRunningOperations(projectName)
 		if err != nil {
 			return err
 		}
@@ -327,20 +515,20 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 		return response.InternalError(err)
 	}
 
-	cert := d.endpoints.NetworkCert()
+	networkCert := d.endpoints.NetworkCert()
 	for _, node := range nodes {
 		if node == localAddress {
 			continue
 		}
 
 		// Connect to the remote server
-		client, err := cluster.Connect(node, cert, true)
+		client, err := cluster.Connect(node, networkCert, d.serverCert(), true)
 		if err != nil {
 			return response.SmartError(err)
 		}
 
 		// Get operation data
-		ops, err := client.GetOperations()
+		ops, err := client.UseProject(projectName).GetOperations()
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -369,6 +557,216 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 	return response.SyncResponse(true, md)
 }
 
+// operationsGetByType gets all operations for a project and type.
+func operationsGetByType(d *Daemon, projectName string, opType db.OperationType) ([]*api.Operation, error) {
+	ops := make([]*api.Operation, 0)
+
+	// Get local operations for project.
+	for _, op := range operations.Clone() {
+		if op.Project() != projectName || op.Type() != opType {
+			continue
+		}
+
+		_, apiOp, err := op.Render()
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed converting local operation %q to API representation", op.ID())
+		}
+
+		ops = append(ops, apiOp)
+	}
+
+	// Check if clustered.
+	clustered, err := cluster.Enabled(d.db)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return just local operations if not clustered.
+	if !clustered {
+		return ops, nil
+	}
+
+	// Get all operations of the specified type in project.
+	var offlineThreshold time.Duration
+	var nodes []db.NodeInfo
+	memberOps := make(map[string]map[string]db.Operation)
+	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		offlineThreshold, err = tx.GetNodeOfflineThreshold()
+		if err != nil {
+			return errors.Wrapf(err, "Failed getting member offline threshold value")
+		}
+
+		nodes, err = tx.GetNodes()
+		if err != nil {
+			return errors.Wrapf(err, "Failed getting members")
+		}
+
+		ops, err := tx.GetOperationsOfType(projectName, opType)
+		if err != nil {
+			return errors.Wrapf(err, "Failed getting operations for project %q and type %d", projectName, opType)
+		}
+
+		// Group operations by member address and UUID.
+		for _, op := range ops {
+			if memberOps[op.NodeAddress] == nil {
+				memberOps[op.NodeAddress] = make(map[string]db.Operation)
+			}
+
+			memberOps[op.NodeAddress][op.UUID] = op
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Get local address.
+	localAddress, err := node.HTTPSAddress(d.db)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed getting member local address")
+	}
+
+	memberOnline := func(memberAddress string) bool {
+		for _, node := range nodes {
+			if node.Address == memberAddress {
+				if node.IsOffline(offlineThreshold) {
+					logger.Warn("Excluding offline member from operations by type list", log.Ctx{"name": node.Name, "address": node.Address, "ID": node.ID, "lastHeartbeat": node.Heartbeat, "opType": opType})
+					return false
+				}
+
+				return true
+			}
+		}
+
+		return false
+	}
+
+	networkCert := d.endpoints.NetworkCert()
+	serverCert := d.serverCert()
+	for memberAddress := range memberOps {
+		if memberAddress == localAddress {
+			continue
+		}
+
+		if !memberOnline(memberAddress) {
+			continue
+		}
+
+		// Connect to the remote server. Use notify=true to only get local operations on remote member.
+		client, err := cluster.Connect(memberAddress, networkCert, serverCert, true)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed connecting to %q", memberAddress)
+		}
+
+		// Get all remote operations in project.
+		remoteOps, err := client.UseProject(projectName).GetOperations()
+		if err != nil {
+			log.Warn("Failed getting operations from member", log.Ctx{"address": memberAddress, "err": err})
+			continue
+		}
+
+		for _, op := range remoteOps {
+			// Exclude remote operations that don't have the desired type.
+			if memberOps[memberAddress][op.ID].Type != opType {
+				continue
+			}
+
+			ops = append(ops, &op)
+		}
+	}
+
+	return ops, nil
+}
+
+// swagger:operation GET /1.0/operations/{id}/wait?public operations operation_wait_get_untrusted
+//
+// Wait for the operation
+//
+// Waits for the operation to reach a final state (or timeout) and retrieve its final state.
+//
+// When accessed by an untrusted user, the secret token must be provided.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: secret
+//     description: Authentication token
+//     type: string
+//     example: random-string
+//   - in: query
+//     name: timeout
+//     description: Timeout in seconds (-1 means never)
+//     type: int
+//     example: -1
+// responses:
+//   "200":
+//     description: Operation
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/Operation"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+
+// swagger:operation GET /1.0/operations/{id}/wait operations operation_wait_get
+//
+// Wait for the operation
+//
+// Waits for the operation to reach a final state (or timeout) and retrieve its final state.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: timeout
+//     description: Timeout in seconds (-1 means never)
+//     type: int
+//     example: -1
+// responses:
+//   "200":
+//     description: Operation
+//     schema:
+//       type: object
+//       description: Sync response
+//       properties:
+//         type:
+//           type: string
+//           description: Response type
+//           example: sync
+//         status:
+//           type: string
+//           description: Status description
+//           example: Success
+//         status_code:
+//           type: int
+//           description: Status code
+//           example: 200
+//         metadata:
+//           $ref: "#/definitions/Operation"
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func operationWaitGet(d *Daemon, r *http.Request) response.Response {
 	id := mux.Vars(r)["id"]
 	secret := r.FormValue("secret")
@@ -418,8 +816,7 @@ func operationWaitGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.Connect(address, cert, false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -470,6 +867,60 @@ func (r *forwardedOperationWebSocket) String() string {
 	return r.id
 }
 
+// swagger:operation GET /1.0/operations/{id}/websocket?public operations operation_websocket_get_untrusted
+//
+// Get the websocket stream
+//
+// Connects to an associated websocket stream for the operation.
+// This should almost never be done directly by a client, instead it's
+// meant for LXD to LXD communication with the client only relaying the
+// connection information to the servers.
+//
+// The untrusted endpoint is used by the target server to connect to the source server.
+// Authentication is performed through the secret token.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: secret
+//     description: Authentication token
+//     type: string
+//     example: random-string
+// responses:
+//   "200":
+//     description: Websocket operation messages (dependent on operation)
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
+
+// swagger:operation GET /1.0/operations/{id}/websocket operations operation_websocket_get
+//
+// Get the websocket stream
+//
+// Connects to an associated websocket stream for the operation.
+// This should almost never be done directly by a client, instead it's
+// meant for LXD to LXD communication with the client only relaying the
+// connection information to the servers.
+//
+// ---
+// produces:
+//   - application/json
+// parameters:
+//   - in: query
+//     name: secret
+//     description: Authentication token
+//     type: string
+//     example: random-string
+// responses:
+//   "200":
+//     description: Websocket operation messages (dependent on operation)
+//   "403":
+//     $ref: "#/responses/Forbidden"
+//   "500":
+//     $ref: "#/responses/InternalServerError"
 func operationWebsocketGet(d *Daemon, r *http.Request) response.Response {
 	id := mux.Vars(r)["id"]
 
@@ -499,8 +950,7 @@ func operationWebsocketGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	cert := d.endpoints.NetworkCert()
-	client, err := cluster.Connect(address, cert, false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
 	if err != nil {
 		return response.SmartError(err)
 	}
