@@ -1184,7 +1184,6 @@ func doImagesGet(d *Daemon, recursion bool, project string, public bool, clauses
 //     type: string
 //     example: default
 // responses:
-// responses:
 //   "200":
 //     description: API endpoints
 //     schema:
@@ -1239,7 +1238,6 @@ func doImagesGet(d *Daemon, recursion bool, project string, public bool, clauses
 //     type: string
 //     example: default
 // responses:
-// responses:
 //   "200":
 //     description: API endpoints
 //     schema:
@@ -1288,7 +1286,6 @@ func doImagesGet(d *Daemon, recursion bool, project string, public bool, clauses
 //     description: Collection filter
 //     type: string
 //     example: default
-// responses:
 // responses:
 //   "200":
 //     description: API endpoints
@@ -3669,13 +3666,13 @@ func imageSyncBetweenNodes(d *Daemon, project string, fingerprint string) error 
 
 	// If none of the nodes have the image, there's nothing to sync.
 	if len(syncNodeAddresses) == 0 {
-		logger.Debug("No members have image, nothing to do", log.Ctx{"fingerprint": fingerprint, "project": project})
+		logger.Info("No members have image, nothing to do", log.Ctx{"fingerprint": fingerprint, "project": project})
 		return nil
 	}
 
 	nodeCount := desiredSyncNodeCount - int64(len(syncNodeAddresses))
 	if nodeCount <= 0 {
-		logger.Debug("Sufficient members have image", log.Ctx{"fingerprint": fingerprint, "project": project, "desiredSyncCount": desiredSyncNodeCount, "syncedCount": len(syncNodeAddresses)})
+		logger.Info("Sufficient members have image", log.Ctx{"fingerprint": fingerprint, "project": project, "desiredSyncCount": desiredSyncNodeCount, "syncedCount": len(syncNodeAddresses)})
 		return nil
 	}
 
@@ -3704,7 +3701,7 @@ func imageSyncBetweenNodes(d *Daemon, project string, fingerprint string) error 
 		}
 
 		if len(addresses) <= 0 {
-			logger.Debug("All members have image", log.Ctx{"fingerprint": fingerprint, "project": project})
+			logger.Info("All members have image", log.Ctx{"fingerprint": fingerprint, "project": project})
 			return nil
 		}
 

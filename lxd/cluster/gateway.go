@@ -115,6 +115,8 @@ type Gateway struct {
 	Cluster                   *db.Cluster
 	HeartbeatNodeHook         func(*APIHeartbeat)
 	HeartbeatOfflineThreshold time.Duration
+	heartbeatCancel           context.CancelFunc
+	heartbeatCancelLock       sync.Mutex
 
 	// NodeStore wrapper.
 	store *dqliteNodeStore
@@ -188,7 +190,7 @@ func (g *Gateway) HandlerFuncs(nodeRefreshTask func(*APIHeartbeat), trustedCerts
 			var heartbeatData APIHeartbeat
 			err := json.NewDecoder(r.Body).Decode(&heartbeatData)
 			if err != nil {
-				logger.Errorf("Error decoding heartbeat body: %v", err)
+				logger.Error("Error decoding heartbeat body", log.Ctx{"err": err})
 				http.Error(w, "400 invalid heartbeat payload", http.StatusBadRequest)
 				return
 			}
@@ -196,17 +198,17 @@ func (g *Gateway) HandlerFuncs(nodeRefreshTask func(*APIHeartbeat), trustedCerts
 			// Look for time skews
 			if heartbeatData.Time.Add(5 * time.Second).Before(time.Now().UTC()) {
 				if !g.timeSkew {
-					logger.Warnf("Time skew detected between leader and local (%s vs %s)", heartbeatData.Time, time.Now().UTC())
+					logger.Warn("Time skew detected between leader and local", log.Ctx{"leaderTime": heartbeatData.Time, "localTime": time.Now().UTC()})
 				}
 				g.timeSkew = true
 			} else if heartbeatData.Time.Add(-5 * time.Second).After(time.Now().UTC()) {
 				if !g.timeSkew {
-					logger.Warnf("Time skew detected between leader and local (%s vs %s)", heartbeatData.Time, time.Now().UTC())
+					logger.Warn("Time skew detected between leader and local", log.Ctx{"leaderTime": heartbeatData.Time, "localTime": time.Now().UTC()})
 				}
 				g.timeSkew = true
 			} else {
 				if g.timeSkew {
-					logger.Warnf("Time skew resolved")
+					logger.Warn("Time skew resolved")
 					g.timeSkew = false
 				}
 			}
@@ -230,12 +232,20 @@ func (g *Gateway) HandlerFuncs(nodeRefreshTask func(*APIHeartbeat), trustedCerts
 					return tx.ReplaceRaftNodes(raftNodes)
 				})
 				if err != nil {
-					logger.Errorf("Error updating raft nodes: %v", err)
+					logger.Error("Error updating raft members", log.Ctx{"err": err})
 					http.Error(w, "500 failed to update raft nodes", http.StatusInternalServerError)
 					return
 				}
+
+				// If there is an ongoing heartbeat round (and by implication this is the leader),
+				// then this could be a problem because it could be broadcasting the stale member
+				// state information which in turn could lead to incorrect decisions being made.
+				// So calling heartbeatRestart will request any ongoing heartbeat round to cancel
+				// itself prematurely and restart another one. If there is no ongoing heartbeat
+				// round then this function call is a no-op.
+				g.heartbeatRestart()
 			} else {
-				logger.Errorf("Empty raft node set received")
+				logger.Error("Empty raft member set received")
 			}
 
 			// Only perform node refresh task if we have received a full state list from leader.
@@ -402,7 +412,7 @@ func (g *Gateway) DialFunc() client.DialFunc {
 		// trigger a full heartbeat now: it will be a no-op if we aren't
 		// actually leaders.
 		logger.Debug("Triggering an out of schedule hearbeat", log.Ctx{"address": address})
-		go g.heartbeat(g.ctx, true)
+		go g.heartbeat(g.ctx, hearbeatInitial)
 
 		return conn, nil
 	}
