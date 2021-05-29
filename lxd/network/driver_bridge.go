@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io/ioutil"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -645,7 +647,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 	// Attempt to add a dummy device to the bridge to force the MTU.
 	if mtu != "" && n.config["bridge.driver"] != "openvswitch" {
 		dummy := &ip.Dummy{
-			Link: ip.Link{Name: fmt.Sprintf("%s-mtu", n.name), Mtu: mtu},
+			Link: ip.Link{Name: fmt.Sprintf("%s-mtu", n.name), MTU: mtu},
 		}
 		err = dummy.Add()
 		if err == nil {
@@ -662,7 +664,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		mtu = "1500"
 	}
 
-	err = bridgeLink.SetMtu(mtu)
+	err = bridgeLink.SetMTU(mtu)
 	if err != nil {
 		return err
 	}
@@ -1184,13 +1186,13 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 				mtu = fanMtu
 				if n.config["bridge.driver"] != "openvswitch" {
 					mtuLink := &ip.Link{Name: fmt.Sprintf("%s-mtu", n.name)}
-					err = mtuLink.SetMtu(mtu)
+					err = mtuLink.SetMTU(mtu)
 					if err != nil {
 						return err
 					}
 				}
 
-				err = bridgeLink.SetMtu(mtu)
+				err = bridgeLink.SetMTU(mtu)
 				if err != nil {
 					return err
 				}
@@ -1277,7 +1279,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 				return err
 			}
 
-			err = vxlan.SetMtu(mtu)
+			err = vxlan.SetMTU(mtu)
 			if err != nil {
 				return err
 			}
@@ -1413,7 +1415,7 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		}
 
 		tunLink := &ip.Link{Name: tunName}
-		err = tunLink.SetMtu(mtu)
+		err = tunLink.SetMTU(mtu)
 		if err != nil {
 			return err
 		}
@@ -1519,6 +1521,16 @@ func (n *bridge) setup(oldConfig map[string]string) error {
 		if err != nil {
 			return fmt.Errorf("Failed to run: %s %s: %v", command, strings.Join(dnsmasqCmd, " "), err)
 		}
+
+		// Check dnsmasq started OK.
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Millisecond*time.Duration(500)))
+		_, err = p.Wait(ctx)
+		if errors.Cause(err) != context.DeadlineExceeded {
+			// Just log an error if dnsmasq has exited, and still proceed with normal setup so we
+			// don't leave the firewall in an inconsistent state.
+			n.logger.Error("The dnsmasq process exited prematurely", log.Ctx{"err": err})
+		}
+		cancel()
 
 		err = p.Save(shared.VarPath("networks", n.name, "dnsmasq.pid"))
 		if err != nil {

@@ -578,7 +578,6 @@ type cmdClusterAdd struct {
 func (c *cmdClusterAdd) Command() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Use = usage("add", i18n.G("[<remote>:]<member>"))
-	cmd.Aliases = []string{"rm"}
 	cmd.Short = i18n.G("Request a join token for adding a cluster member")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(`Request a join token for adding a cluster member`))
 
@@ -623,7 +622,8 @@ func (c *cmdClusterAdd) Run(cmd *cobra.Command, args []string) error {
 			return errors.Wrapf(err, "Failed converting token operation to join token")
 		}
 
-		fmt.Printf(i18n.G("Member %s join token: %s")+"\n", resource.name, joinToken.String())
+		fmt.Printf(i18n.G("Member %s join token:")+"\n", resource.name)
+		fmt.Println(joinToken.String())
 	}
 
 	return nil
@@ -679,8 +679,8 @@ func (c *cmdClusterListTokens) Run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(i18n.G("LXD server isn't part of a cluster"))
 	}
 
-	// Get the cluster member join tokens.
-	ops, err := resource.server.GetOperations()
+	// Get the cluster member join tokens. Use default project as join tokens are created in default project.
+	ops, err := resource.server.UseProject("default").GetOperations()
 	if err != nil {
 		return err
 	}

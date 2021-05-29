@@ -33,6 +33,10 @@ const (
 	WarningMissingCGroupPidsController
 	// WarningMissingCGroupMemorySwapAccounting represents the missing GCgroup memory swap accounting warning
 	WarningMissingCGroupMemorySwapAccounting
+	// WarningClusterTimeSkew represents the cluster time skew warning
+	WarningClusterTimeSkew
+	// WarningAppArmorNotAvailable represents the AppArmor not available warning
+	WarningAppArmorNotAvailable
 )
 
 // WarningTypeNames associates a warning code to its name.
@@ -50,6 +54,8 @@ var WarningTypeNames = map[WarningType]string{
 	WarningMissingCGroupNetworkPriorityController: "Couldn't find the CGroup network priority controller",
 	WarningMissingCGroupPidsController:            "Couldn't find the CGroup pids controller",
 	WarningMissingCGroupMemorySwapAccounting:      "Couldn't find the CGroup memory swap accounting",
+	WarningClusterTimeSkew:                        "Time skew detected between leader and local",
+	WarningAppArmorNotAvailable:                   "AppArmor support has been disabled",
 }
 
 // WarningTypes associates a warning type to its type code.
@@ -89,6 +95,10 @@ func (t WarningType) Severity() WarningSeverity {
 	case WarningMissingCGroupPidsController:
 		return WarningSeverityLow
 	case WarningMissingCGroupMemorySwapAccounting:
+		return WarningSeverityLow
+	case WarningClusterTimeSkew:
+		return WarningSeverityLow
+	case WarningAppArmorNotAvailable:
 		return WarningSeverityLow
 	}
 

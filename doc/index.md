@@ -185,8 +185,7 @@ We use the LXC mailing-lists for developer and user discussions, you can
 find and subscribe to those at: <https://lists.linuxcontainers.org>
 
 ### IRC
-If you prefer live discussions, some of us also hang out in
-[#lxcontainers](https://webchat.freenode.net/?channels=#lxcontainers) on irc.freenode.net.
+If you prefer live discussions, you can find us in [#lxc](https://kiwiirc.com/client/irc.libera.chat/#lxc) on irc.libera.chat.
 
 ## FAQ
 #### How to enable LXD server for remote access?
@@ -330,6 +329,16 @@ curl --unix-socket /var/lib/lxd/unix.socket \
     -d @hello-ubuntu.json \
     lxd/1.0/containers
 ```
+or for snap users:
+
+```bash
+curl --unix-socket /var/snap/lxd/common/lxd/unix.socket \
+    -H "Content-Type: application/json" \
+    -X POST \
+    -d @hello-ubuntu.json \
+    lxd/1.0/containers
+```
+
 
 #### Via TCP
 TCP requires some additional configuration and is not enabled by default.

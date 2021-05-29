@@ -3,6 +3,7 @@ package drivers
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -378,8 +379,8 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]inter
 	logger := d.logger
 
 	return func(event string, data map[string]interface{}) {
-		if !shared.StringInSlice(event, []string{"SHUTDOWN"}) {
-			return
+		if !shared.StringInSlice(event, []string{"SHUTDOWN", "RESET"}) {
+			return // Don't bother loading the instance from DB if we aren't going to handle the event.
 		}
 
 		inst, err := instance.LoadByProjectAndName(state, projectName, instanceName)
@@ -388,7 +389,21 @@ func (d *qemu) getMonitorEventHandler() func(event string, data map[string]inter
 			return
 		}
 
-		if event == "SHUTDOWN" {
+		if event == "RESET" {
+			// As we cannot start QEMU with the -no-reboot flag, because we have to issue a
+			// system_reset QMP command to have the devices bootindex applied, then we need to handle
+			// the RESET events triggered from a guest-reset operation and prevent QEMU internally
+			// restarting the guest, and instead forcefully shutdown and restart the guest from LXD.
+			entry, ok := data["reason"]
+			if ok && entry == "guest-reset" {
+				logger.Debug("Instance guest restart")
+				err = inst.Restart(0) // Using 0 timeout will call inst.Stop() then inst.Start().
+				if err != nil {
+					logger.Error("Failed to restart instance", log.Ctx{"err": err})
+					return
+				}
+			}
+		} else if event == "SHUTDOWN" {
 			logger.Debug("Instance stopped")
 
 			target := "stop"
@@ -514,6 +529,26 @@ func (d *qemu) Freeze() error {
 	return nil
 }
 
+// configDriveMountPath returns the path for the config drive bind mount.
+func (d *qemu) configDriveMountPath() string {
+	// Use instance path and config.mount directory rather than devices path to avoid conflicts with an
+	// instance disk device mount of the same name.
+	return filepath.Join(d.Path(), "config.mount")
+}
+
+// configDriveMountPathClear attempts to unmount the config drive bind mount and remove the directory.
+func (d *qemu) configDriveMountPathClear() error {
+	return device.DiskMountClear(d.configDriveMountPath())
+}
+
+// configVirtiofsdPaths returns the path for the socket and PID file to use with config drive virtiofsd process.
+func (d *qemu) configVirtiofsdPaths() (string, string) {
+	sockPath := filepath.Join(d.LogPath(), "virtio-fs.config.sock")
+	pidPath := filepath.Join(d.LogPath(), "virtiofsd.pid")
+
+	return sockPath, pidPath
+}
+
 // onStop is run when the instance stops.
 func (d *qemu) onStop(target string) error {
 	var err error
@@ -535,18 +570,10 @@ func (d *qemu) onStop(target string) error {
 	op.Reset()
 
 	// Cleanup.
-	d.cleanupDevices()
+	d.cleanupDevices() // Must be called before unmount.
 	os.Remove(d.pidFilePath())
 	os.Remove(d.monitorPath())
 	d.unmount()
-
-	pidPath := filepath.Join(d.LogPath(), "virtiofsd.pid")
-
-	proc, err := subprocess.ImportProcess(pidPath)
-	if err == nil {
-		proc.Stop()
-		os.Remove(pidPath)
-	}
 
 	// Record power state.
 	err = d.state.Cluster.UpdateInstancePowerState(d.id, "STOPPED")
@@ -844,7 +871,7 @@ func (d *qemu) Start(stateful bool) error {
 	revert := revert.New()
 	defer revert.Fail()
 
-	// Start accumulating device paths.
+	// Start accumulating external device paths.
 	d.devPaths = []string{}
 
 	// Rotate the log file.
@@ -908,63 +935,6 @@ func (d *qemu) Start(stateful bool) error {
 		return err
 	}
 
-	// Setup virtiofsd for config path.
-	sockPath := filepath.Join(d.LogPath(), "virtio-fs.config.sock")
-
-	// Remove old socket if needed.
-	os.Remove(sockPath)
-
-	cmd, err := exec.LookPath("virtiofsd")
-	if err != nil {
-		if shared.PathExists("/usr/lib/qemu/virtiofsd") {
-			cmd = "/usr/lib/qemu/virtiofsd"
-		}
-	}
-
-	// Currently, virtiofs is broken on at least the ARM architecture.
-	// We therefore restrict virtiofs to 64BIT_INTEL_X86.
-	if d.Architecture() == osarch.ARCH_64BIT_INTEL_X86 && !shared.IsTrue(d.expandedConfig["migration.stateful"]) && cmd != "" {
-		// Start the virtiofsd process in non-daemon mode.
-		proc, err := subprocess.NewProcess(cmd, []string{fmt.Sprintf("--socket-path=%s", sockPath), "-o", fmt.Sprintf("source=%s", filepath.Join(d.Path(), "config"))}, "", "")
-		if err != nil {
-			op.Done(err)
-			return err
-		}
-
-		err = proc.Start()
-		if err != nil {
-			op.Done(err)
-			return err
-		}
-
-		revert.Add(func() { proc.Stop() })
-
-		pidPath := filepath.Join(d.LogPath(), "virtiofsd.pid")
-
-		err = proc.Save(pidPath)
-		if err != nil {
-			op.Done(err)
-			return err
-		}
-
-		// Wait for socket file to exist
-		for i := 0; i < 200; i++ {
-			if shared.PathExists(sockPath) {
-				break
-			}
-
-			time.Sleep(50 * time.Millisecond)
-		}
-
-		if !shared.PathExists(sockPath) {
-			err = fmt.Errorf("virtiofsd failed to bind socket within 10s")
-			op.Done(err)
-			return err
-		}
-	} else {
-		d.logger.Warn("Unable to use virtio-fs for config drive, using 9p as a fallback: virtiofsd missing")
-	}
-
 	// Generate UUID if not present.
 	instUUID := d.localConfig["volatile.uuid"]
 	if instUUID == "" {
@@ -1015,6 +985,44 @@ func (d *qemu) Start(stateful bool) error {
 		devConfs = append(devConfs, runConf)
 	}
 
+	// Setup the config drive readonly bind mount. Important that this come after the root disk device start.
+	// in order to allow unmounts triggered by deferred resizes of the root volume.
+	configMntPath := d.configDriveMountPath()
+	err = d.configDriveMountPathClear()
+	if err != nil {
+		return errors.Wrapf(err, "Failed cleaning config drive mount path %q", configMntPath)
+	}
+
+	err = os.Mkdir(configMntPath, 0700)
+	if err != nil {
+		return errors.Wrapf(err, "Failed creating device mount path %q for config drive", configMntPath)
+	}
+	revert.Add(func() { d.configDriveMountPathClear() })
+
+	// Mount the config drive device as readonly. This way it will be readonly irrespective of whether its
+	// exported via 9p for virtio-fs.
+	configSrcPath := filepath.Join(d.Path(), "config")
+	err = device.DiskMount(configSrcPath, configMntPath, true, false, "", "", "none")
+	if err != nil {
+		return errors.Wrapf(err, "Failed mounting device mount path %q for config drive", configMntPath)
+	}
+
+	// Setup virtiofsd for the config drive mount path.
+	// This is used by the lxd-agent in preference to 9p (due to its improved performance) and in scenarios
+	// where 9p isn't available in the VM guest OS.
+	configSockPath, configPIDPath := d.configVirtiofsdPaths()
+	err = device.DiskVMVirtiofsdStart(d, configSockPath, configPIDPath, "", configMntPath)
+	if err != nil {
+		var errUnsupported device.UnsupportedError
+		if errors.As(err, &errUnsupported) {
+			d.logger.Warn("Unable to use virtio-fs for config drive, using 9p as a fallback", log.Ctx{"err": errUnsupported})
+		} else {
+			op.Done(err)
+			return errors.Wrapf(err, "Failed to setup virtiofsd for config drive")
+		}
+	}
+	revert.Add(func() { device.DiskVMVirtiofsdStop(configSockPath, configPIDPath) })
+
 	// Get qemu configuration and check qemu is installed.
 	qemuPath, qemuBus, err := d.qemuArchConfig(d.architecture)
 	if err != nil {
@@ -1050,7 +1058,6 @@ func (d *qemu) Start(stateful bool) error {
 		"-nographic",
 		"-serial", "chardev:console",
 		"-nodefaults",
-		"-no-reboot",
 		"-no-user-config",
 		"-sandbox", "on,obsolete=deny,elevateprivileges=allow,spawn=deny,resourcecontrol=deny",
 		"-readconfig", confFile,
@@ -1216,7 +1223,7 @@ func (d *qemu) Start(stateful bool) error {
 		return err
 	}
 
-	_, err = p.Wait()
+	_, err = p.Wait(context.Background())
 	if err != nil {
 		stderr, _ := ioutil.ReadFile(d.EarlyLogFilePath())
 		err = errors.Wrapf(err, "Failed to run: %s: %s", strings.Join(p.Args, " "), string(stderr))
@@ -1290,6 +1297,13 @@ func (d *qemu) Start(stateful bool) error {
 			return errors.Wrapf(err, "Failed setting up device via monitor")
 		}
 	}
+
+	// Due to a bug in QEMU, devices added using QMP's device_add command do not have their bootindex option
+	// respected (even if added before emuation is started). To workaround this we must reset the VM in order
+	// for it to rebuild its boot config and to take into account the devices bootindex settings.
+	// This also means we cannot start the QEMU process with the -no-reboot flag and have to handle restarting
+	// the process from a guest initiated reset using the event handler returned from getMonitorEventHandler().
+	monitor.Reset()
 
 	// Reset timeout to 30s.
 	op.Reset()
@@ -1400,13 +1414,19 @@ func (d *qemu) setupNvram() error {
 		srcOvmfFile = filepath.Join(d.ovmfPath(), "OVMF_VARS.ms.fd")
 	}
 
+	missingEFIFirmwareErr := fmt.Errorf("Required EFI firmware settings file missing %q", srcOvmfFile)
+
+	if !shared.PathExists(srcOvmfFile) {
+		return missingEFIFirmwareErr
+	}
+
 	srcOvmfFile, err = filepath.EvalSymlinks(srcOvmfFile)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "Failed resolving EFI firmware symlink %q", srcOvmfFile)
 	}
 
 	if !shared.PathExists(srcOvmfFile) {
-		return fmt.Errorf("Required EFI firmware settings file missing: %s", srcOvmfFile)
+		return missingEFIFirmwareErr
 	}
 
 	os.Remove(d.nvramPath())
@@ -1650,27 +1670,29 @@ func (d *qemu) generateConfigShare() error {
 	}
 
 	// Add the VM agent.
-	path, err := exec.LookPath("lxd-agent")
+	lxdAgentSrcPath, err := exec.LookPath("lxd-agent")
 	if err != nil {
 		d.logger.Warn("lxd-agent not found, skipping its inclusion in the VM config drive", log.Ctx{"err": err})
 	} else {
 		// Install agent into config drive dir if found.
-		path, err = filepath.EvalSymlinks(path)
+		lxdAgentSrcPath, err = filepath.EvalSymlinks(lxdAgentSrcPath)
 		if err != nil {
 			return err
 		}
 
-		err = shared.FileCopy(path, filepath.Join(configDrivePath, "lxd-agent"))
+		lxdAgentInstallPath := filepath.Join(configDrivePath, "lxd-agent")
+		d.logger.Debug("Installing lxd-agent", log.Ctx{"srcPath": lxdAgentSrcPath, "installPath": lxdAgentInstallPath})
+		err = shared.FileCopy(lxdAgentSrcPath, lxdAgentInstallPath)
 		if err != nil {
 			return err
 		}
 
-		err = os.Chmod(filepath.Join(configDrivePath, "lxd-agent"), 0500)
+		err = os.Chmod(lxdAgentInstallPath, 0500)
 		if err != nil {
 			return err
 		}
 
-		err = os.Chown(filepath.Join(configDrivePath, "lxd-agent"), 0, 0)
+		err = os.Chown(lxdAgentInstallPath, 0, 0)
 		if err != nil {
 			return err
 		}
@@ -1986,25 +2008,30 @@ func (d *qemu) deviceBootPriorities() (map[string]int, error) {
 
 	devices := []devicePrios{}
 
-	for devName, devConf := range d.expandedDevices {
-		if devConf["type"] != "disk" && devConf["type"] != "nic" {
+	for _, dev := range d.expandedDevices.Sorted() {
+		if dev.Config["type"] != "disk" && dev.Config["type"] != "nic" {
 			continue
 		}
 
 		bootPrio := uint32(0) // Default to lowest priority.
-		if devConf["boot.priority"] != "" {
-			prio, err := strconv.ParseInt(devConf["boot.priority"], 10, 32)
+		if dev.Config["boot.priority"] != "" {
+			prio, err := strconv.ParseInt(dev.Config["boot.priority"], 10, 32)
 			if err != nil {
-				return nil, errors.Wrapf(err, "Invalid boot.priority for device %q", devName)
+				return nil, errors.Wrapf(err, "Invalid boot.priority for device %q", dev.Name)
 			}
 			bootPrio = uint32(prio)
-		} else if devConf["path"] == "/" {
+		} else if dev.Config["path"] == "/" {
 			bootPrio = 1 // Set boot priority of root disk higher than any device without a boot prio.
 		}
 
-		devices = append(devices, devicePrios{Name: devName, BootPrio: bootPrio})
+		devices = append(devices, devicePrios{Name: dev.Name, BootPrio: bootPrio})
 	}
 
+	// Sort devices by priority (use SliceStable so that devices with the same boot priority stay in the same
+	// order each boot based on the device order provided by the d.expandedDevices.Sorted() function).
+	// This is important because as well as providing a predicable boot index order, the boot index number can
+	// also be used for other properties (such as disk SCSI ID) which can result in it being given different
+	// device names inside the guest based on the device order.
 	sort.SliceStable(devices, func(i, j int) bool { return devices[i].BootPrio > devices[j].BootPrio })
 
 	sortedDevs := make(map[string]int, len(devices))
@@ -2155,6 +2182,8 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 		return "", nil, err
 	}
 
+	// Always export the config directory as a 9p config drive, in case the host or VM guest doesn't support
+	// virtio-fs.
 	devBus, devAddr, multi = bus.allocate(busFunctionGroup9p)
 	err = qemuDriveConfig.Execute(sb, map[string]interface{}{
 		"bus":           bus.name,
@@ -2163,14 +2192,17 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 		"multifunction": multi,
 		"protocol":      "9p",
 
-		"path": filepath.Join(d.Path(), "config"),
+		"path": d.configDriveMountPath(),
 	})
 	if err != nil {
 		return "", nil, err
 	}
 
-	sockPath := filepath.Join(d.LogPath(), "virtio-fs.config.sock")
-	if shared.PathExists(sockPath) {
+	// If virtiofsd is running for the config directory then export the config drive via virtio-fs.
+	// This is used by the lxd-agent in preference to 9p (due to its improved performance) and in scenarios
+	// where 9p isn't available in the VM guest OS.
+	configSockPath, _ := d.configVirtiofsdPaths()
+	if shared.PathExists(configSockPath) {
 		devBus, devAddr, multi = bus.allocate(busFunctionGroup9p)
 		err = qemuDriveConfig.Execute(sb, map[string]interface{}{
 			"bus":           bus.name,
@@ -2179,7 +2211,7 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 			"multifunction": multi,
 			"protocol":      "virtio-fs",
 
-			"path": sockPath,
+			"path": configSockPath,
 		})
 		if err != nil {
 			return "", nil, err
@@ -2231,7 +2263,22 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 
 		// Add network device.
 		if len(runConf.NetworkInterface) > 0 {
-			monHook, err := d.addNetDevConfig(sb, cpuCount, bus, bootIndexes, runConf.NetworkInterface, fdFiles)
+			qemuDev := make(map[string]string)
+			if shared.StringInSlice(bus.name, []string{"pcie", "pci"}) {
+				// Allocate a PCI(e) port and write it to the config file so QMP can "hotplug" the
+				// NIC into it later.
+				devBus, devAddr, multi := bus.allocate(busFunctionGroupNone)
+
+				// Populate the qemu device with port info.
+				qemuDev["bus"] = devBus
+				qemuDev["addr"] = devAddr
+
+				if multi {
+					qemuDev["multifunction"] = "on"
+				}
+			}
+
+			monHook, err := d.addNetDevConfig(cpuCount, bus.name, qemuDev, bootIndexes, runConf.NetworkInterface)
 			if err != nil {
 				return "", nil, err
 			}
@@ -2458,18 +2505,32 @@ func (d *qemu) addDriveDirConfig(sb *strings.Builder, bus *qemuBus, fdFiles *[]s
 		agentMount.Options = append(agentMount.Options, "trans=virtio")
 	}
 
+	readonly := shared.StringInSlice("ro", driveConf.Opts)
+
 	// Indicate to agent to mount this readonly. Note: This is purely to indicate to VM guest that this is
 	// readonly, it should *not* be used as a security measure, as the VM guest could remount it R/W.
-	if shared.StringInSlice("ro", driveConf.Opts) {
+	if readonly {
 		agentMount.Options = append(agentMount.Options, "ro")
 	}
 
 	// Record the 9p mount for the agent.
 	*agentMounts = append(*agentMounts, agentMount)
 
-	sockPath := filepath.Join(d.Path(), fmt.Sprintf("%s.sock", driveConf.DevName))
+	// Check if the disk device has provided a virtiofsd socket path.
+	var virtiofsdSockPath string
+	for _, opt := range driveConf.Opts {
+		if strings.HasPrefix(opt, fmt.Sprintf("%s=", device.DiskVirtiofsdSockMountOpt)) {
+			parts := strings.SplitN(opt, "=", 2)
+			virtiofsdSockPath = parts[1]
+		}
+	}
 
-	if shared.PathExists(sockPath) {
+	// If there is a virtiofsd socket path setup the virtio-fs share.
+	if virtiofsdSockPath != "" {
+		if !shared.PathExists(virtiofsdSockPath) {
+			return fmt.Errorf("virtiofsd socket path %q doesn't exist", virtiofsdSockPath)
+		}
+
 		devBus, devAddr, multi := bus.allocate(busFunctionGroup9p)
 
 		// Add virtio-fs device as this will be preferred over 9p.
@@ -2481,7 +2542,7 @@ func (d *qemu) addDriveDirConfig(sb *strings.Builder, bus *qemuBus, fdFiles *[]s
 
 			"devName":  driveConf.DevName,
 			"mountTag": mountTag,
-			"path":     sockPath,
+			"path":     virtiofsdSockPath,
 			"protocol": "virtio-fs",
 		})
 		if err != nil {
@@ -2489,26 +2550,10 @@ func (d *qemu) addDriveDirConfig(sb *strings.Builder, bus *qemuBus, fdFiles *[]s
 		}
 	}
 
+	// Add 9p share config.
 	devBus, devAddr, multi := bus.allocate(busFunctionGroup9p)
-
-	// For read only shares, do not use proxy.
-	if shared.StringInSlice("ro", driveConf.Opts) {
-		return qemuDriveDir.Execute(sb, map[string]interface{}{
-			"bus":           bus.name,
-			"devBus":        devBus,
-			"devAddr":       devAddr,
-			"multifunction": multi,
-
-			"devName":  driveConf.DevName,
-			"mountTag": mountTag,
-			"path":     driveConf.DevPath,
-			"readonly": true,
-			"protocol": "9p",
-		})
-	}
-
-	// Only use proxy for writable shares.
 	proxyFD := d.addFileDescriptor(fdFiles, driveConf.DevPath)
+
 	return qemuDriveDir.Execute(sb, map[string]interface{}{
 		"bus":           bus.name,
 		"devBus":        devBus,
@@ -2517,8 +2562,8 @@ func (d *qemu) addDriveDirConfig(sb *strings.Builder, bus *qemuBus, fdFiles *[]s
 
 		"devName":  driveConf.DevName,
 		"mountTag": mountTag,
-		"proxyFD":  proxyFD,
-		"readonly": false,
+		"proxyFD":  proxyFD, // Pass by file descriptor, so don't add to d.devPaths for apparmor access.
+		"readonly": readonly,
 		"protocol": "9p",
 	})
 }
@@ -2529,6 +2574,8 @@ func (d *qemu) addDriveConfig(sb *strings.Builder, bootIndexes map[string]int, d
 	aioMode := "native"
 	cacheMode := "none" // Bypass host cache, use O_DIRECT semantics.
 	media := "disk"
+
+	readonly := shared.StringInSlice("ro", driveConf.Opts)
 
 	// If drive config indicates we need to use unsafe I/O then use it.
 	if shared.StringInSlice(qemuUnsafeIO, driveConf.Opts) {
@@ -2561,6 +2608,7 @@ func (d *qemu) addDriveConfig(sb *strings.Builder, bootIndexes map[string]int, d
 	}
 
 	if !strings.HasPrefix(driveConf.DevPath, "rbd:") {
+		// Add path to external devPaths. This way, the path will be included in the apparmor profile.
 		d.devPaths = append(d.devPaths, driveConf.DevPath)
 	}
 
@@ -2572,11 +2620,13 @@ func (d *qemu) addDriveConfig(sb *strings.Builder, bootIndexes map[string]int, d
 		"aioMode":   aioMode,
 		"media":     media,
 		"shared":    driveConf.TargetPath != "/" && !strings.HasPrefix(driveConf.DevPath, "rbd:"),
+		"readonly":  readonly,
 	})
 }
 
 // addNetDevConfig adds the qemu config required for adding a network device.
-func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, bootIndexes map[string]int, nicConfig []deviceConfig.RunConfigItem, fdFiles *[]string) (monitorHook, error) {
+// The qemuDev map is expected to be preconfigured with the settings for an existing port to use for the device.
+func (d *qemu) addNetDevConfig(cpuCount int, busName string, qemuDev map[string]string, bootIndexes map[string]int, nicConfig []deviceConfig.RunConfigItem) (monitorHook, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -2596,9 +2646,13 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, 
 	}
 
 	var qemuNetDev map[string]interface{}
-	qemuDev := map[string]string{
-		"id":        fmt.Sprintf("dev-lxd_%s", devName),
-		"bootindex": strconv.Itoa(bootIndexes[devName]),
+	qemuDev["id"] = fmt.Sprintf("dev-lxd_%s", devName)
+
+	if len(bootIndexes) > 0 {
+		bootIndex, found := bootIndexes[devName]
+		if found {
+			qemuDev["bootindex"] = strconv.Itoa(bootIndex)
+		}
 	}
 
 	// Detect MACVTAP interface types and figure out which tap device is being used.
@@ -2614,20 +2668,16 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, 
 			return nil, errors.Wrapf(err, "Error parsing tap device ifindex")
 		}
 
-		// Append the tap device file path to the list of files to be opened and passed to qemu.
-		fd := d.addFileDescriptor(fdFiles, fmt.Sprintf("/dev/tap%d", ifindex))
-
 		qemuNetDev = map[string]interface{}{
 			"id":    fmt.Sprintf("lxd_%s", devName),
 			"type":  "tap",
 			"vhost": true,
-			"fd":    strconv.Itoa(fd),
+			"fd":    fmt.Sprintf("/dev/tap%d", ifindex), // Indicates the file to open and the FD name.
 		}
 
-		if shared.StringInSlice(bus.name, []string{"pcie", "pci"}) {
+		if shared.StringInSlice(busName, []string{"pcie", "pci"}) {
 			qemuDev["driver"] = "virtio-net-pci"
-			qemuDev["bus"] = bus.name
-		} else if bus.name == "ccw" {
+		} else if busName == "ccw" {
 			qemuDev["driver"] = "virtio-net-ccw"
 		}
 
@@ -2654,10 +2704,9 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, 
 			qemuNetDev["queues"] = queueCount
 		}
 
-		if shared.StringInSlice(bus.name, []string{"pcie", "pci"}) {
+		if shared.StringInSlice(busName, []string{"pcie", "pci"}) {
 			qemuDev["driver"] = "virtio-net-pci"
-			qemuDev["bus"] = bus.name
-		} else if bus.name == "ccw" {
+		} else if busName == "ccw" {
 			qemuDev["driver"] = "virtio-net-ccw"
 		}
 
@@ -2665,7 +2714,7 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, 
 		vectors := 2*queueCount + 2
 		if vectors > 0 {
 			qemuDev["mq"] = "on"
-			if shared.StringInSlice(bus.name, []string{"pcie", "pci"}) {
+			if shared.StringInSlice(busName, []string{"pcie", "pci"}) {
 				qemuDev["vectors"] = strconv.Itoa(vectors)
 			}
 		}
@@ -2674,9 +2723,9 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, 
 		qemuDev["mac"] = devHwaddr
 	} else if pciSlotName != "" {
 		// Detect physical passthrough device.
-		if shared.StringInSlice(bus.name, []string{"pcie", "pci"}) {
+		if shared.StringInSlice(busName, []string{"pcie", "pci"}) {
 			qemuDev["driver"] = "vfio-pci"
-		} else if bus.name == "ccw" {
+		} else if busName == "ccw" {
 			qemuDev["driver"] = "vfio-ccw"
 		}
 
@@ -2696,23 +2745,24 @@ func (d *qemu) addNetDevConfig(sb *strings.Builder, cpuCount int, bus *qemuBus, 
 		}
 	}
 
-	// Allocate a pcie port and write it to the config file so QMP can "hotplug" the NIC later.
-	devBus, devAddr, multi := bus.allocate(busFunctionGroupNone)
-
-	if shared.StringInSlice(bus.name, []string{"pcie", "pci"}) {
-		qemuDev["bus"] = devBus
-		qemuDev["addr"] = devAddr
-	}
-
-	if multi {
-		qemuDev["multifunction"] = "on"
-	} else {
-		qemuDev["multifunction"] = "off"
-	}
-
 	if qemuDev["driver"] != "" {
 		// Return a monitor hook to add the NIC via QMP before the VM is started.
 		monHook := func(m *qmp.Monitor) error {
+			if fd, found := qemuNetDev["fd"]; found {
+				fileName := fd.(string)
+
+				f, err := os.OpenFile(fileName, os.O_RDWR, 0)
+				if err != nil {
+					return errors.Wrapf(err, "Error opening exta file %q", fileName)
+				}
+				defer f.Close() // Close file after device has been added.
+
+				err = m.SendFile(fileName, f)
+				if err != nil {
+					return errors.Wrapf(err, "Error sending exta file %q", fileName)
+				}
+			}
+
 			err := m.AddNIC(qemuNetDev, qemuDev)
 			if err != nil {
 				return errors.Wrapf(err, "Failed setting up device %v", devName)
@@ -2880,7 +2930,7 @@ func (d *qemu) addUSBDeviceConfig(sb *strings.Builder, bus *qemuBus, usbConfig [
 		return err
 	}
 
-	// Add path to devPaths. This way, the path will be included in the apparmor profile.
+	// Add path to external devPaths. This way, the path will be included in the apparmor profile.
 	d.devPaths = append(d.devPaths, hostDevice)
 
 	return nil
@@ -3762,6 +3812,9 @@ func (d *qemu) updateMemoryLimit(newLimit string) error {
 }
 
 func (d *qemu) updateDevices(removeDevices deviceConfig.Devices, addDevices deviceConfig.Devices, updateDevices deviceConfig.Devices, oldExpandedDevices deviceConfig.Devices, instanceRunning bool, userRequested bool) error {
+	revert := revert.New()
+	defer revert.Fail()
+
 	// Remove devices in reverse order to how they were added.
 	for _, dev := range removeDevices.Reversed() {
 		if instanceRunning {
@@ -3788,7 +3841,8 @@ func (d *qemu) updateDevices(removeDevices deviceConfig.Devices, addDevices devi
 	}
 
 	// Add devices in sorted order, this ensures that device mounts are added in path order.
-	for _, dev := range addDevices.Sorted() {
+	for _, dd := range addDevices.Sorted() {
+		dev := dd // Local var for loop revert.
 		err := d.deviceAdd(dev.Name, dev.Config, instanceRunning)
 		if err == device.ErrUnsupportedDevType {
 			continue // No point in trying to start device below.
@@ -3803,11 +3857,15 @@ func (d *qemu) updateDevices(removeDevices deviceConfig.Devices, addDevices devi
 			continue
 		}
 
+		revert.Add(func() { d.deviceRemove(dev.Name, dev.Config, instanceRunning) })
+
 		if instanceRunning {
 			_, err := d.deviceStart(dev.Name, dev.Config, instanceRunning)
 			if err != nil && err != device.ErrUnsupportedDevType {
 				return errors.Wrapf(err, "Failed to start device %q", dev.Name)
 			}
+
+			revert.Add(func() { d.deviceStop(dev.Name, dev.Config, instanceRunning) })
 		}
 	}
 
@@ -3818,6 +3876,7 @@ func (d *qemu) updateDevices(removeDevices deviceConfig.Devices, addDevices devi
 		}
 	}
 
+	revert.Success()
 	return nil
 }
 
@@ -3848,7 +3907,6 @@ func (d *qemu) removeUnixDevices() error {
 		return err
 	}
 
-	// Go through all the unix devices.
 	for _, f := range dents {
 		// Skip non-Unix devices.
 		if !strings.HasPrefix(f.Name(), "forkmknod.unix.") && !strings.HasPrefix(f.Name(), "unix.") && !strings.HasPrefix(f.Name(), "infiniband.unix.") {
@@ -3867,7 +3925,7 @@ func (d *qemu) removeUnixDevices() error {
 }
 
 func (d *qemu) removeDiskDevices() error {
-	// Check that we indeed have devices to remove.vm
+	// Check that we indeed have devices to remove.
 	if !shared.PathExists(d.DevicesPath()) {
 		return nil
 	}
@@ -3878,17 +3936,16 @@ func (d *qemu) removeDiskDevices() error {
 		return err
 	}
 
-	// Go through all the unix devices
 	for _, f := range dents {
 		// Skip non-disk devices
 		if !strings.HasPrefix(f.Name(), "disk.") {
 			continue
 		}
 
-		// Always try to unmount the host side
+		// Always try to unmount the host side.
 		_ = unix.Unmount(filepath.Join(d.DevicesPath(), f.Name()), unix.MNT_DETACH)
 
-		// Remove the entry
+		// Remove the entry.
 		diskPath := filepath.Join(d.DevicesPath(), f.Name())
 		err := os.Remove(diskPath)
 		if err != nil {
@@ -3915,7 +3972,20 @@ func (d *qemu) cleanup() {
 }
 
 // cleanupDevices performs any needed device cleanup steps when instance is stopped.
+// Must be called before root volume is unmounted.
 func (d *qemu) cleanupDevices() {
+	// Clear up the config drive virtiofsd process.
+	err := device.DiskVMVirtiofsdStop(d.configVirtiofsdPaths())
+	if err != nil {
+		d.logger.Warn("Failed cleaning up config drive virtiofsd", log.Ctx{"err": err})
+	}
+
+	// Clear up the config drive mount.
+	err = d.configDriveMountPathClear()
+	if err != nil {
+		d.logger.Warn("Failed cleaning up config drive mount", log.Ctx{"err": err})
+	}
+
 	for _, dev := range d.expandedDevices.Reversed() {
 		// Use the device interface if device supports it.
 		err := d.deviceStop(dev.Name, dev.Config, false)
@@ -5334,7 +5404,7 @@ func (d *qemu) devlxdEventSend(eventType string, eventMessage interface{}) error
 
 func (d *qemu) writeInstanceData() error {
 	// Only write instance-data file if security.devlxd is true.
-	if !shared.IsTrue(d.expandedConfig["security.devlxd"]) {
+	if !(d.expandedConfig["security.devlxd"] == "" || shared.IsTrue(d.expandedConfig["security.devlxd"])) {
 		return nil
 	}
 

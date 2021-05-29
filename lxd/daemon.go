@@ -39,6 +39,7 @@ import (
 	"github.com/lxc/lxd/lxd/firewall"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/ucred"
+	"github.com/lxc/lxd/lxd/warnings"
 
 	// Import instance/drivers without name so init() runs.
 	_ "github.com/lxc/lxd/lxd/instance/drivers"
@@ -687,6 +688,8 @@ func (d *Daemon) Init() error {
 }
 
 func (d *Daemon) init() error {
+	var dbWarnings []db.Warning
+
 	// Setup logger
 	events.LoggingServer = d.events
 
@@ -715,7 +718,7 @@ func (d *Daemon) init() error {
 	trace := d.config.Trace
 
 	/* Initialize the operating system facade */
-	err = d.os.Init()
+	dbWarnings, err = d.os.Init()
 	if err != nil {
 		return err
 	}
@@ -837,11 +840,11 @@ func (d *Daemon) init() error {
 		logger.Infof(" - unprivileged file capabilities: no")
 	}
 
-	warnings := d.os.CGInfo.Warnings()
+	dbWarnings = append(dbWarnings, d.os.CGInfo.Warnings()...)
 
 	logger.Infof(" - cgroup layout: %s", d.os.CGInfo.Mode())
 
-	for _, w := range warnings {
+	for _, w := range dbWarnings {
 		logger.Warnf(" - %s, %s", db.WarningTypeNames[db.WarningType(w.TypeCode)], w.LastMessage)
 	}
 
@@ -1043,53 +1046,6 @@ func (d *Daemon) init() error {
 		return errors.Wrap(err, "failed to open cluster database")
 	}
 
-	nodeName := ""
-
-	if clustered {
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			nodeName, err = tx.GetLocalNodeName()
-			if err != nil {
-				return err
-			}
-
-			return nil
-		})
-		if err != nil {
-			return errors.Wrap(err, "Failed to get node name")
-		}
-	}
-
-	// Create warnings that have been collected
-	for _, w := range warnings {
-		err := d.cluster.UpsertWarning(nodeName, "", -1, -1, db.WarningType(w.TypeCode), w.LastMessage)
-		if err != nil {
-			return errors.Wrap(err, "Failed to create warning")
-		}
-	}
-
-	// Resolve warnings
-	for i := range db.WarningTypeNames {
-		resolveWarning := true
-
-		for _, w := range warnings {
-			if int(i) == w.TypeCode {
-				// Do not resolve the warning as it's still valid
-				resolveWarning = false
-				break
-			}
-		}
-
-		if !resolveWarning {
-			continue
-		}
-
-		// Resolve warnings with the given type
-		err := resolveWarningsByNodeAndType(d, nodeName, i)
-		if err != nil {
-			return errors.Wrap(err, "Failed to resolve warnings")
-		}
-	}
-
 	d.firewall = firewall.New()
 	logger.Infof("Firewall loaded driver %q", d.firewall)
 
@@ -1279,6 +1235,53 @@ func (d *Daemon) init() error {
 	}
 
 	close(d.setupChan)
+
+	nodeName := ""
+
+	if clustered {
+		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+			nodeName, err = tx.GetLocalNodeName()
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+		if err != nil {
+			return errors.Wrap(err, "Failed to get node name")
+		}
+	}
+
+	// Create warnings that have been collected
+	for _, w := range dbWarnings {
+		err := d.cluster.UpsertWarning(nodeName, "", -1, -1, db.WarningType(w.TypeCode), w.LastMessage)
+		if err != nil {
+			return errors.Wrap(err, "Failed to create warning")
+		}
+	}
+
+	// Resolve warnings; exclude those just created
+	for i := range db.WarningTypeNames {
+		resolveWarning := true
+
+		for _, w := range dbWarnings {
+			if int(i) == w.TypeCode {
+				// Do not resolve the warning as it's still valid
+				resolveWarning = false
+				break
+			}
+		}
+
+		if !resolveWarning {
+			continue
+		}
+
+		// Resolve warnings with the given type
+		err := warnings.ResolveWarningsByNodeAndType(d.cluster, nodeName, i)
+		if err != nil {
+			return errors.Wrap(err, "Failed to resolve warnings")
+		}
+	}
 
 	// Run the post initialization actions
 	err = d.Ready()

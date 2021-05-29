@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 
 	"github.com/lxc/lxd/lxd/cluster"
@@ -418,6 +417,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 			if v.Project() != "" && v.Project() != projectName {
 				continue
 			}
+
 			status := strings.ToLower(v.Status().String())
 			_, ok := body[status]
 			if !ok {
@@ -441,6 +441,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 			if v.Project() != "" && v.Project() != projectName {
 				continue
 			}
+
 			status := strings.ToLower(v.Status().String())
 			_, ok := body[status]
 			if !ok {
@@ -548,7 +549,8 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Merge with existing data
-		for _, op := range ops {
+		for _, o := range ops {
+			op := o // Local var for pointer.
 			status := strings.ToLower(op.Status)
 
 			_, ok := md[status]
@@ -680,7 +682,9 @@ func operationsGetByType(d *Daemon, projectName string, opType db.OperationType)
 			continue
 		}
 
-		for _, op := range remoteOps {
+		for _, o := range remoteOps {
+			op := o // Local var for pointer.
+
 			// Exclude remote operations that don't have the desired type.
 			if memberOps[memberAddress][op.ID].Type != opType {
 				continue
@@ -862,25 +866,6 @@ func (r *operationWebSocket) String() string {
 	return md.ID
 }
 
-type forwardedOperationWebSocket struct {
-	req    *http.Request
-	id     string
-	source *websocket.Conn // Connection to the node were the operation is running
-}
-
-func (r *forwardedOperationWebSocket) Render(w http.ResponseWriter) error {
-	target, err := shared.WebsocketUpgrader.Upgrade(w, r.req, nil)
-	if err != nil {
-		return err
-	}
-	<-shared.WebsocketProxy(r.source, target)
-	return nil
-}
-
-func (r *forwardedOperationWebSocket) String() string {
-	return r.id
-}
-
 // swagger:operation GET /1.0/operations/{id}/websocket?public operations operation_websocket_get_untrusted
 //
 // Get the websocket stream
@@ -974,5 +959,5 @@ func operationWebsocketGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	return &forwardedOperationWebSocket{r, id, source}
+	return operations.ForwardedOperationWebSocket(r, id, source)
 }
