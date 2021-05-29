@@ -168,7 +168,7 @@ static int get_unused_loop_dev(char *name_loop)
 	if (loop_nr < 0)
 		return -1;
 
-	ret = snprintf(name_loop, LO_NAME_SIZE, "/dev/loop%d", loop_nr);
+	ret = snprintf(name_loop, LO_NAME_SIZE, "/dev/block/loop%d", loop_nr);
 	if (ret < 0 || ret >= LO_NAME_SIZE)
 		return -1;
 
