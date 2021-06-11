@@ -11,6 +11,7 @@ import (
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/events"
+	"github.com/lxc/lxd/lxd/request"
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
@@ -105,6 +106,7 @@ type Operation struct {
 	description string
 	permission  string
 	dbOpType    db.OperationType
+	requestor   *api.EventLifecycleRequestor
 
 	// Those functions are called at various points in the Operation lifecycle
 	onRun     func(*Operation) error
@@ -123,7 +125,7 @@ type Operation struct {
 
 // OperationCreate creates a new operation and returns it. If it cannot be
 // created, it returns an error.
-func OperationCreate(s *state.State, projectName string, opClass OperationClass, opType db.OperationType, opResources map[string][]string, opMetadata interface{}, onRun func(*Operation) error, onCancel func(*Operation) error, onConnect func(*Operation, *http.Request, http.ResponseWriter) error) (*Operation, error) {
+func OperationCreate(s *state.State, projectName string, opClass OperationClass, opType db.OperationType, opResources map[string][]string, opMetadata interface{}, onRun func(*Operation) error, onCancel func(*Operation) error, onConnect func(*Operation, *http.Request, http.ResponseWriter) error, r *http.Request) (*Operation, error) {
 	// Don't allow new operations when LXD is shutting down.
 	if s != nil && s.Context.Err() == context.Canceled {
 		return nil, fmt.Errorf("LXD is shutting down")
@@ -160,7 +162,7 @@ func OperationCreate(s *state.State, projectName string, opClass OperationClass,
 	op.onCancel = onCancel
 	op.onConnect = onConnect
 
-	// Sanity check
+	// Quick check.
 	if op.class != OperationClassWebsocket && op.onConnect != nil {
 		return nil, fmt.Errorf("Only websocket operations can have a Connect hook")
 	}
@@ -175,6 +177,36 @@ func OperationCreate(s *state.State, projectName string, opClass OperationClass,
 
 	if op.class == OperationClassToken && op.onCancel != nil {
 		return nil, fmt.Errorf("Token operations can't have a Cancel hook")
+	}
+
+	// Set requestor if request was provided.
+	if r != nil {
+		ctx := r.Context()
+		requestor := api.EventLifecycleRequestor{}
+
+		// Normal requestor.
+		val, ok := ctx.Value(request.CtxUsername).(string)
+		if ok {
+			requestor.Username = val
+		}
+
+		val, ok = ctx.Value(request.CtxProtocol).(string)
+		if ok {
+			requestor.Protocol = val
+		}
+
+		// Forwarded requestor override.
+		val, ok = ctx.Value(request.CtxForwardedUsername).(string)
+		if ok {
+			requestor.Username = val
+		}
+
+		val, ok = ctx.Value(request.CtxForwardedProtocol).(string)
+		if ok {
+			requestor.Protocol = val
+		}
+
+		op.requestor = &requestor
 	}
 
 	operationsLock.Lock()
@@ -199,6 +231,11 @@ func OperationCreate(s *state.State, projectName string, opClass OperationClass,
 // SetEventServer allows injection of event server.
 func (op *Operation) SetEventServer(events *events.Server) {
 	op.events = events
+}
+
+// Requestor returns the initial requestor for this operation.
+func (op *Operation) Requestor() *api.EventLifecycleRequestor {
+	return op.requestor
 }
 
 func (op *Operation) done() {

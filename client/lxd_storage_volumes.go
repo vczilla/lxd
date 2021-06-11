@@ -254,7 +254,7 @@ func (r *ProtocolLXD) MigrateStoragePoolVolume(pool string, volume api.StorageVo
 		return nil, fmt.Errorf("The server is missing the required \"storage_api_remote_volume_handling\" API extension")
 	}
 
-	// Sanity check
+	// Quick check.
 	if !volume.Migration {
 		return nil, fmt.Errorf("Can't ask for a rename through MigrateStoragePoolVolume")
 	}
@@ -822,11 +822,6 @@ func (r *ProtocolLXD) CreateStoragePoolVolumeFromBackup(pool string, args Storag
 
 	if args.Name != "" {
 		req.Header.Set("X-LXD-name", args.Name)
-	}
-
-	// Set the user agent.
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
 	}
 
 	// Send the request.

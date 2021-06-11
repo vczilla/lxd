@@ -38,6 +38,7 @@ import (
 	"github.com/lxc/lxd/lxd/events"
 	"github.com/lxc/lxd/lxd/firewall"
 	"github.com/lxc/lxd/lxd/instance"
+	"github.com/lxc/lxd/lxd/request"
 	"github.com/lxc/lxd/lxd/ucred"
 	"github.com/lxc/lxd/lxd/warnings"
 
@@ -523,9 +524,17 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			}
 
 			// Add authentication/authorization context data.
-			ctx := context.WithValue(r.Context(), "username", username)
-			ctx = context.WithValue(ctx, "protocol", protocol)
-			ctx = context.WithValue(ctx, "access", userAccess)
+			ctx := context.WithValue(r.Context(), request.CtxUsername, username)
+			ctx = context.WithValue(ctx, request.CtxProtocol, protocol)
+			ctx = context.WithValue(ctx, request.CtxAccess, userAccess)
+
+			// Add forwarded requestor data.
+			if protocol == "cluster" {
+				// Add authentication/authorization context data.
+				ctx = context.WithValue(ctx, request.CtxForwardedAddress, r.Header.Get(request.HeaderForwardedAddress))
+				ctx = context.WithValue(ctx, request.CtxForwardedUsername, r.Header.Get(request.HeaderForwardedUsername))
+				ctx = context.WithValue(ctx, request.CtxForwardedProtocol, r.Header.Get(request.HeaderForwardedProtocol))
+			}
 
 			r = r.WithContext(ctx)
 		} else if untrustedOk && r.Header.Get("X-LXD-authenticated") == "" {
@@ -754,6 +763,7 @@ func (d *Daemon) init() error {
 		"seccomp_allow_deny_syntax",
 		"devpts_fd",
 		"seccomp_proxy_send_notify_fd",
+		"idmapped_mounts_v2",
 	}
 	for _, extension := range lxcExtensions {
 		d.os.LXCFeatures[extension] = liblxc.HasApiExtension(extension)
@@ -894,7 +904,7 @@ func (d *Daemon) init() error {
 	}
 
 	// Load cached local trusted certificates before starting listener and cluster database.
-	err = updateCertificateCacheFromLocal(d, networkCert)
+	err = updateCertificateCacheFromLocal(d)
 	if err != nil {
 		return err
 	}
@@ -1166,6 +1176,8 @@ func (d *Daemon) init() error {
 		rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey = config.RBACServer()
 		d.gateway.HeartbeatOfflineThreshold = config.OfflineThreshold()
 
+		d.endpoints.NetworkUpdateTrustedProxy(config.HTTPSTrustedProxy())
+
 		return nil
 	})
 	if err != nil {
@@ -1220,6 +1232,8 @@ func (d *Daemon) init() error {
 		// Connect to MAAS
 		if maasAPIURL != "" {
 			go func() {
+				warningAdded := false
+
 				for {
 					err = d.setupMAASController(maasAPIURL, maasAPIKey, maasMachine)
 					if err == nil {
@@ -1228,7 +1242,19 @@ func (d *Daemon) init() error {
 					}
 
 					logger.Warn("Unable to connect to MAAS, trying again in a minute", log.Ctx{"url": maasAPIURL, "err": err})
+
+					if !warningAdded {
+						d.cluster.UpsertWarningLocalNode("", -1, -1, db.WarningUnableToConnectToMAAS, err.Error())
+
+						warningAdded = true
+					}
+
 					time.Sleep(time.Minute)
+				}
+
+				// Resolve any previously created warning once connected
+				if warningAdded {
+					warnings.ResolveWarningsByLocalNodeAndType(d.cluster, db.WarningUnableToConnectToMAAS)
 				}
 			}()
 		}
@@ -1236,25 +1262,9 @@ func (d *Daemon) init() error {
 
 	close(d.setupChan)
 
-	nodeName := ""
-
-	if clustered {
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			nodeName, err = tx.GetLocalNodeName()
-			if err != nil {
-				return err
-			}
-
-			return nil
-		})
-		if err != nil {
-			return errors.Wrap(err, "Failed to get node name")
-		}
-	}
-
 	// Create warnings that have been collected
 	for _, w := range dbWarnings {
-		err := d.cluster.UpsertWarning(nodeName, "", -1, -1, db.WarningType(w.TypeCode), w.LastMessage)
+		err := d.cluster.UpsertWarningLocalNode("", -1, -1, db.WarningType(w.TypeCode), w.LastMessage)
 		if err != nil {
 			return errors.Wrap(err, "Failed to create warning")
 		}
@@ -1265,7 +1275,7 @@ func (d *Daemon) init() error {
 		resolveWarning := true
 
 		for _, w := range dbWarnings {
-			if int(i) == w.TypeCode {
+			if i == w.TypeCode {
 				// Do not resolve the warning as it's still valid
 				resolveWarning = false
 				break
@@ -1277,7 +1287,7 @@ func (d *Daemon) init() error {
 		}
 
 		// Resolve warnings with the given type
-		err := warnings.ResolveWarningsByNodeAndType(d.cluster, nodeName, i)
+		err := warnings.ResolveWarningsByLocalNodeAndType(d.cluster, i)
 		if err != nil {
 			return errors.Wrap(err, "Failed to resolve warnings")
 		}
@@ -1832,7 +1842,7 @@ func (d *Daemon) NodeRefreshTask(heartbeatData *cluster.APIHeartbeat) {
 				if d.clusterMembershipClosing {
 					return
 				}
-				err := rebalanceMemberRoles(d)
+				err := rebalanceMemberRoles(d, nil)
 				if err != nil && errors.Cause(err) != cluster.ErrNotLeader {
 					logger.Warnf("Could not rebalance cluster member roles: %v", err)
 				}

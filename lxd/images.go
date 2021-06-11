@@ -308,7 +308,12 @@ func imgPostInstanceInfo(d *Daemon, r *http.Request, req api.ImagesPost, op *ope
 	var meta api.ImageMetadata
 
 	writer = shared.NewQuotaWriter(writer, budget)
-	meta, err = c.Export(writer, req.Properties)
+	meta, err = c.Export(writer, req.Properties, req.ExpiresAt)
+
+	// Get ExpiresAt
+	if meta.ExpiryDate != 0 {
+		info.ExpiresAt = time.Unix(meta.ExpiryDate, 0)
+	}
 
 	// Clean up file handles.
 	// When compression is used, Close on imageProgressWriter/tarWriter is required for compressFile/gzip to
@@ -363,7 +368,7 @@ func imgPostInstanceInfo(d *Daemon, r *http.Request, req api.ImagesPost, op *ope
 	return &info, nil
 }
 
-func imgPostRemoteInfo(d *Daemon, req api.ImagesPost, op *operations.Operation, project string, budget int64) (*api.Image, error) {
+func imgPostRemoteInfo(d *Daemon, r *http.Request, req api.ImagesPost, op *operations.Operation, project string, budget int64) (*api.Image, error) {
 	var err error
 	var hash string
 
@@ -375,7 +380,7 @@ func imgPostRemoteInfo(d *Daemon, req api.ImagesPost, op *operations.Operation, 
 		return nil, fmt.Errorf("must specify one of alias or fingerprint for init from image")
 	}
 
-	info, err := d.ImageDownload(op, &ImageDownloadArgs{
+	info, err := d.ImageDownload(r, op, &ImageDownloadArgs{
 		Server:      req.Source.Server,
 		Protocol:    req.Source.Protocol,
 		Certificate: req.Source.Certificate,
@@ -411,7 +416,7 @@ func imgPostRemoteInfo(d *Daemon, req api.ImagesPost, op *operations.Operation, 
 	return info, nil
 }
 
-func imgPostURLInfo(d *Daemon, req api.ImagesPost, op *operations.Operation, project string, budget int64) (*api.Image, error) {
+func imgPostURLInfo(d *Daemon, r *http.Request, req api.ImagesPost, op *operations.Operation, project string, budget int64) (*api.Image, error) {
 	var err error
 
 	if req.Source.URL == "" {
@@ -458,7 +463,7 @@ func imgPostURLInfo(d *Daemon, req api.ImagesPost, op *operations.Operation, pro
 	}
 
 	// Import the image
-	info, err := d.ImageDownload(op, &ImageDownloadArgs{
+	info, err := d.ImageDownload(r, op, &ImageDownloadArgs{
 		Server:      url,
 		Protocol:    "direct",
 		Alias:       hash,
@@ -819,7 +824,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		return response.Forbidden(nil)
 	} else {
 		// We need to invalidate the secret whether the source is trusted or not.
-		op, err := imageValidSecret(d, projectName, fingerprint, secret)
+		op, err := imageValidSecret(d, r, projectName, fingerprint, secret)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -904,7 +909,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 			"public":     req.Public,
 		}
 
-		return createTokenResponse(d, projectName, req.Source.Fingerprint, metadata)
+		return createTokenResponse(d, r, projectName, req.Source.Fingerprint, metadata)
 	}
 
 	if !imageUpload && !shared.StringInSlice(req.Source.Type, []string{"container", "instance", "virtual-machine", "snapshot", "image", "url"}) {
@@ -945,10 +950,10 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		} else {
 			if req.Source.Type == "image" {
 				/* Processing image copy from remote */
-				info, err = imgPostRemoteInfo(d, req, op, projectName, budget)
+				info, err = imgPostRemoteInfo(d, r, req, op, projectName, budget)
 			} else if req.Source.Type == "url" {
 				/* Processing image copy from URL */
-				info, err = imgPostURLInfo(d, req, op, projectName, budget)
+				info, err = imgPostURLInfo(d, r, req, op, projectName, budget)
 			} else {
 				/* Processing image creation from container */
 				imagePublishLock.Lock()
@@ -1007,7 +1012,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Sync the images between each node in the cluster on demand
-		err = imageSyncBetweenNodes(d, projectName, info.Fingerprint)
+		err = imageSyncBetweenNodes(d, r, projectName, info.Fingerprint)
 		if err != nil {
 			return errors.Wrapf(err, "Failed syncing image between nodes")
 		}
@@ -1026,7 +1031,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageDownload, nil, metadata, run, nil, nil)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageDownload, nil, metadata, run, nil, nil, r)
 	if err != nil {
 		cleanup(builddir, post)
 		return response.InternalError(err)
@@ -1078,7 +1083,7 @@ func getImageMetadata(fname string) (*api.ImageMetadata, string, error) {
 		}
 		defer cmd.Wait()
 
-		// Double close stdout, this is to avoid hangs in Wait()
+		// Double close stdout, this is to avoid blocks in Wait()
 		defer stdout.Close()
 
 		tr = tar.NewReader(stdout)
@@ -1216,7 +1221,7 @@ func doImagesGet(d *Daemon, recursion bool, project string, public bool, clauses
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -1270,7 +1275,7 @@ func doImagesGet(d *Daemon, recursion bool, project string, public bool, clauses
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -1319,7 +1324,7 @@ func doImagesGet(d *Daemon, recursion bool, project string, public bool, clauses
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -1373,7 +1378,7 @@ func doImagesGet(d *Daemon, recursion bool, project string, public bool, clauses
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -1412,7 +1417,7 @@ func autoUpdateImagesTask(d *Daemon) (task.Func, task.Schedule) {
 			return autoUpdateImages(ctx, d)
 		}
 
-		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesUpdate, nil, nil, opRun, nil, nil)
+		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesUpdate, nil, nil, opRun, nil, nil, nil)
 		if err != nil {
 			logger.Error("Failed to start image update operation", log.Ctx{"err": err})
 			return
@@ -1628,7 +1633,7 @@ func distributeImage(ctx context.Context, d *Daemon, nodes []string, oldFingerpr
 			return errors.Wrapf(err, "Failed to retrieve information about cluster member with address %q", nodeAddress)
 		}
 
-		client, err := cluster.Connect(nodeAddress, d.endpoints.NetworkCert(), d.serverCert(), true)
+		client, err := cluster.Connect(nodeAddress, d.endpoints.NetworkCert(), d.serverCert(), nil, true)
 		if err != nil {
 			return errors.Wrapf(err, "Failed to connect to %q for image synchronization", nodeAddress)
 		}
@@ -1838,7 +1843,7 @@ func autoUpdateImage(ctx context.Context, d *Daemon, op *operations.Operation, i
 		default:
 		}
 
-		newInfo, err = d.ImageDownload(op, &ImageDownloadArgs{
+		newInfo, err = d.ImageDownload(nil, op, &ImageDownloadArgs{
 			Server:      source.Server,
 			Protocol:    source.Protocol,
 			Certificate: source.Certificate,
@@ -1934,7 +1939,7 @@ func pruneExpiredImagesTask(d *Daemon) (task.Func, task.Schedule) {
 			return pruneExpiredImages(ctx, d)
 		}
 
-		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesExpire, nil, nil, opRun, nil, nil)
+		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesExpire, nil, nil, opRun, nil, nil, nil)
 		if err != nil {
 			logger.Error("Failed to start expired image operation", log.Ctx{"err": err})
 			return
@@ -2001,7 +2006,7 @@ func pruneLeftoverImages(d *Daemon) {
 		return nil
 	}
 
-	op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesPruneLeftover, nil, nil, opRun, nil, nil)
+	op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesPruneLeftover, nil, nil, opRun, nil, nil, nil)
 	if err != nil {
 		logger.Error("Failed to start image leftover cleanup operation", log.Ctx{"err": err})
 		return
@@ -2262,7 +2267,7 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 	resources := map[string][]string{}
 	resources["images"] = []string{fingerprint}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageDelete, resources, nil, do, nil, nil)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageDelete, resources, nil, do, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -2303,8 +2308,8 @@ func doImageGet(db *db.Cluster, project, fingerprint string, public bool) (*api.
 // imageValidSecret searches for an ImageToken operation running on any member in the default project that has an
 // images resource matching the specified fingerprint and the metadata secret field matches the specified secret.
 // If an operation is found it is returned and the operation is cancelled. Otherwise nil is returned if not found.
-func imageValidSecret(d *Daemon, projectName string, fingerprint string, secret string) (*api.Operation, error) {
-	ops, err := operationsGetByType(d, projectName, db.OperationImageToken)
+func imageValidSecret(d *Daemon, r *http.Request, projectName string, fingerprint string, secret string) (*api.Operation, error) {
+	ops, err := operationsGetByType(d, r, projectName, db.OperationImageToken)
 	if err != nil {
 		return nil, errors.Wrapf(err, "Failed getting image token operations")
 	}
@@ -2330,7 +2335,7 @@ func imageValidSecret(d *Daemon, projectName string, fingerprint string, secret 
 
 		if opSecret == secret {
 			// Token is single-use, so cancel it now.
-			err = operationCancel(d, projectName, op)
+			err = operationCancel(d, r, projectName, op)
 			if err != nil {
 				return nil, errors.Wrapf(err, "Failed to cancel operation %q", op.ID)
 			}
@@ -2378,7 +2383,7 @@ func imageValidSecret(d *Daemon, projectName string, fingerprint string, secret 
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -2419,7 +2424,7 @@ func imageValidSecret(d *Daemon, projectName string, fingerprint string, secret 
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -2439,7 +2444,7 @@ func imageGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	op, err := imageValidSecret(d, projectName, info.Fingerprint, secret)
+	op, err := imageValidSecret(d, r, projectName, info.Fingerprint, secret)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -2733,7 +2738,7 @@ func imageAliasesPost(d *Daemon, r *http.Request) response.Response {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -2782,7 +2787,7 @@ func imageAliasesPost(d *Daemon, r *http.Request) response.Response {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -2857,7 +2862,7 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -2898,7 +2903,7 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -3233,7 +3238,7 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 			return response.SmartError(err)
 		}
 
-		op, err := imageValidSecret(d, projectName, imgInfo.Fingerprint, secret)
+		op, err := imageValidSecret(d, r, projectName, imgInfo.Fingerprint, secret)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -3250,7 +3255,7 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 	}
 	if address != "" {
 		// Forward the request to the other node
-		client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
+		client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), r, false)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -3423,7 +3428,7 @@ func imageExportPost(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageDownload, nil, nil, run, nil, nil)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageDownload, nil, nil, run, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -3464,7 +3469,7 @@ func imageSecret(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	return createTokenResponse(d, projectName, imgInfo.Fingerprint, nil)
+	return createTokenResponse(d, r, projectName, imgInfo.Fingerprint, nil)
 }
 
 func imageImportFromNode(imagesDir string, client lxd.InstanceServer, fingerprint string) error {
@@ -3573,7 +3578,7 @@ func imageRefresh(d *Daemon, r *http.Request) response.Response {
 		return err
 	}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageRefresh, nil, nil, run, nil, nil)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationImageRefresh, nil, nil, run, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -3610,7 +3615,7 @@ func autoSyncImagesTask(d *Daemon) (task.Func, task.Schedule) {
 			return autoSyncImages(ctx, d)
 		}
 
-		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesSynchronize, nil, nil, opRun, nil, nil)
+		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationImagesSynchronize, nil, nil, opRun, nil, nil, nil)
 		if err != nil {
 			logger.Error("Failed to start image synchronization operation", log.Ctx{"err": err})
 			return
@@ -3639,7 +3644,7 @@ func autoSyncImages(ctx context.Context, d *Daemon) error {
 	for fingerprint, projects := range imageProjectInfo {
 		ch := make(chan error)
 		go func() {
-			err := imageSyncBetweenNodes(d, projects[0], fingerprint)
+			err := imageSyncBetweenNodes(d, nil, projects[0], fingerprint)
 			if err != nil {
 				logger.Error("Failed to synchronize images", log.Ctx{"err": err, "fingerprint": fingerprint})
 			}
@@ -3656,7 +3661,7 @@ func autoSyncImages(ctx context.Context, d *Daemon) error {
 	return nil
 }
 
-func imageSyncBetweenNodes(d *Daemon, project string, fingerprint string) error {
+func imageSyncBetweenNodes(d *Daemon, r *http.Request, project string, fingerprint string) error {
 	logger.Info("Syncing image to members started", log.Ctx{"fingerprint": fingerprint, "project": project})
 	defer logger.Info("Syncing image to members finished", log.Ctx{"fingerprint": fingerprint, "project": project})
 
@@ -3706,7 +3711,7 @@ func imageSyncBetweenNodes(d *Daemon, project string, fingerprint string) error 
 	// Pick a random node from that slice as the source.
 	syncNodeAddress := syncNodeAddresses[rand.Intn(len(syncNodeAddresses))]
 
-	source, err := cluster.Connect(syncNodeAddress, d.endpoints.NetworkCert(), d.serverCert(), true)
+	source, err := cluster.Connect(syncNodeAddress, d.endpoints.NetworkCert(), d.serverCert(), r, true)
 	if err != nil {
 		return errors.Wrap(err, "Failed to connect to source node for image synchronization")
 	}
@@ -3741,7 +3746,7 @@ func imageSyncBetweenNodes(d *Daemon, project string, fingerprint string) error 
 		// Pick a random node from that slice as the target.
 		targetNodeAddress := addresses[rand.Intn(len(addresses))]
 
-		client, err := cluster.Connect(targetNodeAddress, d.endpoints.NetworkCert(), d.serverCert(), true)
+		client, err := cluster.Connect(targetNodeAddress, d.endpoints.NetworkCert(), d.serverCert(), r, true)
 		if err != nil {
 			return errors.Wrap(err, "Failed to connect node for image synchronization")
 		}
@@ -3765,7 +3770,7 @@ func imageSyncBetweenNodes(d *Daemon, project string, fingerprint string) error 
 	return nil
 }
 
-func createTokenResponse(d *Daemon, projectName string, fingerprint string, metadata shared.Jmap) response.Response {
+func createTokenResponse(d *Daemon, r *http.Request, projectName string, fingerprint string, metadata shared.Jmap) response.Response {
 	secret, err := shared.RandomCryptoString()
 	if err != nil {
 		return response.InternalError(err)
@@ -3782,7 +3787,7 @@ func createTokenResponse(d *Daemon, projectName string, fingerprint string, meta
 	resources := map[string][]string{}
 	resources["images"] = []string{fingerprint}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassToken, db.OperationImageToken, resources, meta, nil, nil, nil)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassToken, db.OperationImageToken, resources, meta, nil, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}

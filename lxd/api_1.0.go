@@ -121,7 +121,7 @@ var api10 = []APIEndpoint{
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -165,7 +165,7 @@ var api10 = []APIEndpoint{
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -658,6 +658,8 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 
 	for key := range clusterChanged {
 		switch key {
+		case "core.https_trusted_proxy":
+			d.endpoints.NetworkUpdateTrustedProxy(clusterChanged[key])
 		case "core.proxy_http":
 			fallthrough
 		case "core.proxy_https":
@@ -717,6 +719,7 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		if err != nil {
 			return err
 		}
+		d.endpoints.NetworkUpdateTrustedProxy(clusterConfig.HTTPSTrustedProxy())
 	}
 
 	value, ok = nodeChanged["cluster.https_address"]
@@ -725,6 +728,7 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		if err != nil {
 			return err
 		}
+		d.endpoints.NetworkUpdateTrustedProxy(clusterConfig.HTTPSTrustedProxy())
 	}
 
 	value, ok = nodeChanged["core.debug_address"]

@@ -102,7 +102,7 @@ func (d *lvm) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Oper
 }
 
 // CreateVolumeFromBackup restores a backup tarball onto the storage device.
-func (d *lvm) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) (func(vol Volume) error, func(), error) {
+func (d *lvm) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) (VolumePostHook, revert.Hook, error) {
 	return genericVFSBackupUnpack(d, vol, srcBackup.Snapshots, srcData, op)
 }
 
@@ -303,7 +303,7 @@ func (d *lvm) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
 func (d *lvm) UpdateVolume(vol Volume, changedConfig map[string]string) error {
 	newSize, sizeChanged := changedConfig["size"]
 	if sizeChanged {
-		err := d.SetVolumeQuota(vol, newSize, nil)
+		err := d.SetVolumeQuota(vol, newSize, false, nil)
 		if err != nil {
 			return err
 		}
@@ -354,9 +354,9 @@ func (d *lvm) GetVolumeUsage(vol Volume) (int64, error) {
 	return -1, ErrNotSupported
 }
 
-// SetVolumeQuota sets the quota on the volume.
+// SetVolumeQuota applies a size limit on volume.
 // Does nothing if supplied with an empty/zero size.
-func (d *lvm) SetVolumeQuota(vol Volume, size string, op *operations.Operation) error {
+func (d *lvm) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op *operations.Operation) error {
 	// Do nothing if size isn't specified.
 	if size == "" || size == "0" {
 		return nil
@@ -418,7 +418,12 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, op *operations.Operation) 
 			}
 
 			// Shrink filesystem first.
-			err = shrinkFileSystem(fsType, volDevPath, vol, sizeBytes)
+			// Pass allowUnsafeResize to allow disabling of filesystem resize safety checks.
+			// We do this as a separate step rather than passing -r to lvresize in resizeLogicalVolume
+			// so that we can have more control over when we trigger unsafe filesystem resize mode,
+			// otherwise by passing -f to lvresize (required for other reasons) this would then pass
+			// -f onto resize2fs as well.
+			err = shrinkFileSystem(fsType, volDevPath, vol, sizeBytes, allowUnsafeResize)
 			if err != nil {
 				return err
 			}
@@ -444,9 +449,9 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, op *operations.Operation) 
 			d.logger.Debug("Logical volume filesystem grown", logCtx)
 		}
 	} else {
-		// Only perform pre-resize sanity checks if we are not in "unsafe" mode.
+		// Only perform pre-resize checks if we are not in "unsafe" mode.
 		// In unsafe mode we expect the caller to know what they are doing and understand the risks.
-		if !vol.allowUnsafeResize {
+		if !allowUnsafeResize {
 			if sizeBytes < oldSizeBytes {
 				return errors.Wrap(ErrCannotBeShrunk, "Block volumes cannot be shrunk")
 			}
@@ -463,7 +468,7 @@ func (d *lvm) SetVolumeQuota(vol Volume, size string, op *operations.Operation) 
 
 		// Move the VM GPT alt header to end of disk if needed (not needed in unsafe resize mode as it is
 		// expected the caller will do all necessary post resize actions themselves).
-		if vol.IsVMBlock() && !vol.allowUnsafeResize {
+		if vol.IsVMBlock() && !allowUnsafeResize {
 			err = d.moveGPTAltHeader(volDevPath)
 			if err != nil {
 				return err

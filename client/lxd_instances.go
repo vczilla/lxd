@@ -200,11 +200,6 @@ func (r *ProtocolLXD) CreateInstanceFromBackup(args InstanceBackupArgs) (Operati
 		req.Header.Set("X-LXD-name", args.Name)
 	}
 
-	// Set the user agent
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
-	}
-
 	// Send the request
 	resp, err := r.do(req)
 	if err != nil {
@@ -390,7 +385,7 @@ func (r *ProtocolLXD) CopyInstance(source InstanceServer, instance api.Instance,
 
 	// Process the copy arguments
 	if args != nil {
-		// Sanity checks
+		// Quick checks.
 		if args.InstanceOnly {
 			if !r.HasExtension("container_only_migration") {
 				return nil, fmt.Errorf("The target server is missing the required \"container_only_migration\" API extension")
@@ -618,7 +613,7 @@ func (r *ProtocolLXD) RenameInstance(name string, instance api.InstancePost) (Op
 		return nil, err
 	}
 
-	// Sanity check
+	// Quick check.
 	if instance.Migration {
 		return nil, fmt.Errorf("Can't ask for a migration through RenameInstance")
 	}
@@ -699,7 +694,7 @@ func (r *ProtocolLXD) MigrateInstance(name string, instance api.InstancePost) (O
 		return nil, fmt.Errorf("The server is missing the required \"instance_pool_move\" API extension")
 	}
 
-	// Sanity check
+	// Quick check.
 	if !instance.Migration {
 		return nil, fmt.Errorf("Can't ask for a rename through MigrateInstance")
 	}
@@ -921,11 +916,6 @@ func (r *ProtocolLXD) GetInstanceFile(instanceName string, filePath string) (io.
 		return nil, nil, err
 	}
 
-	// Set the user agent
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
-	}
-
 	// Send the request
 	resp, err := r.do(req)
 	if err != nil {
@@ -1016,11 +1006,6 @@ func (r *ProtocolLXD) CreateInstanceFile(instanceName string, filePath string, a
 	req, err := http.NewRequest("POST", requestURL, args.Content)
 	if err != nil {
 		return err
-	}
-
-	// Set the user agent
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
 	}
 
 	// Set the various headers
@@ -1205,7 +1190,7 @@ func (r *ProtocolLXD) CopyInstanceSnapshot(source InstanceServer, instanceName s
 
 	// Process the copy arguments
 	if args != nil {
-		// Sanity checks
+		// Quick checks.
 		if shared.StringInSlice(args.Mode, []string{"push", "relay"}) {
 			if !r.HasExtension("container_push") {
 				return nil, fmt.Errorf("The target server is missing the required \"container_push\" API extension")
@@ -1402,7 +1387,7 @@ func (r *ProtocolLXD) RenameInstanceSnapshot(instanceName string, name string, i
 		return nil, err
 	}
 
-	// Sanity check
+	// Quick check.
 	if instance.Migration {
 		return nil, fmt.Errorf("Can't ask for a migration through RenameInstanceSnapshot")
 	}
@@ -1473,7 +1458,7 @@ func (r *ProtocolLXD) MigrateInstanceSnapshot(instanceName string, name string, 
 		return nil, err
 	}
 
-	// Sanity check
+	// Quick check.
 	if !instance.Migration {
 		return nil, fmt.Errorf("Can't ask for a rename through MigrateInstanceSnapshot")
 	}
@@ -1612,11 +1597,6 @@ func (r *ProtocolLXD) GetInstanceLogfile(name string, filename string) (io.ReadC
 		return nil, err
 	}
 
-	// Set the user agent
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
-	}
-
 	// Send the request
 	resp, err := r.do(req)
 	if err != nil {
@@ -1737,11 +1717,6 @@ func (r *ProtocolLXD) GetInstanceTemplateFile(instanceName string, templateName 
 		return nil, err
 	}
 
-	// Set the user agent
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
-	}
-
 	// Send the request
 	resp, err := r.do(req)
 	if err != nil {
@@ -1782,11 +1757,6 @@ func (r *ProtocolLXD) CreateInstanceTemplateFile(instanceName string, templateNa
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-
-	// Set the user agent
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
-	}
 
 	// Send the request
 	resp, err := r.do(req)
@@ -2009,11 +1979,6 @@ func (r *ProtocolLXD) GetInstanceConsoleLog(instanceName string, args *InstanceC
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
-	}
-
-	// Set the user agent
-	if r.httpUserAgent != "" {
-		req.Header.Set("User-Agent", r.httpUserAgent)
 	}
 
 	// Send the request
@@ -2252,7 +2217,7 @@ func (r *ProtocolLXD) GetInstanceBackupFile(instanceName string, name string, re
 }
 
 func (r *ProtocolLXD) proxyMigration(targetOp *operation, targetSecrets map[string]string, source InstanceServer, sourceOp *operation, sourceSecrets map[string]string) error {
-	// Sanity checks
+	// Quick checks.
 	for n := range targetSecrets {
 		_, ok := sourceSecrets[n]
 		if !ok {

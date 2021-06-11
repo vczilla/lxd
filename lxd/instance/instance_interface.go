@@ -84,7 +84,7 @@ type Instance interface {
 	Update(newConfig db.InstanceArgs, userRequested bool) error
 
 	Delete(force bool) error
-	Export(w io.Writer, properties map[string]string) (api.ImageMetadata, error)
+	Export(w io.Writer, properties map[string]string, expiration time.Time) (api.ImageMetadata, error)
 
 	// Used for security.
 	DevPaths() []string
@@ -163,6 +163,7 @@ type Container interface {
 	ConsoleLog(opts liblxc.ConsoleLogOptions) (string, error)
 	InsertSeccompUnixDevice(prefix string, m deviceConfig.Device, pid int) error
 	DevptsFd() (*os.File, error)
+	IdmappedStorage(path string) idmap.IdmapStorageType
 }
 
 // CriuMigrationArgs arguments for CRIU migration.

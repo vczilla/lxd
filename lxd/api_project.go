@@ -83,7 +83,7 @@ var projectStateCmd = APIEndpoint{
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -126,7 +126,7 @@ var projectStateCmd = APIEndpoint{
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -236,7 +236,7 @@ func projectsPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	// Sanity checks
+	// Quick checks.
 	err = projectValidateName(project.Name)
 	if err != nil {
 		return response.BadRequest(err)
@@ -325,7 +325,7 @@ func projectCreateDefaultProfile(tx *db.ClusterTx, project string) error {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -538,7 +538,7 @@ func projectChange(d *Daemon, project *api.Project, req api.ProjectPut) response
 		}
 	}
 
-	// Sanity checks.
+	// Quick checks.
 	if project.Name == projecthelpers.Default && featuresChanged {
 		return response.BadRequest(fmt.Errorf("You can't change the features of the default project"))
 	}
@@ -628,7 +628,7 @@ func projectPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	// Sanity checks
+	// Quick checks.
 	if name == projecthelpers.Default {
 		return response.Forbidden(fmt.Errorf("The 'default' project cannot be renamed"))
 	}
@@ -681,7 +681,7 @@ func projectPost(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationProjectRename, nil, nil, run, nil, nil)
+	op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationProjectRename, nil, nil, run, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -710,7 +710,7 @@ func projectPost(d *Daemon, r *http.Request) response.Response {
 func projectDelete(d *Daemon, r *http.Request) response.Response {
 	name := mux.Vars(r)["name"]
 
-	// Sanity checks
+	// Quick checks.
 	if name == projecthelpers.Default {
 		return response.Forbidden(fmt.Errorf("The 'default' project cannot be deleted"))
 	}
@@ -772,7 +772,7 @@ func projectDelete(d *Daemon, r *http.Request) response.Response {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:

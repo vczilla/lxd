@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -31,15 +32,14 @@ import (
 
 // instanceCreateAsEmpty creates an empty instance.
 func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, error) {
+	revert := revert.New()
+	defer revert.Fail()
+
 	// Create the instance record.
-	inst, err := instance.CreateInternal(d.State(), args)
+	inst, err := instance.CreateInternal(d.State(), args, revert)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed creating instance record")
 	}
-
-	revert := revert.New()
-	defer revert.Fail()
-	revert.Add(func() { inst.Delete(true) })
 
 	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
 	if err != nil {
@@ -51,6 +51,8 @@ func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, 
 		return nil, errors.Wrap(err, "Failed creating instance")
 	}
 
+	revert.Add(func() { inst.Delete(true) })
+
 	err = inst.UpdateBackupFile()
 	if err != nil {
 		return nil, err
@@ -61,9 +63,9 @@ func instanceCreateAsEmpty(d *Daemon, args db.InstanceArgs) (instance.Instance, 
 }
 
 // instanceImageTransfer transfers an image from another cluster node.
-func instanceImageTransfer(d *Daemon, projectName string, hash string, nodeAddress string) error {
+func instanceImageTransfer(d *Daemon, r *http.Request, projectName string, hash string, nodeAddress string) error {
 	logger.Debugf("Transferring image %q from node %q", hash, nodeAddress)
-	client, err := cluster.Connect(nodeAddress, d.endpoints.NetworkCert(), d.serverCert(), false)
+	client, err := cluster.Connect(nodeAddress, d.endpoints.NetworkCert(), d.serverCert(), r, false)
 	if err != nil {
 		return err
 	}
@@ -79,7 +81,10 @@ func instanceImageTransfer(d *Daemon, projectName string, hash string, nodeAddre
 }
 
 // instanceCreateFromImage creates an instance from a rootfs image.
-func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *operations.Operation) (instance.Instance, error) {
+func instanceCreateFromImage(d *Daemon, r *http.Request, args db.InstanceArgs, hash string, op *operations.Operation) (instance.Instance, error) {
+	revert := revert.New()
+	defer revert.Fail()
+
 	s := d.State()
 
 	// Get the image properties.
@@ -114,7 +119,7 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 		unlock := d.imageDownloadLock(img.Fingerprint)
 
 		// The image is available from another node, let's try to import it.
-		err = instanceImageTransfer(d, args.Project, img.Fingerprint, nodeAddress)
+		err = instanceImageTransfer(d, r, args.Project, img.Fingerprint, nodeAddress)
 		if err != nil {
 			unlock()
 			return nil, errors.Wrapf(err, "Failed transferring image %q from %q", img.Fingerprint, nodeAddress)
@@ -141,14 +146,10 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 	args.BaseImage = hash
 
 	// Create the instance.
-	inst, err := instance.CreateInternal(s, args)
+	inst, err := instance.CreateInternal(s, args, revert)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed creating instance record")
 	}
-
-	revert := revert.New()
-	defer revert.Fail()
-	revert.Add(func() { inst.Delete(true) })
 
 	err = s.Cluster.UpdateImageLastUseDate(hash, time.Now().UTC())
 	if err != nil {
@@ -164,6 +165,8 @@ func instanceCreateFromImage(d *Daemon, args db.InstanceArgs, hash string, op *o
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed creating instance from image")
 	}
+
+	revert.Add(func() { inst.Delete(true) })
 
 	err = inst.UpdateBackupFile()
 	if err != nil {
@@ -206,12 +209,10 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 	// If we are not in refresh mode, then create a new instance as we are in copy mode.
 	if !opts.refresh {
 		// Create the instance.
-		inst, err = instance.CreateInternal(s, opts.targetInstance)
+		inst, err = instance.CreateInternal(s, opts.targetInstance, revert)
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed creating instance record")
 		}
-
-		revert.Add(func() { inst.Delete(true) })
 	}
 
 	// At this point we have already figured out the instance's root disk device so we can simply retrieve it
@@ -303,7 +304,7 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 			}
 
 			// Create the snapshots.
-			snapInst, err := instance.CreateInternal(s, snapInstArgs)
+			snapInst, err := instance.CreateInternal(s, snapInstArgs, revert)
 			if err != nil {
 				return nil, errors.Wrapf(err, "Failed creating instance snapshot record %q", newSnapName)
 			}
@@ -333,6 +334,8 @@ func instanceCreateAsCopy(s *state.State, opts instanceCreateAsCopyOpts, op *ope
 		if err != nil {
 			return nil, errors.Wrap(err, "Create instance from copy")
 		}
+
+		revert.Add(func() { inst.Delete(true) })
 
 		if opts.applyTemplateTrigger {
 			// Trigger the templates on next start.
@@ -430,7 +433,7 @@ func autoCreateContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 			return autoCreateContainerSnapshots(ctx, d, instances)
 		}
 
-		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationSnapshotCreate, nil, nil, opRun, nil, nil)
+		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationSnapshotCreate, nil, nil, opRun, nil, nil, nil)
 		if err != nil {
 			logger.Error("Failed to start create snapshot operation", log.Ctx{"err": err})
 			return
@@ -537,7 +540,7 @@ func pruneExpiredContainerSnapshotsTask(d *Daemon) (task.Func, task.Schedule) {
 			return pruneExpiredContainerSnapshots(ctx, d, expiredSnapshots)
 		}
 
-		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationSnapshotsExpire, nil, nil, opRun, nil, nil)
+		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationSnapshotsExpire, nil, nil, opRun, nil, nil, nil)
 		if err != nil {
 			logger.Error("Failed to start expired instance snapshots operation", log.Ctx{"err": err})
 			return

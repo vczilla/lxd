@@ -54,7 +54,7 @@ import (
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -103,7 +103,7 @@ import (
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -322,7 +322,7 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 	resources["backups"] = []string{req.Name}
 
 	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask,
-		db.OperationBackupCreate, resources, nil, backup, nil, nil)
+		db.OperationBackupCreate, resources, nil, backup, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -361,7 +361,7 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -482,7 +482,7 @@ func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 	resources["containers"] = resources["instances"]
 
 	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask,
-		db.OperationBackupRename, resources, nil, rename, nil, nil)
+		db.OperationBackupRename, resources, nil, rename, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -554,7 +554,7 @@ func instanceBackupDelete(d *Daemon, r *http.Request) response.Response {
 	resources["container"] = []string{name}
 
 	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask,
-		db.OperationBackupRemove, resources, nil, remove, nil, nil)
+		db.OperationBackupRemove, resources, nil, remove, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}

@@ -82,7 +82,7 @@ func filterWarnings(warnings []api.Warning, clauses []filter.Clause) []api.Warni
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -129,7 +129,7 @@ func filterWarnings(warnings []api.Warning, clauses []filter.Clause) []api.Warni
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -231,7 +231,7 @@ func warningsGet(d *Daemon, r *http.Request) response.Response {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -398,7 +398,7 @@ func pruneResolvedWarningsTask(d *Daemon) (task.Func, task.Schedule) {
 			return pruneResolvedWarnings(ctx, d)
 		}
 
-		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationWarningsPruneResolved, nil, nil, opRun, nil, nil)
+		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationWarningsPruneResolved, nil, nil, opRun, nil, nil, nil)
 		if err != nil {
 			logger.Error("Failed to start prune resolved warnings operation", log.Ctx{"err": err})
 			return

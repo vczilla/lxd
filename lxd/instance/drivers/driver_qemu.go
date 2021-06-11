@@ -32,6 +32,7 @@ import (
 	"github.com/lxc/lxd/lxd/cgroup"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	dbCluster "github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/device"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/device/nictype"
@@ -39,7 +40,6 @@ import (
 	"github.com/lxc/lxd/lxd/instance/drivers/qmp"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/instance/operationlock"
-	"github.com/lxc/lxd/lxd/maas"
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/resources"
@@ -50,6 +50,7 @@ import (
 	pongoTemplate "github.com/lxc/lxd/lxd/template"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/lxd/vsock"
+	"github.com/lxc/lxd/lxd/warnings"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/instancewriter"
@@ -70,6 +71,15 @@ const qemuSerialChardevName = "qemu_serial-chardev"
 
 // qemuDefaultMemSize is the default memory size for VMs if not limit specified.
 const qemuDefaultMemSize = "1GiB"
+
+// qemuPCIDeviceIDStart is the first PCI slot used for user configurable devices.
+const qemuPCIDeviceIDStart = 4
+
+// qemuDeviceIDPrefix used as part of the name given QEMU devices generated from user added devices.
+const qemuDeviceIDPrefix = "dev-lxd_"
+
+// qemuNetDevIDPrefix used as part of the name given QEMU netdevs generated from user added devices.
+const qemuNetDevIDPrefix = "lxd_"
 
 var errQemuAgentOffline = fmt.Errorf("LXD VM agent isn't currently running")
 
@@ -153,7 +163,9 @@ func qemuInstantiate(s *state.State, args db.InstanceArgs, expandedDevices devic
 }
 
 // qemuCreate creates a new storage volume record and returns an initialised Instance.
-func qemuCreate(s *state.State, args db.InstanceArgs) (instance.Instance, error) {
+// Accepts a reverter that revert steps this function does will be added to. It is up to the caller to call the
+// revert's Fail() or Success() function as needed.
+func qemuCreate(s *state.State, args db.InstanceArgs, revert *revert.Reverter) (instance.Instance, error) {
 	// Create the instance struct.
 	d := &qemu{
 		common: common{
@@ -178,13 +190,6 @@ func qemuCreate(s *state.State, args db.InstanceArgs) (instance.Instance, error)
 			stateful:     args.Stateful,
 		},
 	}
-
-	revert := revert.New()
-	defer revert.Fail()
-
-	// Use d.Delete() in revert on error as this function doesn't just create DB records, it can also cause
-	// other modifications to the host when devices are added.
-	revert.Add(func() { d.Delete(true) })
 
 	// Get the architecture name.
 	archName, err := osarch.ArchitectureName(d.architecture)
@@ -298,26 +303,35 @@ func qemuCreate(s *state.State, args db.InstanceArgs) (instance.Instance, error)
 		}
 	}
 
+	revert.Add(func() {
+		s.Cluster.RemoveStoragePoolVolume(args.Project, args.Name, db.StoragePoolVolumeTypeVM, d.storagePool.ID())
+	})
+
 	if !d.IsSnapshot() {
-		// Update MAAS.
-		err = d.maasUpdate(nil)
+		// Add devices to instance.
+		for k, m := range d.expandedDevices {
+			devName := k
+			devConfig := m
+			err = d.deviceAdd(devName, devConfig, false)
+			if err != nil && err != device.ErrUnsupportedDevType {
+				return nil, errors.Wrapf(err, "Failed to add device %q", devName)
+			}
+
+			revert.Add(func() { d.deviceRemove(devName, devConfig, false) })
+		}
+
+		// Update MAAS (must run after the MAC addresses have been generated).
+		err = d.maasUpdate(d, nil)
 		if err != nil {
 			return nil, err
 		}
 
-		// Add devices to instance.
-		for k, m := range d.expandedDevices {
-			err = d.deviceAdd(k, m, false)
-			if err != nil && err != device.ErrUnsupportedDevType {
-				return nil, errors.Wrapf(err, "Failed to add device %q", k)
-			}
-		}
+		revert.Add(func() { d.maasDelete(d) })
 	}
 
 	d.logger.Info("Created instance", log.Ctx{"ephemeral": d.ephemeral})
 	d.lifecycle("created", nil)
 
-	revert.Success()
 	return d, nil
 }
 
@@ -533,7 +547,7 @@ func (d *qemu) Freeze() error {
 func (d *qemu) configDriveMountPath() string {
 	// Use instance path and config.mount directory rather than devices path to avoid conflicts with an
 	// instance disk device mount of the same name.
-	return filepath.Join(d.Path(), "config.mount")
+	return filepath.Join(d.Path(), storageDrivers.VMConfigDriveMountDir)
 }
 
 // configDriveMountPathClear attempts to unmount the config drive bind mount and remove the directory.
@@ -551,6 +565,9 @@ func (d *qemu) configVirtiofsdPaths() (string, string) {
 
 // onStop is run when the instance stops.
 func (d *qemu) onStop(target string) error {
+	d.logger.Debug("onStop hook started", log.Ctx{"target": target})
+	defer d.logger.Debug("onStop hook finished", log.Ctx{"target": target})
+
 	var err error
 
 	// Pick up the existing stop operation lock created in Stop() function.
@@ -564,6 +581,29 @@ func (d *qemu) onStop(target string) error {
 		if err != nil {
 			return errors.Wrap(err, "Create restart operation")
 		}
+	}
+
+	// Reset timeout to 30s.
+	op.Reset()
+
+	// Wait for QEMU process to end (to avoiding racing start when restarting).
+	// Wait up to 20s to allow for flushing any pending data to disk.
+	d.logger.Debug("Waiting for VM process to finish")
+	waitDuration := time.Duration(time.Second * time.Duration(20))
+	waitUntil := time.Now().Add(waitDuration)
+	for {
+		pid, _ := d.pid()
+		if pid <= 0 {
+			d.logger.Debug("VM process finished")
+			break
+		}
+
+		if time.Now().After(waitUntil) {
+			d.logger.Error("VM process failed to stop", log.Ctx{"waitDuration": waitDuration})
+			break // Continue clean up as best we can.
+		}
+
+		time.Sleep(time.Millisecond * time.Duration(100))
 	}
 
 	// Reset timeout to 30s.
@@ -622,6 +662,9 @@ func (d *qemu) onStop(target string) error {
 
 // Shutdown shuts the instance down.
 func (d *qemu) Shutdown(timeout time.Duration) error {
+	d.logger.Debug("Shutdown started", log.Ctx{"timeout": timeout})
+	defer d.logger.Debug("Shutdown finished", log.Ctx{"timeout": timeout})
+
 	// Must be run prior to creating the operation lock.
 	if !d.IsRunning() {
 		return fmt.Errorf("The instance is already stopped")
@@ -840,6 +883,9 @@ func (d *qemu) saveState(monitor *qmp.Monitor) error {
 
 // Start starts the instance.
 func (d *qemu) Start(stateful bool) error {
+	d.logger.Debug("Start started", log.Ctx{"stateful": stateful})
+	defer d.logger.Debug("Start finished", log.Ctx{"stateful": stateful})
+
 	// Must be run prior to creating the operation lock.
 	if d.IsRunning() {
 		return fmt.Errorf("The instance is already running")
@@ -1016,7 +1062,17 @@ func (d *qemu) Start(stateful bool) error {
 		var errUnsupported device.UnsupportedError
 		if errors.As(err, &errUnsupported) {
 			d.logger.Warn("Unable to use virtio-fs for config drive, using 9p as a fallback", log.Ctx{"err": errUnsupported})
+
+			if errUnsupported == device.ErrMissingVirtiofsd {
+				// Create a warning if virtiofsd is missing
+				d.state.Cluster.UpsertWarning(d.node, d.project, dbCluster.TypeInstance, d.ID(), db.WarningMissingVirtiofsd, "Using 9p as a fallback")
+			} else {
+				// Resolve previous warning
+				warnings.ResolveWarningsByNodeAndProjectAndType(d.state.Cluster, d.node, d.project, db.WarningMissingVirtiofsd)
+			}
 		} else {
+			// Resolve previous warning
+			warnings.ResolveWarningsByNodeAndProjectAndType(d.state.Cluster, d.node, d.project, db.WarningMissingVirtiofsd)
 			op.Done(err)
 			return errors.Wrapf(err, "Failed to setup virtiofsd for config drive")
 		}
@@ -1232,8 +1288,8 @@ func (d *qemu) Start(stateful bool) error {
 	}
 
 	pid, err := d.pid()
-	if err != nil {
-		d.logger.Error("Failed to get VM process ID", log.Ctx{"pid": pid})
+	if err != nil || pid <= 0 {
+		d.logger.Error("Failed to get VM process ID", log.Ctx{"err": err, "pid": pid})
 		op.Done(err)
 		return err
 	}
@@ -1533,7 +1589,10 @@ func (d *qemu) deviceStart(deviceName string, rawConfig deviceConfig.Device, ins
 	logger := logging.AddContext(d.logger, log.Ctx{"device": deviceName, "type": rawConfig["type"]})
 	logger.Debug("Starting device")
 
-	dev, _, err := d.deviceLoad(deviceName, rawConfig)
+	revert := revert.New()
+	defer revert.Fail()
+
+	dev, configCopy, err := d.deviceLoad(deviceName, rawConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -1547,7 +1606,102 @@ func (d *qemu) deviceStart(deviceName string, rawConfig deviceConfig.Device, ins
 		return nil, err
 	}
 
+	revert.Add(func() {
+		runConf, _ := dev.Stop()
+		if runConf != nil {
+			d.runHooks(runConf.PostHooks)
+		}
+	})
+
+	// If runConf supplied, perform any instance specific setup of device.
+	if runConf != nil {
+		// If instance is running and then live attach device.
+		if instanceRunning {
+			// Attach network interface if requested.
+			if len(runConf.NetworkInterface) > 0 {
+				err = d.deviceAttachNIC(deviceName, configCopy, runConf.NetworkInterface)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			// If running, run post start hooks now (if not running LXD will run them
+			// once the instance is started).
+			err = d.runHooks(runConf.PostHooks)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	revert.Success()
 	return runConf, nil
+}
+
+// deviceAttachNIC live attaches a NIC device to the instance.
+func (d *qemu) deviceAttachNIC(deviceName string, configCopy map[string]string, netIF []deviceConfig.RunConfigItem) error {
+	devName := ""
+	for _, dev := range netIF {
+		if dev.Key == "link" {
+			devName = dev.Value
+			break
+		}
+	}
+
+	if devName == "" {
+		return fmt.Errorf("Device didn't provide a link property to use")
+	}
+
+	_, qemuBus, err := d.qemuArchConfig(d.architecture)
+	if err != nil {
+		return err
+	}
+
+	// Check if the agent is running.
+	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
+	if err != nil {
+		return err
+	}
+
+	qemuDev := make(map[string]string)
+
+	// PCIe and PCI require a port device name to hotplug the NIC into.
+	if shared.StringInSlice(qemuBus, []string{"pcie", "pci"}) {
+		pciDevID := qemuPCIDeviceIDStart
+
+		// Iterate through all the instance devices in the same sorted order as is used when allocating the
+		// boot time devices in order to find the PCI bus slot device we would have used at boot time.
+		// Then attempt to use that same device, assuming it is available.
+		for _, dev := range d.expandedDevices.Sorted() {
+			if dev.Name == deviceName {
+				break // Found our device.
+			}
+
+			pciDevID++
+		}
+
+		pciDeviceName := fmt.Sprintf("%s%d", busDevicePortPrefix, pciDevID)
+		d.logger.Debug("Using PCI bus device to hotplug NIC into", log.Ctx{"device": deviceName, "port": pciDeviceName})
+		qemuDev["bus"] = pciDeviceName
+		qemuDev["addr"] = "00.0"
+	}
+
+	cpuCount, err := d.addCPUMemoryConfig(nil)
+	if err != nil {
+		return err
+	}
+
+	monHook, err := d.addNetDevConfig(cpuCount, qemuBus, qemuDev, nil, netIF)
+	if err != nil {
+		return err
+	}
+
+	err = monHook(monitor)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // deviceStop loads a new device and calls its Stop() function.
@@ -1584,10 +1738,87 @@ func (d *qemu) deviceStop(deviceName string, rawConfig deviceConfig.Device, inst
 	}
 
 	if runConf != nil {
+		if runConf != nil {
+			// Detach NIC from running instance.
+			if rawConfig["type"] == "nic" && instanceRunning {
+				err = d.deviceDetachNIC(deviceName)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 		// Run post stop hooks irrespective of run state of instance.
 		err = d.runHooks(runConf.PostHooks)
 		if err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+// deviceDetachNIC detaches a NIC device from a running instance.
+func (d *qemu) deviceDetachNIC(deviceName string) error {
+	// Check if the agent is running.
+	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
+	if err != nil {
+		return err
+	}
+
+	// pciDeviceExists checks if the deviceID exists as a bridged PCI device.
+	pciDeviceExists := func(deviceID string) (bool, error) {
+		pciDevs, err := monitor.QueryPCI()
+		if err != nil {
+			return false, err
+		}
+
+		for _, pciDev := range pciDevs {
+			for _, bridgeDev := range pciDev.Bridge.Devices {
+				if bridgeDev.DevID == deviceID {
+					return true, nil
+				}
+			}
+		}
+
+		return false, nil
+	}
+
+	deviceID := fmt.Sprintf("%s%s", qemuDeviceIDPrefix, deviceName)
+	netDevID := fmt.Sprintf("%s%s", qemuNetDevIDPrefix, deviceName)
+
+	// Request removal of device.
+	err = monitor.RemoveNIC(netDevID, deviceID)
+	if err != nil {
+		return err
+	}
+
+	_, qemuBus, err := d.qemuArchConfig(d.architecture)
+	if err != nil {
+		return err
+	}
+
+	if shared.StringInSlice(qemuBus, []string{"pcie", "pci"}) {
+		// Wait until the device is actually removed (or we timeout waiting).
+		waitDuration := time.Duration(time.Second * time.Duration(10))
+		waitUntil := time.Now().Add(waitDuration)
+		for {
+			devExists, err := pciDeviceExists(deviceID)
+			if err != nil {
+				return errors.Wrapf(err, "Failed getting PCI devices to check for NIC detach")
+			}
+
+			if !devExists {
+				break
+
+			}
+
+			if time.Now().After(waitUntil) {
+				return errors.Wrapf(err, "Failed to detach NIC after %v", waitDuration)
+			}
+
+			d.logger.Debug("Waiting for NIC device to be detached", log.Ctx{"device": deviceName})
+			time.Sleep(time.Second * time.Duration(2))
 		}
 	}
 
@@ -2085,7 +2316,7 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 	// on PCIe (which we need to maintain compatibility with network configuration in our existing VM images).
 	// It's also meant to group all low-bandwidth internal devices onto a single address. PCIe bus allows a
 	// total of 256 devices, but this assumes 32 chassis * 8 function. By using VFs for the internal fixed
-	// devices we avoid consuming a chassis for each one.
+	// devices we avoid consuming a chassis for each one. See also the qemuPCIDeviceIDStart constant.
 	devBus, devAddr, multi := bus.allocate(busFunctionGroupGeneric)
 	err = qemuBalloon.Execute(sb, map[string]interface{}{
 		"bus":           bus.name,
@@ -2320,6 +2551,11 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 
 	}
 
+	// Allocate 4 PCI slots for hotplug devices.
+	for i := 0; i < 4; i++ {
+		bus.allocate(busFunctionGroupNone)
+	}
+
 	// Write the agent mount config.
 	agentMountJSON, err := json.Marshal(agentMounts)
 	if err != nil {
@@ -2338,6 +2574,7 @@ func (d *qemu) generateQemuConfigFile(mountInfo *storagePools.MountInfo, busName
 }
 
 // addCPUMemoryConfig adds the qemu config required for setting the number of virtualised CPUs and memory.
+// If sb is nil then no config is written and instead just the CPU count is returned.
 func (d *qemu) addCPUMemoryConfig(sb *strings.Builder) (int, error) {
 	// Default to a single core.
 	cpus := d.expandedConfig["limits.cpu"]
@@ -2438,16 +2675,24 @@ func (d *qemu) addCPUMemoryConfig(sb *strings.Builder) (int, error) {
 	memSizeBytes = nodeMemory * int64(len(hostNodes))
 	ctx["memory"] = nodeMemory
 
-	err = qemuMemory.Execute(sb, map[string]interface{}{
-		"architecture": d.architectureName,
-		"memSizeBytes": memSizeBytes,
-	})
-	if err != nil {
-		return -1, err
+	if sb != nil {
+		err = qemuMemory.Execute(sb, map[string]interface{}{
+			"architecture": d.architectureName,
+			"memSizeBytes": memSizeBytes,
+		})
+
+		if err != nil {
+			return -1, err
+		}
+
+		err = qemuCPU.Execute(sb, ctx)
+		if err != nil {
+			return -1, err
+		}
 	}
 
 	// Configure the CPU limit.
-	return ctx["cpuCount"].(int), qemuCPU.Execute(sb, ctx)
+	return ctx["cpuCount"].(int), nil
 }
 
 // addFileDescriptor adds a file path to the list of files to open and pass file descriptor to qemu.
@@ -2480,7 +2725,7 @@ func (d *qemu) addRootDriveConfig(sb *strings.Builder, mountInfo *storagePools.M
 	}
 
 	// If the storage pool is on ZFS and backed by a loop file and we can't use DirectIO, then resort to
-	// unsafe async I/O to avoid kernel hangs when running ZFS storage pools in an image file on another FS.
+	// unsafe async I/O to avoid kernel lock up when running ZFS storage pools in an image file on another FS.
 	driverInfo := pool.Driver().Info()
 	driverConf := pool.Driver().Config()
 	if driverInfo.Name == "zfs" && !driverInfo.DirectIO && shared.PathExists(driverConf["source"]) && !shared.IsBlockdevPath(driverConf["source"]) {
@@ -2590,7 +2835,7 @@ func (d *qemu) addDriveConfig(sb *strings.Builder, bootIndexes map[string]int, d
 		}
 
 		// If backing FS is ZFS or BTRFS, avoid using direct I/O and use host page cache only.
-		// We've seen ZFS hangs and BTRFS checksum issues when using direct I/O on image files.
+		// We've seen ZFS lock up and BTRFS checksum issues when using direct I/O on image files.
 		if fsType == "zfs" || fsType == "btrfs" {
 			if driveConf.FSType != "iso9660" {
 				// Only warn about using writeback cache if the drive image is writable.
@@ -2646,7 +2891,7 @@ func (d *qemu) addNetDevConfig(cpuCount int, busName string, qemuDev map[string]
 	}
 
 	var qemuNetDev map[string]interface{}
-	qemuDev["id"] = fmt.Sprintf("dev-lxd_%s", devName)
+	qemuDev["id"] = fmt.Sprintf("%s%s", qemuDeviceIDPrefix, devName)
 
 	if len(bootIndexes) > 0 {
 		bootIndex, found := bootIndexes[devName]
@@ -2669,7 +2914,7 @@ func (d *qemu) addNetDevConfig(cpuCount int, busName string, qemuDev map[string]
 		}
 
 		qemuNetDev = map[string]interface{}{
-			"id":    fmt.Sprintf("lxd_%s", devName),
+			"id":    fmt.Sprintf("%s%s", qemuNetDevIDPrefix, devName),
 			"type":  "tap",
 			"vhost": true,
 			"fd":    fmt.Sprintf("/dev/tap%d", ifindex), // Indicates the file to open and the FD name.
@@ -2681,12 +2926,12 @@ func (d *qemu) addNetDevConfig(cpuCount int, busName string, qemuDev map[string]
 			qemuDev["driver"] = "virtio-net-ccw"
 		}
 
-		qemuDev["netdev"] = fmt.Sprintf("lxd_%s", devName)
+		qemuDev["netdev"] = qemuNetDev["id"].(string)
 		qemuDev["mac"] = devHwaddr
 	} else if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/tun_flags", nicName)) {
 		// Detect TAP (via TUN driver) device.
 		qemuNetDev = map[string]interface{}{
-			"id":         fmt.Sprintf("lxd_%s", devName),
+			"id":         fmt.Sprintf("%s%s", qemuNetDevIDPrefix, devName),
 			"type":       "tap",
 			"vhost":      true,
 			"script":     "no",
@@ -2719,7 +2964,7 @@ func (d *qemu) addNetDevConfig(cpuCount int, busName string, qemuDev map[string]
 			}
 		}
 
-		qemuDev["netdev"] = fmt.Sprintf("lxd_%s", devName)
+		qemuDev["netdev"] = qemuNetDev["id"].(string)
 		qemuDev["mac"] = devHwaddr
 	} else if pciSlotName != "" {
 		// Detect physical passthrough device.
@@ -2965,11 +3210,11 @@ func (d *qemu) pidFilePath() string {
 	return filepath.Join(d.LogPath(), "qemu.pid")
 }
 
-// pid gets the PID of the running qemu process.
+// pid gets the PID of the running qemu process. Returns 0 if PID file or process not found, and -1 if err non-nil.
 func (d *qemu) pid() (int, error) {
 	pidStr, err := ioutil.ReadFile(d.pidFilePath())
 	if os.IsNotExist(err) {
-		return 0, nil
+		return 0, nil // PID file has gone.
 	}
 
 	if err != nil {
@@ -2984,13 +3229,13 @@ func (d *qemu) pid() (int, error) {
 	cmdLineProcFilePath := fmt.Sprintf("/proc/%d/cmdline", pid)
 	cmdLine, err := ioutil.ReadFile(cmdLineProcFilePath)
 	if err != nil {
-		return -1, err
+		return 0, nil // Process has gone.
 	}
 
 	qemuSearchString := []byte("qemu-system")
 	instUUID := []byte(d.localConfig["volatile.uuid"])
 	if !bytes.Contains(cmdLine, qemuSearchString) || !bytes.Contains(cmdLine, instUUID) {
-		return -1, fmt.Errorf("Pid doesn't match the running process")
+		return -1, fmt.Errorf("PID doesn't match the running process")
 	}
 
 	return pid, nil
@@ -2998,6 +3243,9 @@ func (d *qemu) pid() (int, error) {
 
 // Stop the VM.
 func (d *qemu) Stop(stateful bool) error {
+	d.logger.Debug("Stop started", log.Ctx{"stateful": stateful})
+	defer d.logger.Debug("Stop finished", log.Ctx{"stateful": stateful})
+
 	// Must be run prior to creating the operation lock.
 	if !d.IsRunning() {
 		return fmt.Errorf("The instance is already stopped")
@@ -3021,8 +3269,8 @@ func (d *qemu) Stop(stateful bool) error {
 	// Connect to the monitor.
 	monitor, err := qmp.Connect(d.monitorPath(), qemuSerialChardevName, d.getMonitorEventHandler())
 	if err != nil {
-		// If we fail to connect, it's most likely because the VM is already off.
-		// but it could also be because the qemu process is hung, check for that
+		// If we fail to connect, it's most likely because the VM is already off, but it could also be
+		// because the qemu process is hung, check if process still exists and kill it if needed.
 		pid, _ := d.pid()
 		if pid > 0 {
 			d.killQemuProcess(pid)
@@ -3125,7 +3373,7 @@ func (d *qemu) Snapshot(name string, expiry time.Time, stateful bool) error {
 			return fmt.Errorf("Stateful stop requires migration.stateful to be set to true")
 		}
 
-		// Sanity checks.
+		// Quick checks.
 		if !d.IsRunning() {
 			return fmt.Errorf("Unable to create a stateful snapshot. The instance isn't running")
 		}
@@ -3281,7 +3529,7 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 
 	d.logger.Info("Renaming instance", ctxMap)
 
-	// Sanity checks.
+	// Quick checks.
 	err := instance.ValidName(newName, d.IsSnapshot())
 	if err != nil {
 		return err
@@ -3369,7 +3617,7 @@ func (d *qemu) Rename(newName string, applyTemplateTrigger bool) error {
 
 	// Rename the MAAS entry.
 	if !d.IsSnapshot() {
-		err = d.maasRename(newName)
+		err = d.maasRename(d, newName)
 		if err != nil {
 			return err
 		}
@@ -3658,7 +3906,7 @@ func (d *qemu) Update(args db.InstanceArgs, userRequested bool) error {
 	}
 
 	if !d.IsSnapshot() && updateMAAS {
-		err = d.maasUpdate(oldExpandedDevices.CloneNative())
+		err = d.maasUpdate(d, oldExpandedDevices.CloneNative())
 		if err != nil {
 			return err
 		}
@@ -4077,7 +4325,7 @@ func (d *qemu) Delete(force bool) error {
 		}
 
 		// Delete the MAAS entry.
-		err = d.maasDelete()
+		err = d.maasDelete(d)
 		if err != nil {
 			d.logger.Error("Failed deleting instance MAAS record", log.Ctx{"err": err})
 			return err
@@ -4167,7 +4415,7 @@ func (d *qemu) deviceRemove(deviceName string, rawConfig deviceConfig.Device, in
 }
 
 // Export publishes the instance.
-func (d *qemu) Export(w io.Writer, properties map[string]string) (api.ImageMetadata, error) {
+func (d *qemu) Export(w io.Writer, properties map[string]string, expiration time.Time) (api.ImageMetadata, error) {
 	ctxMap := log.Ctx{
 		"created":   d.creationDate,
 		"ephemeral": d.ephemeral,
@@ -4250,6 +4498,9 @@ func (d *qemu) Export(w io.Writer, properties map[string]string) (api.ImageMetad
 		meta.Architecture = arch
 		meta.CreationDate = time.Now().UTC().Unix()
 		meta.Properties = properties
+		if !expiration.IsZero() {
+			meta.ExpiryDate = expiration.UTC().Unix()
+		}
 
 		data, err := yaml.Marshal(&meta)
 		if err != nil {
@@ -4296,9 +4547,15 @@ func (d *qemu) Export(w io.Writer, properties map[string]string) (api.ImageMetad
 			return meta, err
 		}
 
+		if !expiration.IsZero() {
+			meta.ExpiryDate = expiration.UTC().Unix()
+		}
+
 		if properties != nil {
 			meta.Properties = properties
+		}
 
+		if properties != nil || !expiration.IsZero() {
 			// Generate a new metadata.yaml.
 			tempDir, err := ioutil.TempDir("", "lxd_lxd_metadata_")
 			if err != nil {
@@ -4334,7 +4591,7 @@ func (d *qemu) Export(w io.Writer, properties map[string]string) (api.ImageMetad
 			return meta, err
 		}
 
-		if properties != nil {
+		if properties != nil || !expiration.IsZero() {
 			tmpOffset := len(filepath.Dir(fnam)) + 1
 			err = tarWriter.WriteFile(fnam[tmpOffset:], fnam, fi, false)
 		} else {
@@ -5075,177 +5332,6 @@ func (d *qemu) FillNetworkDevice(name string, m deviceConfig.Device) (deviceConf
 	}
 
 	return newDevice, nil
-}
-
-// Internal MAAS handling.
-func (d *qemu) maasInterfaces(devices map[string]map[string]string) ([]maas.ContainerInterface, error) {
-	interfaces := []maas.ContainerInterface{}
-	for k, m := range devices {
-		if m["type"] != "nic" {
-			continue
-		}
-
-		if m["maas.subnet.ipv4"] == "" && m["maas.subnet.ipv6"] == "" {
-			continue
-		}
-
-		m, err := d.FillNetworkDevice(k, m)
-		if err != nil {
-			return nil, err
-		}
-
-		subnets := []maas.ContainerInterfaceSubnet{}
-
-		// IPv4
-		if m["maas.subnet.ipv4"] != "" {
-			subnet := maas.ContainerInterfaceSubnet{
-				Name:    m["maas.subnet.ipv4"],
-				Address: m["ipv4.address"],
-			}
-
-			subnets = append(subnets, subnet)
-		}
-
-		// IPv6
-		if m["maas.subnet.ipv6"] != "" {
-			subnet := maas.ContainerInterfaceSubnet{
-				Name:    m["maas.subnet.ipv6"],
-				Address: m["ipv6.address"],
-			}
-
-			subnets = append(subnets, subnet)
-		}
-
-		iface := maas.ContainerInterface{
-			Name:       m["name"],
-			MACAddress: m["hwaddr"],
-			Subnets:    subnets,
-		}
-
-		interfaces = append(interfaces, iface)
-	}
-
-	return interfaces, nil
-}
-
-func (d *qemu) maasRename(newName string) error {
-	maasURL, err := cluster.ConfigGetString(d.state.Cluster, "maas.api.url")
-	if err != nil {
-		return err
-	}
-
-	if maasURL == "" {
-		return nil
-	}
-
-	interfaces, err := d.maasInterfaces(d.expandedDevices.CloneNative())
-	if err != nil {
-		return err
-	}
-
-	if len(interfaces) == 0 {
-		return nil
-	}
-
-	if d.state.MAAS == nil {
-		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
-	}
-
-	exists, err := d.state.MAAS.DefinedContainer(d)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		return d.maasUpdate(nil)
-	}
-
-	return d.state.MAAS.RenameContainer(d, newName)
-}
-
-func (d *qemu) maasDelete() error {
-	maasURL, err := cluster.ConfigGetString(d.state.Cluster, "maas.api.url")
-	if err != nil {
-		return err
-	}
-
-	if maasURL == "" {
-		return nil
-	}
-
-	interfaces, err := d.maasInterfaces(d.expandedDevices.CloneNative())
-	if err != nil {
-		return err
-	}
-
-	if len(interfaces) == 0 {
-		return nil
-	}
-
-	if d.state.MAAS == nil {
-		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
-	}
-
-	exists, err := d.state.MAAS.DefinedContainer(d)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		return nil
-	}
-
-	return d.state.MAAS.DeleteContainer(d)
-}
-
-func (d *qemu) maasUpdate(oldDevices map[string]map[string]string) error {
-	// Check if MAAS is configured
-	maasURL, err := cluster.ConfigGetString(d.state.Cluster, "maas.api.url")
-	if err != nil {
-		return err
-	}
-
-	if maasURL == "" {
-		return nil
-	}
-
-	// Check if there's something that uses MAAS
-	interfaces, err := d.maasInterfaces(d.expandedDevices.CloneNative())
-	if err != nil {
-		return err
-	}
-
-	var oldInterfaces []maas.ContainerInterface
-	if oldDevices != nil {
-		oldInterfaces, err = d.maasInterfaces(oldDevices)
-		if err != nil {
-			return err
-		}
-	}
-
-	if len(interfaces) == 0 && len(oldInterfaces) == 0 {
-		return nil
-	}
-
-	// See if we're connected to MAAS
-	if d.state.MAAS == nil {
-		return fmt.Errorf("Can't perform the operation because MAAS is currently unavailable")
-	}
-
-	exists, err := d.state.MAAS.DefinedContainer(d)
-	if err != nil {
-		return err
-	}
-
-	if exists {
-		if len(interfaces) == 0 && len(oldInterfaces) > 0 {
-			return d.state.MAAS.DeleteContainer(d)
-		}
-
-		return d.state.MAAS.UpdateContainer(d, interfaces)
-	}
-
-	return d.state.MAAS.CreateContainer(d, interfaces)
 }
 
 // UpdateBackupFile writes the instance's backup.yaml file to storage.

@@ -143,6 +143,7 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 				go func(inst instance.Instance) {
 					defer wgAction.Done()
 
+					inst.SetOperation(op)
 					err := doInstanceStatePut(inst, *req.State)
 					if err != nil {
 						failuresLock.Lock()
@@ -217,7 +218,7 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 				}
 
 				// Connect to the remote server.
-				client, err := cluster.Connect(node.Address, networkCert, d.serverCert(), true)
+				client, err := cluster.Connect(node.Address, networkCert, d.serverCert(), r, true)
 				if err != nil {
 					failuresLock.Lock()
 					failures[node.Name] = err
@@ -251,7 +252,7 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 
 	resources := map[string][]string{}
 	resources["instances"] = names
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, opType, resources, nil, do, nil, nil)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, opType, resources, nil, do, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}

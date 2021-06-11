@@ -287,7 +287,7 @@ func (d *ceph) getVolumeSize(volumeName string) (int64, error) {
 }
 
 // CreateVolumeFromBackup re-creates a volume from its exported state.
-func (d *ceph) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) (func(vol Volume) error, func(), error) {
+func (d *ceph) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) (VolumePostHook, revert.Hook, error) {
 	return genericVFSBackupUnpack(d, vol, srcBackup.Snapshots, srcData, op)
 }
 
@@ -326,7 +326,7 @@ func (d *ceph) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots boo
 
 		// Resize volume to the size specified. Only uses volume "size" property and does not use
 		// pool/defaults to give the caller more control over the size being used.
-		err = d.SetVolumeQuota(vol, vol.config["size"], nil)
+		err = d.SetVolumeQuota(vol, vol.config["size"], false, op)
 		if err != nil {
 			return err
 		}
@@ -424,7 +424,7 @@ func (d *ceph) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots boo
 
 	// Copy with snapshots.
 
-	// Create empty dummy volume
+	// Create empty placeholder volume
 	err = d.rbdCreateVolume(vol, "0")
 	if err != nil {
 		return err
@@ -432,7 +432,7 @@ func (d *ceph) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots boo
 
 	revert.Add(func() { d.rbdDeleteVolume(vol) })
 
-	// Receive over the dummy volume we created above.
+	// Receive over the placeholder volume we created above.
 	targetVolumeName := d.getRBDVolumeName(vol, "", false, true)
 
 	lastSnap := ""
@@ -763,7 +763,7 @@ func (d *ceph) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
 func (d *ceph) UpdateVolume(vol Volume, changedConfig map[string]string) error {
 	newSize, sizeChanged := changedConfig["size"]
 	if sizeChanged {
-		err := d.SetVolumeQuota(vol, newSize, nil)
+		err := d.SetVolumeQuota(vol, newSize, false, nil)
 		if err != nil {
 			return err
 		}
@@ -850,7 +850,7 @@ func (d *ceph) GetVolumeUsage(vol Volume) (int64, error) {
 
 // SetVolumeQuota applies a size limit on volume.
 // Does nothing if supplied with an empty/zero size.
-func (d *ceph) SetVolumeQuota(vol Volume, size string, op *operations.Operation) error {
+func (d *ceph) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op *operations.Operation) error {
 	// Convert to bytes.
 	sizeBytes, err := units.ParseByteSizeString(size)
 	if err != nil {
@@ -884,7 +884,7 @@ func (d *ceph) SetVolumeQuota(vol Volume, size string, op *operations.Operation)
 	// Block image volumes cannot be resized because they have a readonly snapshot that doesn't get
 	// updated when the volume's size is changed, and this is what instances are created from.
 	// During initial volume fill allowUnsafeResize is enabled because snapshot hasn't been taken yet.
-	if !vol.allowUnsafeResize && vol.volType == VolumeTypeImage {
+	if !allowUnsafeResize && vol.volType == VolumeTypeImage {
 		return ErrNotSupported
 	}
 
@@ -903,8 +903,9 @@ func (d *ceph) SetVolumeQuota(vol Volume, size string, op *operations.Operation)
 				return ErrInUse // We don't allow online shrinking of filesytem volumes.
 			}
 
-			// Shrink filesystem first.
-			err = shrinkFileSystem(fsType, devPath, vol, sizeBytes)
+			// Shrink filesystem first. Pass allowUnsafeResize to allow disabling of filesystem
+			// resize safety checks.
+			err = shrinkFileSystem(fsType, devPath, vol, sizeBytes, allowUnsafeResize)
 			if err != nil {
 				return err
 			}
@@ -928,9 +929,9 @@ func (d *ceph) SetVolumeQuota(vol Volume, size string, op *operations.Operation)
 			}
 		}
 	} else {
-		// Only perform pre-resize sanity checks if we are not in "unsafe" mode.
+		// Only perform pre-resize checks if we are not in "unsafe" mode.
 		// In unsafe mode we expect the caller to know what they are doing and understand the risks.
-		if !vol.allowUnsafeResize {
+		if !allowUnsafeResize {
 			if sizeBytes < oldSizeBytes {
 				return errors.Wrap(ErrCannotBeShrunk, "Block volumes cannot be shrunk")
 			}
@@ -941,14 +942,14 @@ func (d *ceph) SetVolumeQuota(vol Volume, size string, op *operations.Operation)
 		}
 
 		// Resize block device.
-		err = d.resizeVolume(vol, sizeBytes, vol.allowUnsafeResize)
+		err = d.resizeVolume(vol, sizeBytes, allowUnsafeResize)
 		if err != nil {
 			return err
 		}
 
 		// Move the VM GPT alt header to end of disk if needed (not needed in unsafe resize mode as it is
 		// expected the caller will do all necessary post resize actions themselves).
-		if vol.IsVMBlock() && !vol.allowUnsafeResize {
+		if vol.IsVMBlock() && !allowUnsafeResize {
 			err = d.moveGPTAltHeader(devPath)
 			if err != nil {
 				return err

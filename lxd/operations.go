@@ -161,7 +161,7 @@ func waitForOperations(s *state.State, chCancel chan struct{}) {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -201,7 +201,7 @@ func operationGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), r, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -267,7 +267,7 @@ func operationDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), r, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -276,7 +276,7 @@ func operationDelete(d *Daemon, r *http.Request) response.Response {
 }
 
 // operationCancel cancels an operation that exists on any member.
-func operationCancel(d *Daemon, projectName string, op *api.Operation) error {
+func operationCancel(d *Daemon, r *http.Request, projectName string, op *api.Operation) error {
 	// Check if operation is local and if so, cancel it.
 	localOp, _ := operations.OperationGetInternal(op.ID)
 	if localOp != nil {
@@ -306,7 +306,7 @@ func operationCancel(d *Daemon, projectName string, op *api.Operation) error {
 		return err
 	}
 
-	client, err := cluster.Connect(memberAddress, d.endpoints.NetworkCert(), d.serverCert(), true)
+	client, err := cluster.Connect(memberAddress, d.endpoints.NetworkCert(), d.serverCert(), r, true)
 	if err != nil {
 		return errors.Wrapf(err, "Failed to connect to %q", memberAddress)
 	}
@@ -344,7 +344,7 @@ func operationCancel(d *Daemon, projectName string, op *api.Operation) error {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -390,7 +390,7 @@ func operationCancel(d *Daemon, projectName string, op *api.Operation) error {
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -537,7 +537,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Connect to the remote server
-		client, err := cluster.Connect(node, networkCert, d.serverCert(), true)
+		client, err := cluster.Connect(node, networkCert, d.serverCert(), r, true)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -574,7 +574,7 @@ func operationsGet(d *Daemon, r *http.Request) response.Response {
 }
 
 // operationsGetByType gets all operations for a project and type.
-func operationsGetByType(d *Daemon, projectName string, opType db.OperationType) ([]*api.Operation, error) {
+func operationsGetByType(d *Daemon, r *http.Request, projectName string, opType db.OperationType) ([]*api.Operation, error) {
 	ops := make([]*api.Operation, 0)
 
 	// Get local operations for project.
@@ -670,7 +670,7 @@ func operationsGetByType(d *Daemon, projectName string, opType db.OperationType)
 		}
 
 		// Connect to the remote server. Use notify=true to only get local operations on remote member.
-		client, err := cluster.Connect(memberAddress, networkCert, serverCert, true)
+		client, err := cluster.Connect(memberAddress, networkCert, serverCert, r, true)
 		if err != nil {
 			return nil, errors.Wrapf(err, "Failed connecting to %q", memberAddress)
 		}
@@ -717,7 +717,7 @@ func operationsGetByType(d *Daemon, projectName string, opType db.OperationType)
 //   - in: query
 //     name: timeout
 //     description: Timeout in seconds (-1 means never)
-//     type: int
+//     type: integer
 //     example: -1
 // responses:
 //   "200":
@@ -735,7 +735,7 @@ func operationsGetByType(d *Daemon, projectName string, opType db.OperationType)
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -758,7 +758,7 @@ func operationsGetByType(d *Daemon, projectName string, opType db.OperationType)
 //   - in: query
 //     name: timeout
 //     description: Timeout in seconds (-1 means never)
-//     type: int
+//     type: integer
 //     example: -1
 // responses:
 //   "200":
@@ -776,7 +776,7 @@ func operationsGetByType(d *Daemon, projectName string, opType db.OperationType)
 //           description: Status description
 //           example: Success
 //         status_code:
-//           type: int
+//           type: integer
 //           description: Status code
 //           example: 200
 //         metadata:
@@ -834,7 +834,7 @@ func operationWaitGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), r, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -949,7 +949,7 @@ func operationWebsocketGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), false)
+	client, err := cluster.Connect(address, d.endpoints.NetworkCert(), d.serverCert(), r, false)
 	if err != nil {
 		return response.SmartError(err)
 	}
